@@ -52,6 +52,7 @@ type module struct {
 type value struct {
 	Address, Mode, Type, Name string
 	Values                    json.RawMessage `json:"values"`
+	SensitiveValues           json.RawMessage `json:"sensitive_values"`
 }
 
 // ParsePlan accepts supported Terraform JSON and exposes no values or sensitive fields.
@@ -104,6 +105,9 @@ func collect(out *[]Resource, m module) error {
 	for _, r := range m.Resources {
 		if r.Address == "" || r.Type == "" || r.Name == "" || !reportableType(r.Type) {
 			continue
+		}
+		if sensitiveIdentity(r.SensitiveValues) {
+			return fmt.Errorf("Terraform state contains sensitive resource identity")
 		}
 		id, displayName, err := safeIdentity(r.Values)
 		if err != nil {

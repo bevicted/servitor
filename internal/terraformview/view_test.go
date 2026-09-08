@@ -111,6 +111,13 @@ func TestParseStateCollectsNestedClusterAndReusedNetworkingFixtures(t *testing.T
 	}
 }
 
+func TestParseStateRejectsSensitiveIdentity(t *testing.T) {
+	_, err := ParseState([]byte(`{"format_version":"1.2","values":{"root_module":{"resources":[{"address":"ibm_container_vpc_cluster.cluster","mode":"managed","type":"ibm_container_vpc_cluster","name":"cluster","values":{"id":"private-id","name":"cluster"},"sensitive_values":{"id":true}}]}}}`))
+	if err == nil || strings.Contains(err.Error(), "private-id") {
+		t.Fatalf("sensitive state identity error = %v", err)
+	}
+}
+
 func TestTerraformViewRejectsUnsupportedDocuments(t *testing.T) {
 	for _, input := range []string{
 		`{"format_version":"1.2","resource_changes":[`,

@@ -12,6 +12,9 @@ const (
 	PhasePending          = "Pending"
 	PhasePlanning         = "Planning"
 	PhaseAwaitingApproval = "AwaitingApproval"
+	PhaseApplying         = "Applying"
+	PhaseReady            = "Ready"
+	PhaseCleanupPending   = "CleanupPending"
 	PhaseUnresolved       = "Unresolved"
 	CleanupFinalizer      = "servitor.bevicted.github.io/cleanup"
 )
@@ -91,11 +94,41 @@ type BackendIdentity struct {
 
 // RecoveryMetadata contains only non-secret normalized values required for later operations.
 type RecoveryMetadata struct {
-	Version      int               `json:"version"`
-	Target       string            `json:"target,omitempty"`
-	Endpoints    map[string]string `json:"endpoints,omitempty"`
-	Values       ResolvedOptions   `json:"values"`
-	TFVarsSHA256 string            `json:"tfvarsSHA256,omitempty"`
+	Version                          int               `json:"version"`
+	Target                           string            `json:"target,omitempty"`
+	Endpoints                        map[string]string `json:"endpoints,omitempty"`
+	Values                           RecoveryValues    `json:"values"`
+	SatelliteSSHPublicKeyFingerprint string            `json:"satelliteSSHPublicKeyFingerprint,omitempty"`
+	TFVarsSHA256                     string            `json:"tfvarsSHA256,omitempty"`
+}
+
+// RecoveryValues are ICT's normalized non-secret Terraform inputs. They let a
+// later fresh operation reconstruct its ephemeral tfvars without resolution.
+type RecoveryValues struct {
+	ClusterName                    string   `json:"cluster_name"`
+	ResourceGroupName              string   `json:"resource_group_name"`
+	Region                         string   `json:"region"`
+	ClusterMode                    string   `json:"cluster_mode"`
+	Platform                       string   `json:"platform"`
+	KubeVersion                    string   `json:"kube_version"`
+	WorkerCount                    int      `json:"worker_count"`
+	Zone                           string   `json:"zone,omitempty"`
+	Flavor                         string   `json:"flavor,omitempty"`
+	VPCID                          string   `json:"vpc_id,omitempty"`
+	SubnetIDs                      []string `json:"subnet_ids,omitempty"`
+	PublicGatewayIDs               []string `json:"public_gateway_ids,omitempty"`
+	Datacenter                     string   `json:"datacenter,omitempty"`
+	MachineType                    string   `json:"machine_type,omitempty"`
+	PublicVLANID                   string   `json:"public_vlan_id,omitempty"`
+	PrivateVLANID                  string   `json:"private_vlan_id,omitempty"`
+	SatelliteZones                 []string `json:"satellite_zones,omitempty"`
+	SatelliteManagedFrom           string   `json:"satellite_managed_from,omitempty"`
+	SatelliteLocationID            string   `json:"satellite_location_id,omitempty"`
+	SatelliteHostImage             string   `json:"satellite_host_image,omitempty"`
+	SatelliteHostProfile           string   `json:"satellite_host_profile,omitempty"`
+	SatelliteSSHKeyID              string   `json:"satellite_ssh_key_id,omitempty"`
+	SatelliteWorkerInstanceIDs     []string `json:"satellite_worker_instance_ids,omitempty"`
+	SatelliteWorkerOperatingSystem string   `json:"satellite_worker_operating_system,omitempty"`
 }
 
 // OperationReference is persisted before a PipelineRun can be created.
@@ -121,6 +154,11 @@ type ReviewSummary struct {
 	Resources []SummaryResource `json:"resources,omitempty"`
 }
 
+// ReadySummary is the controller-persisted sanitized resource metadata after apply.
+type ReadySummary struct {
+	Resources []SummaryResource `json:"resources,omitempty"`
+}
+
 // ServitorClusterStatus is written exclusively by the controller.
 type ServitorClusterStatus struct {
 	Phase           string              `json:"phase,omitempty"`
@@ -132,7 +170,13 @@ type ServitorClusterStatus struct {
 	Review          *ReviewSummary      `json:"review,omitempty"`
 	Recovery        *RecoveryMetadata   `json:"recovery,omitempty"`
 	ReviewDeadline  *metav1.Time        `json:"reviewDeadline,omitempty"`
-	Diagnostic      string              `json:"diagnostic,omitempty"`
+	// ReviewGeneration and ReviewApproval record the spec state that entered AwaitingApproval.
+	// An approval must be written in a later generation.
+	ReviewGeneration int64         `json:"reviewGeneration,omitempty"`
+	ReviewApproval   string        `json:"reviewApproval,omitempty"`
+	Ready            *ReadySummary `json:"ready,omitempty"`
+	CleanupRequested bool          `json:"cleanupRequested,omitempty"`
+	Diagnostic       string        `json:"diagnostic,omitempty"`
 }
 
 // +kubebuilder:object:root=true
@@ -268,7 +312,16 @@ func (in *ServitorClusterStatus) DeepCopy() *ServitorClusterStatus {
 		for k, value := range in.Recovery.Endpoints {
 			v.Endpoints[k] = value
 		}
+		v.Values.SubnetIDs = append([]string(nil), v.Values.SubnetIDs...)
+		v.Values.PublicGatewayIDs = append([]string(nil), v.Values.PublicGatewayIDs...)
+		v.Values.SatelliteZones = append([]string(nil), v.Values.SatelliteZones...)
+		v.Values.SatelliteWorkerInstanceIDs = append([]string(nil), v.Values.SatelliteWorkerInstanceIDs...)
 		out.Recovery = &v
+	}
+	if in.Ready != nil {
+		v := *in.Ready
+		v.Resources = append([]SummaryResource(nil), v.Resources...)
+		out.Ready = &v
 	}
 	if in.ReviewDeadline != nil {
 		out.ReviewDeadline = in.ReviewDeadline.DeepCopy()

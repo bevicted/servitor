@@ -26,8 +26,17 @@ func DeterministicRunName(uid, operation string) string {
 // NewPlanningRun constructs one disposable planning PipelineRun. It has no owner reference,
 // so foreground CR deletion cannot cancel an active operation.
 func NewPlanningRun(cluster *servitorv1alpha1.ServitorCluster) (*tektonv1.PipelineRun, error) {
-	if cluster.Status.Operation == nil || cluster.Status.ResolvedOptions == nil || cluster.Status.Backend == nil || cluster.Status.ExecutionImage == "" {
-		return nil, fmt.Errorf("planning operation was not persisted")
+	return newOperationRun(cluster, "plan")
+}
+
+// NewApplyRun constructs a fresh, noninteractive apply from frozen planning status.
+func NewApplyRun(cluster *servitorv1alpha1.ServitorCluster) (*tektonv1.PipelineRun, error) {
+	return newOperationRun(cluster, "apply")
+}
+
+func newOperationRun(cluster *servitorv1alpha1.ServitorCluster, kind string) (*tektonv1.PipelineRun, error) {
+	if cluster.Status.Operation == nil || cluster.Status.Operation.Kind != kind || cluster.Status.ResolvedOptions == nil || cluster.Status.Backend == nil || cluster.Status.ExecutionImage == "" {
+		return nil, fmt.Errorf("%s operation was not persisted", kind)
 	}
 	options, err := json.Marshal(cluster.Status.ResolvedOptions)
 	if err != nil {
@@ -38,22 +47,31 @@ func NewPlanningRun(cluster *servitorv1alpha1.ServitorCluster) (*tektonv1.Pipeli
 		return nil, fmt.Errorf("encode backend identity: %w", err)
 	}
 	operation := cluster.Status.Operation
+	params := tektonv1.Params{
+		{Name: "operation-id", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: operation.ID}},
+		{Name: "operation-kind", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: kind}},
+		{Name: "cluster-uid", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: string(cluster.UID)}},
+		{Name: "execution-image", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: cluster.Status.ExecutionImage}},
+		{Name: "resolved-options", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: string(options)}},
+		{Name: "backend", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: string(backend)}},
+	}
+	if kind == "apply" {
+		if cluster.Status.Recovery == nil {
+			return nil, fmt.Errorf("apply recovery metadata was not persisted")
+		}
+		recovery, err := json.Marshal(cluster.Status.Recovery)
+		if err != nil {
+			return nil, fmt.Errorf("encode recovery metadata: %w", err)
+		}
+		params = append(params, tektonv1.Param{Name: "recovery", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: string(recovery)}})
+	}
 	return &tektonv1.PipelineRun{
 		TypeMeta: metav1.TypeMeta{APIVersion: "tekton.dev/v1", Kind: "PipelineRun"},
 		ObjectMeta: metav1.ObjectMeta{
 			Name: operation.PipelineRunName, Namespace: cluster.Namespace,
 			Labels: map[string]string{OperationLabel: operation.ID, ClusterUIDLabel: string(cluster.UID)},
 		},
-		Spec: tektonv1.PipelineRunSpec{
-			PipelineRef: &tektonv1.PipelineRef{Name: PipelineName},
-			Params: tektonv1.Params{
-				{Name: "operation-id", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: operation.ID}},
-				{Name: "cluster-uid", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: string(cluster.UID)}},
-				{Name: "execution-image", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: cluster.Status.ExecutionImage}},
-				{Name: "resolved-options", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: string(options)}},
-				{Name: "backend", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: string(backend)}},
-			},
-		},
+		Spec: tektonv1.PipelineRunSpec{PipelineRef: &tektonv1.PipelineRef{Name: PipelineName}, Params: params},
 	}, nil
 }
 

@@ -67,15 +67,23 @@ func (r *Reconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.
 			cluster.Finalizers = append(cluster.Finalizers, servitorv1alpha1.CleanupFinalizer)
 			return ctrl.Result{}, r.Update(ctx, cluster)
 		}
-	} else {
-		// Cleanup is introduced in the next slice. Never remove the finalizer merely because
-		// report/log evidence is unavailable.
-		return r.unresolved(ctx, cluster, "CleanupNotImplemented", errors.New("cleanup operation has not been confirmed"))
+	} else if !cluster.Status.CleanupRequested {
+		cluster.Status.CleanupRequested = true
+		if cluster.Status.Phase != servitorv1alpha1.PhaseApplying {
+			cluster.Status.Phase = servitorv1alpha1.PhaseCleanupPending
+		}
+		return ctrl.Result{}, r.Status().Update(ctx, cluster)
 	}
 
 	if cluster.Status.ResolvedOptions == nil {
 		r.snapshot(cluster)
 		return ctrl.Result{}, r.Status().Update(ctx, cluster)
+	}
+	if cluster.Status.Phase == servitorv1alpha1.PhaseAwaitingApproval {
+		return r.reconcileApproval(ctx, cluster)
+	}
+	if cluster.Status.Phase == servitorv1alpha1.PhaseReady || cluster.Status.Phase == servitorv1alpha1.PhaseCleanupPending || cluster.Status.Phase == servitorv1alpha1.PhaseUnresolved {
+		return ctrl.Result{}, nil
 	}
 	if cluster.Status.Operation == nil {
 		now := metav1.NewTime(r.now())
@@ -84,11 +92,57 @@ func (r *Reconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.
 		cluster.Status.Phase = servitorv1alpha1.PhasePlanning
 		return ctrl.Result{}, r.Status().Update(ctx, cluster)
 	}
+	return r.observeOperation(ctx, cluster)
+}
 
+func (r *Reconciler) reconcileApproval(ctx context.Context, cluster *servitorv1alpha1.ServitorCluster) (ctrl.Result, error) {
+	deadline := cluster.Status.ReviewDeadline
+	if deadline == nil || !r.now().Before(deadline.Time) {
+		cluster.Status.CleanupRequested = true
+		cluster.Status.Phase = servitorv1alpha1.PhaseCleanupPending
+		setCondition(cluster, "Ready", metav1.ConditionFalse, "ApprovalExpired", "approval was not received before the review deadline")
+		return ctrl.Result{}, r.Status().Update(ctx, cluster)
+	}
+	switch cluster.Spec.Lifecycle.Approval {
+	case "rejected":
+		cluster.Status.CleanupRequested = true
+		cluster.Status.Phase = servitorv1alpha1.PhaseCleanupPending
+		setCondition(cluster, "Ready", metav1.ConditionFalse, "ApprovalRejected", "configuration approval was rejected")
+		return ctrl.Result{}, r.Status().Update(ctx, cluster)
+	case "":
+		if cluster.Status.ReviewApproval == "approved" {
+			cluster.Status.ReviewGeneration = cluster.Generation
+			cluster.Status.ReviewApproval = ""
+			return ctrl.Result{RequeueAfter: deadline.Time.Sub(r.now())}, r.Status().Update(ctx, cluster)
+		}
+		return ctrl.Result{RequeueAfter: deadline.Time.Sub(r.now())}, nil
+	case "approved":
+		if cluster.Status.ReviewGeneration == 0 || cluster.Generation <= cluster.Status.ReviewGeneration || cluster.Status.ReviewApproval == "approved" {
+			return ctrl.Result{RequeueAfter: deadline.Time.Sub(r.now())}, nil
+		}
+		operation := applyID(string(cluster.UID))
+		cluster.Status.Operation = &servitorv1alpha1.OperationReference{ID: operation, Kind: "apply", PipelineRunName: pipeline.DeterministicRunName(string(cluster.UID), operation), StartedAt: metav1.NewTime(r.now())}
+		cluster.Status.Phase = servitorv1alpha1.PhaseApplying
+		return ctrl.Result{}, r.Status().Update(ctx, cluster)
+	}
+	return ctrl.Result{RequeueAfter: deadline.Time.Sub(r.now())}, nil
+}
+
+func (r *Reconciler) observeOperation(ctx context.Context, cluster *servitorv1alpha1.ServitorCluster) (ctrl.Result, error) {
+	operation := cluster.Status.Operation
 	run := &tektonv1.PipelineRun{}
-	err := r.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: cluster.Status.Operation.PipelineRunName}, run)
+	err := r.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: operation.PipelineRunName}, run)
 	if apierrors.IsNotFound(err) {
-		created, buildErr := pipeline.NewPlanningRun(cluster)
+		var created *tektonv1.PipelineRun
+		var buildErr error
+		switch operation.Kind {
+		case "plan":
+			created, buildErr = pipeline.NewPlanningRun(cluster)
+		case "apply":
+			created, buildErr = pipeline.NewApplyRun(cluster)
+		default:
+			buildErr = errors.New("unsupported operation kind")
+		}
 		if buildErr != nil {
 			return r.unresolved(ctx, cluster, "InvalidOperation", buildErr)
 		}
@@ -100,7 +154,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if !pipeline.MatchingRun(run, string(cluster.UID), cluster.Status.Operation.ID) {
+	if !pipeline.MatchingRun(run, string(cluster.UID), operation.ID) {
 		return r.unresolved(ctx, cluster, "OperationIdentityMismatch", errors.New("existing PipelineRun does not match active operation"))
 	}
 	done, succeeded := pipeline.Succeeded(run)
@@ -108,12 +162,22 @@ func (r *Reconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.
 		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 	}
 	if !succeeded {
+		if operation.Kind == "apply" {
+			cluster.Status.CleanupRequested = true
+			cluster.Status.Phase = servitorv1alpha1.PhaseCleanupPending
+			cluster.Status.Diagnostic = "ApplyFailed"
+			setCondition(cluster, "Ready", metav1.ConditionFalse, "ApplyFailed", "apply PipelineRun failed; cleanup is required")
+			return ctrl.Result{}, r.Status().Update(ctx, cluster)
+		}
 		return r.unresolved(ctx, cluster, "PlanningFailed", errors.New("planning PipelineRun failed"))
 	}
-	if cluster.Status.Operation.Adopted {
+	if operation.Adopted {
 		return ctrl.Result{}, nil
 	}
+	return r.adoptReport(ctx, cluster, run)
+}
 
+func (r *Reconciler) adoptReport(ctx context.Context, cluster *servitorv1alpha1.ServitorCluster, run *tektonv1.PipelineRun) (ctrl.Result, error) {
 	taskRunName := pipeline.ReportTaskRunName(run)
 	if taskRunName == "" {
 		return r.unresolved(ctx, cluster, "ReportMissing", errors.New("completed PipelineRun has no operation TaskRun"))
@@ -142,17 +206,29 @@ func (r *Reconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.
 		}
 		return r.unresolved(ctx, cluster, "InvalidReport", err)
 	}
-	cluster.Status.ResolvedOptions = &report.ResolvedOptions
-	cluster.Status.Recovery = &report.Recovery
-	cluster.Status.Review = &report.Review
 	cluster.Status.Operation.Adopted = true
-	cluster.Status.Phase = servitorv1alpha1.PhaseAwaitingApproval
-	deadline := r.now().Add(r.reviewTimeout())
-	if cluster.Spec.Lifecycle.ConfirmationDeadline != nil {
-		deadline = cluster.Spec.Lifecycle.ConfirmationDeadline.Time
+	if cluster.Status.Operation.Kind == "plan" {
+		cluster.Status.ResolvedOptions = &report.ResolvedOptions
+		cluster.Status.Recovery = &report.Recovery
+		cluster.Status.Review = &report.Review
+		cluster.Status.Phase = servitorv1alpha1.PhaseAwaitingApproval
+		deadline := r.now().Add(r.reviewTimeout())
+		if cluster.Spec.Lifecycle.ConfirmationDeadline != nil {
+			deadline = cluster.Spec.Lifecycle.ConfirmationDeadline.Time
+		}
+		cluster.Status.ReviewDeadline = &metav1.Time{Time: deadline}
+		cluster.Status.ReviewGeneration = cluster.Generation
+		cluster.Status.ReviewApproval = cluster.Spec.Lifecycle.Approval
+		setCondition(cluster, "PlanningSucceeded", metav1.ConditionTrue, "ReportAdopted", "validated planning report adopted")
+	} else {
+		cluster.Status.Ready = &report.Ready
+		if cluster.Status.CleanupRequested {
+			cluster.Status.Phase = servitorv1alpha1.PhaseCleanupPending
+		} else {
+			cluster.Status.Phase = servitorv1alpha1.PhaseReady
+			setCondition(cluster, "Ready", metav1.ConditionTrue, "ReportAdopted", "validated apply report adopted")
+		}
 	}
-	cluster.Status.ReviewDeadline = &metav1.Time{Time: deadline}
-	setCondition(cluster, "PlanningSucceeded", metav1.ConditionTrue, "ReportAdopted", "validated planning report adopted")
 	return ctrl.Result{}, r.Status().Update(ctx, cluster)
 }
 
@@ -197,6 +273,10 @@ func (r *Reconciler) reviewTimeout() time.Duration {
 func planningID(uid string) string {
 	digest := sha256.Sum256([]byte(uid))
 	return "plan-" + hex.EncodeToString(digest[:])[:16]
+}
+func applyID(uid string) string {
+	digest := sha256.Sum256([]byte(uid + "\\x00apply"))
+	return "apply-" + hex.EncodeToString(digest[:])[:16]
 }
 func contains(items []string, item string) bool {
 	for _, value := range items {

@@ -5,10 +5,12 @@ metadata:
 spec:
   params:
     - { name: operation-id, type: string }
+    - { name: operation-kind, type: string }
     - { name: cluster-uid, type: string }
     - { name: execution-image, type: string }
     - { name: resolved-options, type: string }
     - { name: backend, type: string }
+    - { name: recovery, type: string, default: "" }
   volumes:
     - name: operation-data
       emptyDir: {}
@@ -21,6 +23,8 @@ spec:
         - $(params.cluster-uid)
         - -operation-id
         - $(params.operation-id)
+        - -operation-kind
+        - $(params.operation-kind)
         - -resolved-options
         - /operation/options.json
         - -resolved-options-json
@@ -29,6 +33,10 @@ spec:
         - /operation/backend.json
         - -backend-json
         - $(params.backend)
+        - -recovery
+        - /operation/recovery.json
+        - -recovery-json
+        - $(params.recovery)
         - -ict-result
         - /operation/ict-result.json
         - -report
@@ -51,16 +59,20 @@ spec:
     serviceAccountName: servitor-task
   params:
     - { name: operation-id, type: string }
+    - { name: operation-kind, type: string }
     - { name: cluster-uid, type: string }
     - { name: execution-image, type: string }
     - { name: resolved-options, type: string }
     - { name: backend, type: string }
+    - { name: recovery, type: string, default: "" }
   tasks:
     - name: operation
       taskRef: { name: servitor-operation }
       params:
         - { name: operation-id, value: $(params.operation-id) }
+        - { name: operation-kind, value: $(params.operation-kind) }
         - { name: cluster-uid, value: $(params.cluster-uid) }
         - { name: execution-image, value: $(params.execution-image) }
         - { name: resolved-options, value: $(params.resolved-options) }
         - { name: backend, value: $(params.backend) }
+        - { name: recovery, value: $(params.recovery) }

@@ -25,21 +25,42 @@ type Report struct {
 	OperationID     string                            `json:"operationID"`
 	ResolvedOptions servitorv1alpha1.ResolvedOptions  `json:"resolvedOptions"`
 	Recovery        servitorv1alpha1.RecoveryMetadata `json:"recovery"`
-	Review          servitorv1alpha1.ReviewSummary    `json:"review"`
+	Review          servitorv1alpha1.ReviewSummary    `json:"review,omitempty"`
+	Ready           servitorv1alpha1.ReadySummary     `json:"ready,omitempty"`
 }
 
 func (r Report) Validate(expectedUID, expectedOperation string) error {
 	if r.Version != 1 || r.ClusterUID != expectedUID || r.OperationID != expectedOperation {
 		return errors.New("report identity does not match the active operation")
 	}
-	if len(r.Review.Resources) > 256 {
-		return errors.New("report has too many resources")
+	if err := validateSummary(r.Review.Resources); err != nil {
+		return err
+	}
+	if err := validateSummary(r.Ready.Resources); err != nil {
+		return err
 	}
 	if r.Recovery.Version != 1 || strings.TrimSpace(r.Recovery.Target) == "" || strings.TrimSpace(r.Recovery.TFVarsSHA256) == "" {
 		return errors.New("report has incomplete recovery metadata")
 	}
 	if r.ResolvedOptions.ClusterName == "" || r.ResolvedOptions.Provider == "" || r.ResolvedOptions.Version == "" {
 		return errors.New("report has incomplete resolved options")
+	}
+	return nil
+}
+
+func validateSummary(resources []servitorv1alpha1.SummaryResource) error {
+	if len(resources) > 256 {
+		return errors.New("report has too many resources")
+	}
+	for _, resource := range resources {
+		if len(resource.Role) > 64 || len(resource.ID) > 256 || len(resource.Name) > 256 || len(resource.Actions) > 2 {
+			return errors.New("report has invalid resource metadata")
+		}
+		for _, value := range append([]string{resource.Role, resource.ID, resource.Name}, resource.Actions...) {
+			if strings.ContainsAny(value, "\x00\r\n") {
+				return errors.New("report has unsafe resource metadata")
+			}
+		}
 	}
 	return nil
 }

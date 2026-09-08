@@ -154,7 +154,16 @@ spec:
                 phase:
                   {
                     type: string,
-                    enum: [Pending, Planning, AwaitingApproval, Unresolved],
+                    enum:
+                      [
+                        Pending,
+                        Planning,
+                        AwaitingApproval,
+                        Applying,
+                        Ready,
+                        CleanupPending,
+                        Unresolved,
+                      ],
                   }
                 conditions:
                   {
@@ -280,11 +289,75 @@ spec:
                     target: { type: string }
                     endpoints:
                       { type: object, additionalProperties: { type: string } }
+                    satelliteSSHPublicKeyFingerprint:
+                      { type: string, maxLength: 128 }
                     tfvarsSHA256: { type: string, maxLength: 64 }
                     values:
-                      {
-                        type: object,
-                        x-kubernetes-preserve-unknown-fields: true,
-                      }
+                      type: object
+                      properties:
+                        cluster_name: { type: string, maxLength: 128 }
+                        resource_group_name: { type: string, maxLength: 128 }
+                        region: { type: string, maxLength: 64 }
+                        cluster_mode:
+                          { type: string, enum: [vpc, classic, satellite] }
+                        platform:
+                          { type: string, enum: [kubernetes, openshift] }
+                        kube_version: { type: string, maxLength: 32 }
+                        worker_count:
+                          { type: integer, minimum: 1, maximum: 100 }
+                        zone: { type: string, maxLength: 64 }
+                        flavor: { type: string, maxLength: 64 }
+                        vpc_id: { type: string, maxLength: 128 }
+                        subnet_ids:
+                          {
+                            type: array,
+                            maxItems: 8,
+                            items: { type: string, maxLength: 128 },
+                          }
+                        public_gateway_ids:
+                          {
+                            type: array,
+                            maxItems: 8,
+                            items: { type: string, maxLength: 128 },
+                          }
+                        datacenter: { type: string, maxLength: 32 }
+                        machine_type: { type: string, maxLength: 64 }
+                        public_vlan_id: { type: string, maxLength: 64 }
+                        private_vlan_id: { type: string, maxLength: 64 }
+                        satellite_zones:
+                          {
+                            type: array,
+                            maxItems: 3,
+                            items: { type: string, maxLength: 64 },
+                          }
+                        satellite_managed_from: { type: string, maxLength: 128 }
+                        satellite_location_id: { type: string, maxLength: 128 }
+                        satellite_host_image: { type: string, maxLength: 256 }
+                        satellite_host_profile: { type: string, maxLength: 64 }
+                        satellite_ssh_key_id: { type: string, maxLength: 128 }
+                        satellite_worker_instance_ids:
+                          {
+                            type: array,
+                            maxItems: 32,
+                            items: { type: string, maxLength: 128 },
+                          }
+                        satellite_worker_operating_system:
+                          { type: string, maxLength: 64 }
                 reviewDeadline: { type: string, format: date-time }
+                reviewGeneration: { type: integer, format: int64, minimum: 1 }
+                reviewApproval: { type: string, enum: ["", approved, rejected] }
+                ready:
+                  type: object
+                  properties:
+                    resources:
+                      type: array
+                      maxItems: 256
+                      items:
+                        type: object
+                        properties:
+                          role: { type: string, maxLength: 64 }
+                          id: { type: string, maxLength: 256 }
+                          name: { type: string, maxLength: 256 }
+                          reused: { type: boolean }
+                cleanupRequested: { type: boolean }
                 diagnostic: { type: string, maxLength: 128 }
