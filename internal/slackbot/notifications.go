@@ -103,7 +103,7 @@ func statusNotices(cluster *servitorv1alpha1.ServitorCluster) []statusNotice {
 	case servitorv1alpha1.PhaseCleanupComplete:
 		texts = []string{"Cleanup complete."}
 	case servitorv1alpha1.PhaseUnresolved:
-		texts = []string{"Cleanup requires maintainer attention."}
+		texts = []string{"Cleanup is unresolved. An administrator must inspect the allocation CR status and private cluster logs."}
 	}
 	notices := phaseNotices(uid, phase, texts)
 	if cleanup := cluster.Status.Cleanup; cleanup != nil && cleanup.RetryCount > 0 {

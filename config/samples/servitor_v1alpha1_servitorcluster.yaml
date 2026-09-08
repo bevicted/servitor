@@ -1,3 +1,6 @@
+# The controller adds the cleanup finalizer and is the only status writer.
+# userOptions is explicit-only; deployment defaults are frozen in
+# status.resolvedOptions before planning. lifecycle is desired intent/policy.
 apiVersion: servitor.bevicted.github.io/v1alpha1
 kind: ServitorCluster
 metadata:

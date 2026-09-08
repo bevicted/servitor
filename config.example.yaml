@@ -1,5 +1,7 @@
-# Non-secret OpenShift operator configuration. This file is mounted from the
-# servitor-operator-config ConfigMap; do not put credential values here.
+# Non-secret OpenShift operator configuration. Mount this through the
+# servitor-operator-config ConfigMap; do not put credential values, host paths,
+# local state, or log locations here. The controller snapshots these defaults
+# into each CR status before planning.
 namespace: servitor
 slack:
   channel_id: C_REPLACE_ME
@@ -12,6 +14,8 @@ defaults:
   vpc_id: REPLACE_ME
   openshift_flavor: bx2.4x16
   kubernetes_flavor: bx2.2x8
+# This policy is copied into spec.lifecycle for each allocation. The controller
+# alone writes observed phase, deadlines, operations, retries, and summaries.
 lifecycle:
   confirmation_timeout: 5m
   lease: 4h
@@ -19,6 +23,8 @@ lifecycle:
 ict:
   target_config_map: servitor-ict-config
   target_config_key: config.yaml
+# Terraform state is stored in this COS S3 backend. HMAC values belong only in
+# the referenced Secret and never in a CR, status, result, or command argument.
 cos:
   endpoint: https://s3.us-south.cloud-object-storage.appdomain.cloud
   bucket: REPLACE_ME
@@ -31,7 +37,7 @@ cos:
   force_path_style: true
   use_lockfile: false
 images:
-  # Use the immutable digest built by `make task-image`.
+  # Use the immutable digest built by `make task-image`; it is frozen per CR.
   execution: registry.example.invalid/servitor-task@sha256:REPLACE_WITH_64_HEX_DIGEST
 secrets:
   # These are names only. Values remain in existing namespace Secrets.

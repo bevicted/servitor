@@ -7,7 +7,6 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"sync"
 
 	servitorv1alpha1 "github.com/bevicted/servitor/api/v1alpha1"
 	"github.com/bevicted/servitor/internal/command"
@@ -28,6 +27,11 @@ import (
 
 func main() {
 	configPath := flag.String("config", "", "mounted operator configuration YAML path")
+	flag.Usage = func() {
+		output := flag.CommandLine.Output()
+		_, _ = output.Write([]byte("Servitor reconciles namespaced ServitorCluster resources through Tekton PipelineRuns and COS-backed ICT.\nThe controller alone writes CR status; Slack writes authorized spec.userOptions and spec.lifecycle intent.\nTerraform plans are ephemeral and approval starts a fresh auto-approved apply from frozen resolved options.\n"))
+		flag.PrintDefaults()
+	}
 	flag.Parse()
 	path, err := config.ResolvePath(*configPath)
 	if err != nil {
@@ -115,17 +119,6 @@ func controllerConfig(operator config.Config) controller.Config {
 func config2() (*rest.Config, error) { return ctrlconfig.GetConfig() }
 func commandDefaults(operator config.Config) command.CreateDefaults {
 	return command.CreateDefaults{Version: operator.Defaults.Version, Target: operator.Defaults.Target, Provider: operator.Defaults.Provider, ResourceGroup: operator.Defaults.ResourceGroup, Zone: operator.Defaults.Zone, VPCID: operator.Defaults.VPCID, OpenShiftFlavor: operator.Defaults.OpenShiftFlavor, KubernetesFlavor: operator.Defaults.KubernetesFlavor}
-}
-
-// waitForCleanup remains a small shutdown helper for callers that need to
-// await already-started local work. The operator itself does not cancel or
-// wait for PipelineRuns when Slack leadership changes.
-func waitForCleanup(runErr error, activity *sync.WaitGroup) error {
-	activity.Wait()
-	if runErr != nil && !errors.Is(runErr, context.Canceled) {
-		return runErr
-	}
-	return nil
 }
 
 func fail(err error) { _, _ = os.Stderr.WriteString("servitor: " + err.Error() + "\n"); os.Exit(1) }

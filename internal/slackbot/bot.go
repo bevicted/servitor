@@ -148,7 +148,7 @@ func (b Bot) create(ctx context.Context, message Message, text string, respond f
 		return
 	}
 	if b.Client == nil || b.Namespace == "" {
-		respond(rejectedText("Create is unavailable. The operator must inspect the private server logs."))
+		respond(rejectedText("Create is unavailable. Inspect the allocation CR status and private cluster logs."))
 		return
 	}
 	name := ownerClusterName(message.User)
@@ -265,13 +265,13 @@ func (b Bot) extend(ctx context.Context, message Message, thread string, require
 
 func (b Bot) list(ctx context.Context, user string, respond func(string)) {
 	if b.Client == nil || b.Namespace == "" {
-		respond(rejectedText("List is unavailable. The operator must inspect the private server logs."))
+		respond(rejectedText("List is unavailable. Inspect the allocation CR status and private cluster logs."))
 		return
 	}
 	var clusters servitorv1alpha1.ServitorClusterList
 	if err := b.Client.List(ctx, &clusters, client.InNamespace(b.Namespace)); err != nil {
 		b.logf("list allocations: %v", err)
-		respond(rejectedText("Unable to list clusters. No cleanup is running; this requires maintainer attention."))
+		respond(rejectedText("Unable to list clusters. No operation was started."))
 		return
 	}
 	for _, text := range clusterListMessages(clusters.Items, user, b.now()) {

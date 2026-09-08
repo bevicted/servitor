@@ -5,82 +5,15 @@ import (
 	"os"
 	"strings"
 	"testing"
-
-	"github.com/bevicted/servitor/internal/diagnostics"
 )
-
-func TestRunnerLogsStartProcessFailureToDiagnosticWriter(t *testing.T) {
-	logger, err := diagnostics.Open(t.TempDir(), 4096)
-	if err != nil {
-		t.Fatal(err)
-	}
-	writer, err := logger.Writer("111111111111111111111111", "U1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := (Runner{Log: writer}).Run(context.Background(), t.TempDir()+"/missing-command"); err == nil {
-		t.Fatal("Run succeeded for a missing executable")
-	}
-	segments, err := writer.Segments()
-	if err != nil {
-		t.Fatal(err)
-	}
-	var contents strings.Builder
-	for _, segment := range segments {
-		data, err := os.ReadFile(segment)
-		if err != nil {
-			t.Fatal(err)
-		}
-		contents.Write(data)
-	}
-	for _, want := range []string{"kind=argv", "missing-command", "kind=error", "start command:"} {
-		if !strings.Contains(contents.String(), want) {
-			t.Fatalf("diagnostic log missing %q: %s", want, contents.String())
-		}
-	}
-}
-
-func TestRunnerFlushesUnterminatedDiagnosticOutput(t *testing.T) {
-	if os.Getenv("SERVITOR_COMMAND_DIAGNOSTIC_HELPER") == "1" {
-		_, _ = os.Stdout.WriteString(`{"values":{"remote":"value"}}`)
-		os.Exit(0)
-	}
-	t.Setenv("SERVITOR_COMMAND_DIAGNOSTIC_HELPER", "1")
-	logger, err := diagnostics.Open(t.TempDir(), 200)
-	if err != nil {
-		t.Fatal(err)
-	}
-	writer, err := logger.Writer("111111111111111111111111", "U1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := (Runner{Log: writer}).Run(context.Background(), os.Args[0], "-test.run=^TestRunnerFlushesUnterminatedDiagnosticOutput$", "--"); err != nil {
-		t.Fatal(err)
-	}
-	segments, err := writer.Segments()
-	if err != nil {
-		t.Fatal(err)
-	}
-	var contents strings.Builder
-	for _, segment := range segments {
-		data, err := os.ReadFile(segment)
-		if err != nil {
-			t.Fatal(err)
-		}
-		contents.Write(data)
-	}
-	if !strings.Contains(contents.String(), "kind=output {\"values\":{\"remote\":\"value\"}}\n") {
-		t.Fatalf("unterminated output was not framed: %q", contents.String())
-	}
-}
 
 func TestRunnerUsesArgumentVectorAndBoundsOutput(t *testing.T) {
 	if os.Getenv("SERVITOR_COMMAND_HELPER") == "1" {
 		if os.Args[len(os.Args)-1] != "literal;not-a-shell-command" {
 			os.Exit(2)
 		}
-		os.Stdout.WriteString(strings.Repeat("x", 32))
-		os.Stderr.WriteString(strings.Repeat("y", 32))
+		_, _ = os.Stdout.WriteString(strings.Repeat("x", 32))
+		_, _ = os.Stderr.WriteString(strings.Repeat("y", 32))
 		return
 	}
 	t.Setenv("SERVITOR_COMMAND_HELPER", "1")

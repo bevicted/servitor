@@ -8,11 +8,9 @@ import (
 	"io"
 	"log"
 	"os"
-
-	"github.com/bevicted/servitor/internal/diagnostics"
 )
 
-// Runner executes commands and preserves bounded diagnostic output for private logs.
+// Runner executes commands and preserves bounded output for task-local logs.
 type Runner struct {
 	MaxOutput int
 	Log       io.Writer
@@ -28,9 +26,6 @@ type Result struct {
 
 // Run executes name and args directly, never through a shell.
 func (r Runner) Run(ctx context.Context, name string, args ...string) (Result, error) {
-	if writer, ok := r.Log.(*diagnostics.Writer); ok {
-		writer.Command(append([]string{name}, args...)...)
-	}
 	if err := ctx.Err(); err != nil {
 		return Result{}, err
 	}
@@ -42,25 +37,22 @@ func (r Runner) Run(ctx context.Context, name string, args ...string) (Result, e
 	if err != nil {
 		return Result{}, fmt.Errorf("create stdout pipe: %w", err)
 	}
-	defer stdoutReader.Close()
-	defer stdoutWriter.Close()
+	defer closeFile(stdoutReader)
 	stderrReader, stderrWriter, err := os.Pipe()
 	if err != nil {
+		closeFile(stdoutWriter)
 		return Result{}, fmt.Errorf("create stderr pipe: %w", err)
 	}
-	defer stderrReader.Close()
-	defer stderrWriter.Close()
+	defer closeFile(stderrReader)
 
 	process, err := os.StartProcess(name, append([]string{name}, args...), &os.ProcAttr{Files: []*os.File{os.Stdin, stdoutWriter, stderrWriter}})
 	if err != nil {
-		startErr := fmt.Errorf("start command: %w", err)
-		if writer, ok := r.Log.(*diagnostics.Writer); ok {
-			writer.Error(startErr)
-		}
-		return Result{}, startErr
+		closeFile(stdoutWriter)
+		closeFile(stderrWriter)
+		return Result{}, fmt.Errorf("start command: %w", err)
 	}
-	_ = stdoutWriter.Close()
-	_ = stderrWriter.Close()
+	closeFile(stdoutWriter)
+	closeFile(stderrWriter)
 	var stdout, stderr boundedBuffer
 	stdout.limit = limit
 	stderr.limit = limit
@@ -93,9 +85,6 @@ func (r Runner) Run(ctx context.Context, name string, args ...string) (Result, e
 	}
 	<-stdoutDone
 	<-stderrDone
-	if writer, ok := r.Log.(*diagnostics.Writer); ok {
-		writer.Flush()
-	}
 	result := Result{
 		Stdout:          stdout.String(),
 		Stderr:          stderr.String(),
@@ -104,12 +93,17 @@ func (r Runner) Run(ctx context.Context, name string, args ...string) (Result, e
 	}
 	if err != nil {
 		if r.Log != nil {
-			argv := diagnostics.RedactArgv(append([]string{name}, args...))
-			log.New(r.Log, "command: ", log.LstdFlags|log.LUTC).Printf("%q failed: %v\nstdout:\n%s\nstderr:\n%s", argv, err, result.Stdout, result.Stderr)
+			log.New(r.Log, "command: ", log.LstdFlags|log.LUTC).Printf("%q failed: %v\nstdout:\n%s\nstderr:\n%s", append([]string{name}, args...), err, result.Stdout, result.Stderr)
 		}
 		return result, fmt.Errorf("command failed")
 	}
 	return result, nil
+}
+
+func closeFile(file *os.File) {
+	if err := file.Close(); err != nil {
+		log.Printf("close command pipe: %v", err)
+	}
 }
 
 func copyOutput(destination io.Writer, source *os.File) <-chan error {

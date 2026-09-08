@@ -1,146 +1,80 @@
 # Servitor
 
-Servitor is a Slack Socket Mode front end for ICT. It provisions at most one temporary IBM Cloud cluster for each Slack user. It is fail-closed: only the configured channel can start or stop a lifecycle, and only the lifecycle owner can act on that owner's ICT workspace.
+Servitor is a namespaced Kubernetes operator with a leader-elected Slack Socket Mode front end. It creates one `ServitorCluster` custom resource (CR) per Slack owner and reconciles temporary IBM Cloud clusters through Tekton PipelineRuns and ICT. There is no host-local Servitor runtime, workspace authority, lifecycle file, or migration path.
 
-## Install the Slack app
+## Ownership and lifecycle
 
-Enable Socket Mode. The minimum scopes and event subscriptions are:
+Slack validates authorized requests and writes only `spec.userOptions` and `spec.lifecycle` intent. The controller is the only writer of CR status. It snapshots configured defaults with the explicit safe user options once in `status.resolvedOptions`, including generated names and the pinned execution image. Changed deployment defaults never alter an existing allocation.
 
-- App-level: `connections:write`.
-- Bot: `chat:write`, `im:history`, and `channels:history` for a public configured channel and/or `groups:history` for a private configured channel.
-- Events: `message.im` plus `message.channels` for public-channel support and/or `message.groups` for private-channel support.
+The CR owns the observed lifecycle:
 
-Invite the bot only to the configured channel. Do not add `app_mentions:read`, reaction scopes, profile scopes such as `users:read`, conversation-membership scopes, `im:read`, `im:write`, or other IM scopes. Servitor does not use them.
+- `spec.lifecycle` holds review approval, requested extension expiry, cleanup intent, and the immutable lease/retry snapshot.
+- The controller records phase, review and lease deadlines, resolved options, non-secret recovery metadata, backend identity, operation identity, summaries, retry state, and diagnostic reason in `status`.
+- Planning creates a disposable PipelineRun. The review is approval of the frozen configuration, not an exact saved Terraform plan. Approval starts a fresh ICT apply with `--auto-approve`; cloud drift can change Terraform actions between review and apply.
+- Terraform state is stored only in the configured IBM Cloud Object Storage (COS) S3 backend. Planning metadata and Terraform plans are ephemeral task-local files. No PVC, artifact store, saved-plan handoff, or custom COS client is used.
+- `done`, lease expiry, failed apply, rejected or expired review, and CR deletion use the cleanup finalizer. Apply and destroy never overlap. Failed destroy retries from persisted absolute deadlines; exhausted cleanup remains `Unresolved` with recovery context and finalizer retained.
 
-Keep tokens out of YAML and source control:
+Controller restart recovery is supported: persisted operations, status snapshots, and deadlines are observed rather than recreated. Tekton worker-loss recovery and management-cluster disaster recovery are not supported.
 
-```sh
-export SLACK_BOT_TOKEN='...'
-export SLACK_APP_TOKEN='...'
-```
+## Deploy
 
-## Configure and run
-
-Install [ICT](https://github.com/bevicted/ict) from its public release path:
+Build immutable operator and task images, then replace the digest placeholders in the deployment overlay:
 
 ```sh
-go install github.com/bevicted/ict@latest
+make operator-image OPERATOR_IMAGE=registry.example/servitor-operator@sha256:...
+make task-image TASK_IMAGE=registry.example/servitor-task@sha256:...
+kubectl kustomize config/default
 ```
 
-Copy `config.example.yaml` to a private operator location. The template is intentionally incomplete: fill every empty field, including Slack IDs, ICT paths, runtime paths, and all defaults, before startup. Configuration lookup order is:
+Copy `config.example.yaml` to the ConfigMap input used by `config/default`. It contains only non-secret deployment settings: namespace, Slack channel ID, safe defaults, lifecycle policy, ICT target ConfigMap, COS S3 identity, task image digest, and Secret names. `config/default/operator-references.env` supplies resource names. Do not put Slack, IBM Cloud, or COS HMAC values in configuration, CRs, status, CLI arguments, reports, or source control.
 
-1. `-config PATH`
-2. `SERVITOR_CONFIG`
-3. `$XDG_CONFIG_HOME/servitor/config.yaml` (or the platform user config directory, normally `~/.config/servitor/config.yaml`)
+The manager reads its mounted configuration from `/etc/servitor/config/config.yaml`; `-config PATH` or `SERVITOR_CONFIG` can select another mounted path. The controller receives the Slack Secret only. Tekton execution receives COS HMAC and IBM credentials from namespace Secrets; the report step receives neither. The task service account has no CR or status write permissions.
 
-Secrets are environment-only. The selected non-secret configuration path is recorded in the private startup log. Restrict the configuration file and keep `paths.state`, `paths.logs`, ICT workspaces, Terraform plans, state, and logs outside the repository.
+Apply the rendered resources in the target namespace. They include the CRD, controller Role, empty-permission task Role, controller Deployment, ConfigMaps, Tekton Task/Pipeline, and a sample CR. The controller reads the selected report container's private Pod log after a PipelineRun completes and validates its bounded structured result before changing status.
 
-```sh
-mkdir -p "${XDG_CONFIG_HOME:-$HOME/.config}/servitor"
-cp config.example.yaml "${XDG_CONFIG_HOME:-$HOME/.config}/servitor/config.yaml"
-chmod 600 "${XDG_CONFIG_HOME:-$HOME/.config}/servitor/config.yaml"
-SLACK_BOT_TOKEN='...' SLACK_APP_TOKEN='...' go run ./cmd/servitor
-```
+## Slack interface
 
-`defaults.version` makes bare `create` valid. `lifecycle.lease` is the initial lease and must be a whole number of hours from `1h` through `24h`. `extend` adds from the current expiry, but remaining time is always capped at 24 hours; total cluster lifetime is not capped. IBM VPC cluster creation is allowed up to 90 minutes.
-
-Servitor passes `--prefix servitor` to ICT. Generated cloud resource names therefore begin `servitor-`; the ICT workspace remains the caller's Slack ID.
-
-## Commands and routing
-
-DM commands are bare. Configured-channel root commands require exactly one leading authenticated bot mention, for example `@servitor create`. Ordinary channel conversation, a mention in the middle of text, a wrong bot mention, and unmentioned root text are ignored. `help` and `list` are available in both DMs and the configured channel.
+Enable Socket Mode with `connections:write`, `chat:write`, and the message-history scopes/events needed for the configured channel and DMs. Keep `SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` in the referenced Kubernetes Secret.
 
 ```text
 DM
-  help [command]          print help
-  list                    list clusters
+  help [command]
+  list
 
 Configured channel
-  @servitor help [command]  print help
-  @servitor create [flags]  provision a new cluster
-  @servitor done            release your resources
-  @servitor extend [N[h]]   extend your lease
-  @servitor list            list clusters
+  @servitor help [command]
+  @servitor create [safe flags]
+  @servitor done
+  @servitor extend [N[h]]
+  @servitor list
 
 Lifecycle thread
-  yes                       approve the cluster plan
-  no                        reject the cluster plan
-  done                      release your resources
-  extend [N[h]]             extend your lease
+  yes | no
+  done
+  extend [N[h]]
 ```
 
-`destroy` is an accepted, silent alias for `done`; it is intentionally not shown in help. Root `help` and unknown commands produce useful command help. `help create`, `help extend`, `help done`, and `help list` provide command-specific syntax. The configured maintainer's DM help additionally shows `status`, `pause`, `unpause`, and `stop`; other users are not told about those commands.
+`create` writes explicit safe flags to `spec.userOptions`; the controller overlays startup defaults and records the resolved result. Only the owner in the initiating thread can approve, reject, extend, or request cleanup. `destroy` remains a silent alias for `done`.
 
-Root commands promptly report one of `Command accepted.\nPlanning...`, `Command rejected.`, or `Command unknown.`. A create acceptance must be delivered before Servitor starts ICT. Creation planning has no periodic heartbeat.
-
-### Create, review, and readiness
-
-Use bare create for configured defaults, or supply safe typed flags:
-
-```text
-@servitor create
-@servitor create --version 1.36
-@servitor create --version 4.22 --provider classic --datacenter dal10
-```
-
-The safe flags are:
-
-```text
-Common
-  --target --provider --platform --version --resource-group --name --worker-count
-
-VPC Gen 2
-  --zone --flavor --vpc-id --subnet-id --public-gateway-id
-
-Classic
-  --datacenter --machine-type --public-vlan-id --private-vlan-id
-
-Satellite
-  --satellite-zone --satellite-managed-from --satellite-location-id
-  --satellite-host-image --satellite-host-profile --satellite-ssh-key-id
-  --satellite-worker-instance-id --satellite-worker-operating-system
-```
-
-Servitor immediately sends planning feedback, then posts a sanitized, tabular review with normalized target, platform/version, provider, location, resource group, worker and network choices, plus resource action counts. Only the initiating user may approve by replying with the exact, case-sensitive raw text `yes` in that initiating lifecycle thread within five minutes. Exact `no` declines. Unknown replies, replies in other threads, other users, and root confirmations are ignored.
-
-After durable approval, Servitor immediately posts:
-
-```text
-Plan approved.
-Creating... This may take 30m-90m.
-
-Diagnostic ID: `ID`
-```
-
-A second `yes` during apply reports progress but cannot start another apply. Ready output uses separate, readable Created and Reused tables, shows the UTC expiry, and says how to use `done`. Lease expiry timestamps in ready, list, existing-allocation, and extension responses use `YYYY-MM-DD HH:MM:SS UTC (~Nh)`, with remaining hours rounded to the nearest hour. Slack output contains only whitelisted, sanitized metadata; it never includes Terraform plan/state, filesystem paths, credentials, subprocess output, or private logs. Long help, review, ready, and list output is split at logical boundaries with balanced code fences.
-
-### List, cleanup, and extension
-
-`list` is a Slack code-block table of known lifecycle records with cluster, state, location, and expiry. It never resolves Slack identities and marks only the caller's row with `*`; unavailable values are `-`. An empty list contains the table header only.
-
-`done` in the active lifecycle thread, or `@servitor done` in the configured channel, requests cleanup only for the caller's dedicated Slack-ID workspace. Cleanup starts asynchronously, retries after 1, 5, and 15 minutes, and never removes unrelated ICT workspaces such as `default`. A final cleanup failure remains unresolved for maintainer investigation.
-
-`extend`, only for a ready lifecycle owned by the caller, accepts bare `extend`, `extend N`, or `extend Nh`, where `N` is an integer from 1 through 24. Bare form adds the configured initial lease. On success, Slack uses an aligned code block for the previous expiry, new expiry, and actual added duration. Exact-hour additions use `Nh`; a clamped addition below one hour uses `<1h`; other partial-hour additions use rounded `~Nh`. Remaining lease time is capped at 24 hours.
-
-## Lifecycle state and restart behavior
-
-The authoritative record is `.servitor-lifecycle.json` inside the caller's Servitor-owned ICT workspace. ICT-local records are removed with a successful workspace destroy. `ict list --output json` is used privately to discover workspace paths; paths are never sent to Slack.
-
-On restart, Servitor cleans up interrupted review or apply instead of resuming it, restores ready and extended-ready lease deadlines, starts cleanup for an expired lease, resumes cleanup retries, and retains final cleanup failures as unresolved. A missing workspace while resources may still exist is unresolved, not proof of remote deletion. A record-less Slack-ID workspace is conservatively cleaned up; unrelated workspaces such as `default` are retained.
+There are no maintainer `status`, `pause`, `unpause`, or `stop` commands, and no replacement command for them. Slack delivery is not exactly once: a controller crash after posting and before recording the receipt can duplicate a notification.
 
 ## Operations and diagnostics
 
-Startup writes progress to stderr and private `paths.logs/servitor.log`: configuration load, Slack authentication, reconciliation, and `ready; accepting Socket Mode events`. The log correlates safe event and lifecycle identifiers, admission outcomes, diagnostic IDs, and private diagnostic locations. Private diagnostic output is logical-line framed, ANSI-free, and rotated between records at `logs.max_size_bytes`; each complete logical output line is reconstructable across rotation, including long JSON lines.
+Use opaque Kubernetes references when investigating a lifecycle: the namespaced `ServitorCluster` name/UID, `status.operation.id`, `status.operation.pipelineRunName`, the matching TaskRun, and the report container's private Pod log. Inspect private cluster logs with authorized cluster access. Do not expose or copy credentials, raw Terraform plans or state, task report internals, workspace paths, or host filesystem paths into Slack, CR status, tickets, or source control.
 
-Each lifecycle has an opaque diagnostic ID. Slack diagnostic references render the ID as inline code. On the authenticated host, inspect `paths.logs/<diagnostic-id>/`; never copy these logs, plans, state, or workspace paths into Slack or source control. Resolved lifecycle and recordless diagnostics are retained for `logs.resolved_retention` (720 hours in the example). Active and unresolved diagnostics are retained conservatively.
+Excluded behavior is intentional: no local compatibility or allocation migration, no local filesystem/process supervision, no PVC or artifact store, no Tekton worker-loss recovery, no management-cluster disaster recovery, no exactly-once Slack guarantee, and no maintainer-command replacement.
 
-The maintainer uses bare DM commands:
+## Sample CR
 
-- `status`: show admission mode and activity counts.
-- `pause`: immediately pause new modifying commands and decline pending reviews. Existing apply and cleanup continue.
-- `unpause`: reopen admission only from paused.
-- `stop`: immediately enter `draining-to-stop`, decline pending reviews, wait without an automatic deadline for applies and cleanup/retry chains, notify the maintainer, then exit.
+`config/samples/servitor_v1alpha1_servitorcluster.yaml` shows the schema. Create requests normally originate from Slack, but an authorized automation client can create a CR with immutable Slack identity, explicit `spec.userOptions`, and the required `spec.lifecycle` lease/retry snapshot. The controller adds the cleanup finalizer and writes all status fields.
 
-While paused or draining, users may only use `help` and `list`; automatic expiry cleanup continues. A future ready lease does not block graceful stop and is restored at the next start. Use `stop` for normal maintenance. SIGINT and SIGTERM are emergency interruption paths, not a replacement for graceful drain.
+## Development verification
 
-For unresolved cleanup, inspect the private diagnostics and `ict list`, then perform required local ICT remediation for the caller's Slack-ID workspace. Preserve unrelated `default` and any other non-Servitor workspace.
+```sh
+gofmt -d $(find api cmd internal -name '*.go')
+go test ./...
+go test -race ./...
+kubectl kustomize config/default
+```
+
+Live OpenShift, Tekton, COS, and Slack checks require the designated cluster namespace, COS key prefix, and credentials. Do not treat missing or pruned task logs as proof that a cloud operation did not run.

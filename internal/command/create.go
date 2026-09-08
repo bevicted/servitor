@@ -12,7 +12,7 @@ type CreateDefaults struct {
 	OpenShiftFlavor, KubernetesFlavor                     string
 }
 
-// CreateRequest is the validated, shell-free ICT create argument vector.
+// CreateRequest is the validated, shell-free provisioning option vector.
 type CreateRequest struct {
 	Target, Platform, Version, Provider, ResourceGroup      string
 	WorkerShape, WorkerCount                                string
