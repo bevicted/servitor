@@ -3,34 +3,33 @@ package slackbot
 
 import (
 	"context"
-	"errors"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"log"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
 	"unicode/utf8"
 
-	"github.com/bevicted/servitor/internal/admission"
+	servitorv1alpha1 "github.com/bevicted/servitor/api/v1alpha1"
 	"github.com/bevicted/servitor/internal/command"
-	"github.com/bevicted/servitor/internal/diagnostics"
 	"github.com/bevicted/servitor/internal/lifecycle"
-	"github.com/bevicted/servitor/internal/state"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 const maxSlackMessage = 3000
 
-type EventStore interface{ Claim(string) (bool, error) }
-type ListClient interface {
-	WorkspaceInventoryDiagnostic(context.Context, string, string) (state.WorkspaceInventory, error)
+type EventStore interface {
+	Claim(context.Context, string) (bool, error)
 }
 type Responder interface {
 	Reply(context.Context, Response) error
-}
-type lifecycleHandler interface {
-	lifecycle.Destroyer
-	OwnsThread(lifecycle.Request) bool
-	Extend(context.Context, lifecycle.Request, time.Duration, lifecycle.Notifier) (lifecycle.ExtensionResult, error)
 }
 type Message struct{ Channel, ChannelType, User, Text, Timestamp, ThreadTimestamp, Subtype, BotID string }
 type Envelope struct {
@@ -40,19 +39,18 @@ type Envelope struct {
 }
 type Response struct{ Channel, Text, ThreadTimestamp string }
 
-// Bot routes messages while preserving the configured-channel authorization boundary.
+// Bot accepts authorized Slack commands and mutates only ServitorCluster.spec.
+// The reconciler exclusively owns status and all Tekton execution.
 type Bot struct {
 	ChannelID, SelfUserID string
-	MaintainerID          string
-	Admission             *admission.Control
+	Namespace             string
+	Client                client.Client
 	Events                EventStore
-	ICT                   ListClient
-	Lifecycles            *state.LifecycleStore
-	Lifecycle             lifecycleHandler
-	Creator               lifecycle.CreateHandler
 	Defaults              command.CreateDefaults
+	ConfirmationTimeout   time.Duration
+	Lease                 time.Duration
+	RetryIntervals        []time.Duration
 	Responder             Responder
-	GracefulStop          func(lifecycle.Request, <-chan struct{})
 	Clock                 func() time.Time
 	Logf                  func(string, ...any)
 }
@@ -64,7 +62,10 @@ func (b Bot) Handle(ctx context.Context, envelope Envelope) error {
 		}
 	}
 	if envelope.ID != "" {
-		claimed, err := b.Events.Claim(envelope.ID)
+		if b.Events == nil {
+			return fmt.Errorf("record Slack event: receipt store is not configured")
+		}
+		claimed, err := b.Events.Claim(ctx, envelope.ID)
 		if err != nil {
 			return fmt.Errorf("record Slack event: %w", err)
 		}
@@ -76,312 +77,348 @@ func (b Bot) Handle(ctx context.Context, envelope Envelope) error {
 	if message.Subtype != "" || message.BotID != "" || (b.SelfUserID != "" && message.User == b.SelfUserID) {
 		return nil
 	}
-
-	isDM := message.ChannelType == "im"
-	thread := message.Timestamp
-	if isDM {
-		thread = ""
-	} else if message.ThreadTimestamp != "" {
-		thread = message.ThreadTimestamp
-	}
-	reply := func(text string) error {
-		return b.Responder.Reply(ctx, Response{Channel: message.Channel, Text: text, ThreadTimestamp: thread})
-	}
-	respond := func(text string) {
-		if err := reply(text); err != nil {
-			b.logf("deliver Slack reply: %v", err)
-		}
-	}
-	notify := func(noticeCtx context.Context, notice lifecycle.Notice) error {
-		err := b.Responder.Reply(noticeCtx, Response{Channel: notice.Channel, ThreadTimestamp: notice.ThreadTimestamp, Text: notice.Text})
-		if err != nil {
-			b.logf("deliver lifecycle Slack reply: %v", err)
-		}
-		return err
-	}
-
-	if isDM {
-		category := commandCategory(message.Text)
-		b.logCommand(envelope, message, thread, category, b.dmCommandAccepted(message.User, message.Text, category))
-		b.handleDM(ctx, message, reply, respond, notify)
+	if message.ChannelType == "im" {
+		b.handleDM(ctx, message)
 		return nil
 	}
 	if message.Channel != b.ChannelID {
 		return nil
 	}
-
-	raw := message.Text
+	thread := message.Timestamp
 	if message.ThreadTimestamp != "" {
-		request := lifecycle.Request{UserID: message.User, Channel: message.Channel, ThreadTimestamp: thread, RawThread: true}
-		if modifyingCommand(firstToken(raw)) && !b.admissionOpen() {
-			if b.ownsThread(request) {
-				b.logCommand(envelope, message, thread, firstToken(raw), false)
-				respond(modeRejection(b.admissionMode()))
-			}
-			return nil
-		}
-		if firstToken(raw) == "extend" {
-			b.logCommand(envelope, message, thread, "extend", b.Lifecycle != nil && b.Lifecycle.OwnsThread(request))
-			b.handleExtension(ctx, request, raw, notify, respond)
-			return nil
-		}
-		switch raw {
-		case "yes", "no":
-			outcome := b.handleConfirmation(ctx, request, raw, notify, respond)
-			b.logConfirmation(envelope, message, thread, raw, outcome)
-			return nil
-		case "done", "destroy":
-			b.logCommand(envelope, message, thread, raw, b.Lifecycle != nil && b.Lifecycle.OwnsThread(request))
-			b.handleThreadCleanup(ctx, request, notify, respond)
-			return nil
-		}
+		thread = message.ThreadTimestamp
 	}
-
+	reply := func(text string) { b.respond(ctx, message.Channel, thread, text) }
+	if message.ThreadTimestamp != "" {
+		switch message.Text {
+		case "yes", "no":
+			b.confirm(ctx, message, thread)
+		case "done":
+			b.cleanup(ctx, message, thread, true)
+		case "destroy":
+			b.cleanup(ctx, message, thread, false)
+		default:
+			if firstToken(message.Text) == "extend" {
+				b.extend(ctx, message, thread, true, reply)
+			}
+		}
+		return nil
+	}
 	text, mentioned := channelCommand(message.Text, b.SelfUserID)
 	if !mentioned {
 		return nil
 	}
-	request := lifecycle.Request{UserID: message.User, Channel: message.Channel, ThreadTimestamp: thread, RawThread: message.ThreadTimestamp != ""}
-	category := commandCategory(text)
-	b.logCommand(envelope, message, thread, category, b.channelCommandAccepted(category, request))
-	b.handleChannelRoot(ctx, message, request, text, reply, respond, notify)
+	switch firstToken(text) {
+	case "help":
+		b.respondHelp(text, reply)
+	case "list":
+		b.list(ctx, message.User, reply)
+	case "create":
+		b.create(ctx, message, text, reply)
+	case "done":
+		b.cleanup(ctx, message, thread, true)
+	case "destroy":
+		b.cleanup(ctx, message, thread, false)
+	case "extend":
+		b.extend(ctx, message, thread, false, reply)
+	default:
+		reply(unknownText())
+	}
 	return nil
 }
 
-func (b Bot) handleDM(ctx context.Context, message Message, reply func(string) error, respond func(string), notify lifecycle.Notifier) {
-	commandText := strings.TrimSpace(message.Text)
-	if message.User == b.MaintainerID && len(strings.Fields(commandText)) == 1 {
-		switch firstToken(commandText) {
-		case "status":
-			respond(maintainerStatus(b.admissionStatus()))
-			return
-		case "pause":
-			if b.Admission == nil {
-				respond(rejectedText("Admission control is unavailable."))
-				return
-			}
-			status, changed, err := b.Admission.Pause()
-			if err != nil {
-				b.logf("pause admission: %v", err)
-				respond(rejectedText("Unable to pause admission. The operator must inspect the private server logs."))
-				return
-			}
-			respond(maintainerStatus(status))
-			if changed {
-				if creator, ok := b.Creator.(interface{ DeclinePendingReviews(lifecycle.Notifier) }); ok {
-					go creator.DeclinePendingReviews(notify)
-				}
-			}
-			return
-		case "unpause":
-			if b.Admission == nil {
-				respond(rejectedText("Admission control is unavailable."))
-				return
-			}
-			status, _, err := b.Admission.Unpause()
-			if err != nil {
-				b.logf("unpause admission: %v", err)
-				respond(rejectedText("Unable to unpause admission. The operator must inspect the private server logs."))
-				return
-			}
-			respond(maintainerStatus(status))
-			return
-		case "stop":
-			if b.Admission == nil || b.GracefulStop == nil {
-				respond(rejectedText("Graceful stop is unavailable. The operator must inspect the private server logs."))
-				return
-			}
-			status, changed, drained, err := b.Admission.Stop()
-			if err != nil {
-				b.logf("start graceful stop: %v", err)
-				respond(rejectedText("Unable to start graceful stop. The operator must inspect the private server logs."))
-				return
-			}
-			respond(maintainerStatus(status))
-			if changed {
-				if creator, ok := b.Creator.(interface{ DeclinePendingReviews(lifecycle.Notifier) }); ok {
-					go creator.DeclinePendingReviews(notify)
-				}
-				go b.GracefulStop(lifecycle.Request{UserID: message.User, Channel: message.Channel}, drained)
-			}
-			return
-		}
-	}
-	switch firstToken(commandText) {
+func (b Bot) handleDM(ctx context.Context, message Message) {
+	respond := func(text string) { b.respond(ctx, message.Channel, "", text) }
+	switch firstToken(message.Text) {
 	case "help":
-		b.respondHelp(commandText, message.User == b.MaintainerID, respond)
+		b.respondHelp(message.Text, respond)
 	case "list":
 		b.list(ctx, message.User, respond)
-	case "":
-		respond(unknownText())
 	case "create", "done", "destroy", "extend":
 		respond(rejectedText("That command is available only in the configured channel."))
-	case "status", "pause", "unpause", "stop":
-		b.respondHelp("help", false, respond)
 	default:
 		respond(unknownText())
 	}
-	_ = reply
 }
 
-func (b Bot) handleExtension(ctx context.Context, request lifecycle.Request, text string, notify lifecycle.Notifier, respond func(string)) {
-	if b.Lifecycle == nil || (request.RawThread && !b.Lifecycle.OwnsThread(request)) {
-		return
-	}
-	increment, err := command.ParseExtend(text)
+func (b Bot) create(ctx context.Context, message Message, text string, respond func(string)) {
+	options, err := command.ParseCreateOptions(text)
 	if err != nil {
 		respond(rejectedText(err.Error()))
 		return
 	}
-	if _, err := b.Lifecycle.Extend(ctx, request, increment, notify); err != nil {
-		respond(rejectedText(err.Error()))
-	}
-}
-
-func (b Bot) handleThreadCleanup(ctx context.Context, request lifecycle.Request, notify lifecycle.Notifier, respond func(string)) {
-	if b.Lifecycle == nil || !b.Lifecycle.OwnsThread(request) {
+	if b.Client == nil || b.Namespace == "" {
+		respond(rejectedText("Create is unavailable. The operator must inspect the private server logs."))
 		return
 	}
-	if b.Creator != nil && b.Creator.Cancel(ctx, request, notify) {
-		respond("Command accepted.\nCleaning up...")
+	name := ownerClusterName(message.User)
+	existing := &servitorv1alpha1.ServitorCluster{}
+	err = b.Client.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: name}, existing)
+	if err == nil {
+		respond(existingAllocationNotice(existing, b.now()))
 		return
 	}
-	respond("Command accepted.\nCleaning up...")
-	if err := b.Lifecycle.RequestDestroy(ctx, request, notify); err != nil {
-		b.logf("start cleanup: %v", err)
-	}
-}
-
-func (b Bot) handleChannelRoot(ctx context.Context, message Message, request lifecycle.Request, text string, reply func(string) error, respond func(string), notify lifecycle.Notifier) {
-	if modifyingCommand(firstToken(text)) && !b.admissionOpen() {
-		respond(modeRejection(b.admissionMode()))
+	if !apierrors.IsNotFound(err) {
+		b.logf("get existing allocation: %v", err)
+		respond(rejectedText("Unable to check an existing allocation. No operation was started."))
 		return
 	}
-	switch firstToken(text) {
-	case "help":
-		b.respondHelp(text, false, respond)
-	case "list":
-		b.list(ctx, message.User, respond)
-	case "create":
-		if message.ThreadTimestamp != "" {
-			respond(rejectedText("Create must be started from the configured channel root."))
-			return
-		}
-		if b.Creator == nil {
-			respond(rejectedText("Create is unavailable. The operator must inspect the private server logs."))
-			return
-		}
-		if err := b.Creator.Start(ctx, request, text, notify); err != nil {
-			var noticeError lifecycle.UserNoticeError
-			if errors.As(err, &noticeError) {
-				respond(rejectedText(noticeError.UserNotice()))
-				return
-			}
-			var deliveryError *lifecycle.AcceptanceDeliveryError
-			if errors.As(err, &deliveryError) {
-				// A failed acceptance reply is deliberately silent: Start has not invoked ICT.
-				b.logf("start create: %v", err)
-				return
-			}
-			respond(rejectedText(err.Error()))
-		}
-	case "extend":
-		b.handleExtension(ctx, request, text, notify, respond)
-	case "done", "destroy":
-		if request.RawThread {
-			b.handleThreadCleanup(ctx, request, notify, respond)
-			return
-		}
-		if b.Creator != nil && b.Creator.Cancel(ctx, request, notify) {
-			respond("Command accepted.\nCleaning up...")
-			return
-		}
-		if b.Lifecycle == nil {
-			respond(rejectedText("Cleanup is unavailable. The operator must inspect the private server logs."))
-			return
-		}
-		respond("Command accepted.\nCleaning up...")
-		if err := b.Lifecycle.RequestDestroy(ctx, request, notify); err != nil {
-			b.logf("start cleanup: %v", err)
-		}
-	default:
-		respond(unknownText())
-	}
-	_ = reply
-}
-
-func (b Bot) handleConfirmation(ctx context.Context, request lifecycle.Request, text string, notify lifecycle.Notifier, respond func(string)) lifecycle.ConfirmationOutcome {
-	if b.Creator == nil {
-		return lifecycle.ConfirmationNoLifecycle
-	}
-	outcome, err := b.Creator.ConfirmResult(ctx, request, text, notify)
-	if err != nil {
-		var noticeError lifecycle.UserNoticeError
-		if errors.As(err, &noticeError) {
-			respond(rejectedText(noticeError.UserNotice()))
-			return outcome
-		}
-		b.logf("confirm lifecycle: %v", err)
-		return outcome
-	}
-	if outcome == lifecycle.ConfirmationApplying && text == "yes" {
-		respond("Creation is already in progress.")
-	}
-	return outcome
-}
-
-func (b Bot) list(ctx context.Context, user string, respond func(string)) {
-	if b.ICT == nil || b.Lifecycles == nil {
-		respond(rejectedText("List is unavailable. The operator must inspect the private server logs."))
+	// Delivery precedes CR creation. A controller can therefore never begin
+	// planning an allocation the user was not told was accepted.
+	if b.Responder == nil {
+		b.logf("deliver create acceptance: responder is not configured")
 		return
 	}
-	diagnosticID, err := diagnostics.NewID()
-	if err != nil {
-		respond(rejectedText("Unable to prepare private diagnostics. No ICT operation was started; this requires maintainer attention."))
-		return
-	}
-	if pathProvider, ok := b.ICT.(interface{ DiagnosticPath(string) (string, error) }); ok {
-		if path, err := pathProvider.DiagnosticPath(diagnosticID); err != nil {
-			b.logf("list diagnostic path failed diagnostic_id=%q: %v", diagnosticID, err)
-		} else {
-			b.logf("list state_id=%q diagnostic_id=%q diagnostic_path=%q started", user, diagnosticID, path)
-		}
-	} else {
-		b.logf("list diagnostic_id=%q state_id=%q started", diagnosticID, user)
-	}
-	defer func() {
-		resolver, ok := b.ICT.(interface{ ResolveDiagnostic(string) error })
-		if !ok {
-			return
-		}
-		if err := resolver.ResolveDiagnostic(diagnosticID); err != nil {
-			b.logf("list diagnostic resolution failed diagnostic_id=%q: %v", diagnosticID, err)
-		}
-	}()
-	inventory, err := b.ICT.WorkspaceInventoryDiagnostic(ctx, user, diagnosticID)
-	if err != nil {
-		respond(rejectedText("Unable to list clusters. No cleanup is running; this requires maintainer attention. Diagnostic ID: " + lifecycle.DiagnosticReference(diagnosticID) + "."))
-		return
-	}
-	if err := b.Lifecycles.Refresh(inventory); err != nil {
-		b.logf("refresh lifecycle inventory: %v", err)
-		respond(rejectedText("Unable to list clusters. No cleanup is running; this requires maintainer attention. Diagnostic ID: " + lifecycle.DiagnosticReference(diagnosticID) + "."))
+	if err := b.Responder.Reply(ctx, Response{Channel: message.Channel, ThreadTimestamp: message.Timestamp, Text: "Command accepted.\nPlanning..."}); err != nil {
+		b.logf("deliver create acceptance: %v", err)
 		return
 	}
 	now := b.now()
-	for _, message := range lifecycleListMessages(b.Lifecycles.Records(), user, now) {
-		respond(message)
+	deadline := metav1.NewTime(now.Add(b.reviewTimeout()))
+	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: b.Namespace}, Spec: servitorv1alpha1.ServitorClusterSpec{
+		Slack:       servitorv1alpha1.SlackIdentity{OwnerID: message.User, ChannelID: message.Channel, ThreadTimestamp: message.Timestamp},
+		UserOptions: userOptions(options.Values()),
+		Lifecycle:   servitorv1alpha1.LifecyclePolicy{ConfirmationDeadline: &deadline, InitialLeaseSeconds: int64(b.lease() / time.Second), RetrySeconds: seconds(b.RetryIntervals)},
+	}}
+	if err := b.Client.Create(ctx, cluster); err != nil {
+		if apierrors.IsAlreadyExists(err) {
+			if getErr := b.Client.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: name}, existing); getErr == nil {
+				respond(existingAllocationNotice(existing, now))
+				return
+			}
+		}
+		b.logf("create allocation: %v", err)
+		respond(rejectedText("Unable to record the create request. No operation was started."))
 	}
 }
 
+func (b Bot) confirm(ctx context.Context, message Message, thread string) {
+	cluster, err := b.ownerCluster(ctx, message.User)
+	if err != nil || !ownsThread(cluster, message, thread, true) || cluster.Status.Phase != servitorv1alpha1.PhaseAwaitingApproval {
+		return
+	}
+	approval := "approved"
+	if message.Text == "no" {
+		approval = "rejected"
+	}
+	if err := b.updateIntent(ctx, cluster.Name, func(current *servitorv1alpha1.ServitorCluster) error {
+		if !ownsThread(current, message, thread, true) || current.Status.Phase != servitorv1alpha1.PhaseAwaitingApproval {
+			return nil
+		}
+		current.Spec.Lifecycle.Approval = approval
+		return nil
+	}); err != nil {
+		b.logf("record review decision: %v", err)
+	}
+}
+
+func (b Bot) cleanup(ctx context.Context, message Message, thread string, acknowledge bool) {
+	cluster, err := b.ownerCluster(ctx, message.User)
+	if err != nil || !ownsThread(cluster, message, thread, message.ThreadTimestamp != "") {
+		return
+	}
+	if err := b.updateIntent(ctx, cluster.Name, func(current *servitorv1alpha1.ServitorCluster) error {
+		if !ownsThread(current, message, thread, message.ThreadTimestamp != "") {
+			return nil
+		}
+		current.Spec.Lifecycle.CleanupRequested = true
+		return nil
+	}); err != nil {
+		b.logf("request cleanup: %v", err)
+		return
+	}
+	if acknowledge {
+		b.respond(ctx, message.Channel, thread, "Command accepted.\nCleaning up...")
+	}
+}
+
+func (b Bot) extend(ctx context.Context, message Message, thread string, requireThread bool, respond func(string)) {
+	increment, err := command.ParseExtend(message.Text)
+	if err != nil {
+		respond(rejectedText(err.Error()))
+		return
+	}
+	cluster, err := b.ownerCluster(ctx, message.User)
+	if err != nil || !ownsThread(cluster, message, thread, requireThread) || cluster.Status.Phase != servitorv1alpha1.PhaseReady || cluster.Status.LeaseExpiresAt == nil {
+		return
+	}
+	target, err := command.ExtensionTarget(cluster.Status.LeaseExpiresAt.Time, increment, time.Duration(cluster.Spec.Lifecycle.InitialLeaseSeconds)*time.Second)
+	if err != nil {
+		respond(rejectedText(err.Error()))
+		return
+	}
+	if err := b.updateIntent(ctx, cluster.Name, func(current *servitorv1alpha1.ServitorCluster) error {
+		if !ownsThread(current, message, thread, requireThread) || current.Status.Phase != servitorv1alpha1.PhaseReady || current.Status.LeaseExpiresAt == nil {
+			return nil
+		}
+		if staleExtensionEvent(current.Spec.Lifecycle.ExtensionEventTimestamp, message.Timestamp) {
+			return nil
+		}
+		current.Spec.Lifecycle.RequestedExpiry = &metav1.Time{Time: target}
+		current.Spec.Lifecycle.ExtensionEventTimestamp = message.Timestamp
+		return nil
+	}); err != nil {
+		b.logf("request lease extension: %v", err)
+		respond(rejectedText("Unable to record the lease extension."))
+	}
+}
+
+func (b Bot) list(ctx context.Context, user string, respond func(string)) {
+	if b.Client == nil || b.Namespace == "" {
+		respond(rejectedText("List is unavailable. The operator must inspect the private server logs."))
+		return
+	}
+	var clusters servitorv1alpha1.ServitorClusterList
+	if err := b.Client.List(ctx, &clusters, client.InNamespace(b.Namespace)); err != nil {
+		b.logf("list allocations: %v", err)
+		respond(rejectedText("Unable to list clusters. No cleanup is running; this requires maintainer attention."))
+		return
+	}
+	for _, text := range clusterListMessages(clusters.Items, user, b.now()) {
+		respond(text)
+	}
+}
+
+func (b Bot) ownerCluster(ctx context.Context, owner string) (*servitorv1alpha1.ServitorCluster, error) {
+	cluster := &servitorv1alpha1.ServitorCluster{}
+	if err := b.Client.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: ownerClusterName(owner)}, cluster); err != nil {
+		return nil, err
+	}
+	return cluster, nil
+}
+func (b Bot) updateIntent(ctx context.Context, name string, mutate func(*servitorv1alpha1.ServitorCluster) error) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		current := &servitorv1alpha1.ServitorCluster{}
+		if err := b.Client.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: name}, current); err != nil {
+			return err
+		}
+		if err := mutate(current); err != nil {
+			return err
+		}
+		return b.Client.Update(ctx, current)
+	})
+}
+func ownsThread(cluster *servitorv1alpha1.ServitorCluster, message Message, thread string, requireThread bool) bool {
+	if cluster == nil || cluster.Spec.Slack.OwnerID != message.User || cluster.Spec.Slack.ChannelID != message.Channel {
+		return false
+	}
+	return !requireThread || cluster.Spec.Slack.ThreadTimestamp == thread
+}
+func ownerClusterName(owner string) string {
+	digest := sha256.Sum256([]byte(owner))
+	return "slack-" + hex.EncodeToString(digest[:])[:24]
+}
+
+// staleExtensionEvent rejects a redelivery even after the bounded receipt
+// cache evicts its ID. Slack message timestamps are monotonically increasing
+// for a conversation and the latest accepted value is durable CR spec intent.
+func staleExtensionEvent(last, current string) bool {
+	if last == "" {
+		return false
+	}
+	if last == current {
+		return true
+	}
+	comparison, comparable := compareSlackTimestamps(current, last)
+	return comparable && comparison <= 0
+}
+
+func compareSlackTimestamps(left, right string) (int, bool) {
+	leftWhole, leftFraction, leftOK := splitSlackTimestamp(left)
+	rightWhole, rightFraction, rightOK := splitSlackTimestamp(right)
+	if !leftOK || !rightOK {
+		return 0, false
+	}
+	if len(leftWhole) != len(rightWhole) {
+		if len(leftWhole) < len(rightWhole) {
+			return -1, true
+		}
+		return 1, true
+	}
+	if leftWhole != rightWhole {
+		if leftWhole < rightWhole {
+			return -1, true
+		}
+		return 1, true
+	}
+	length := len(leftFraction)
+	if len(rightFraction) > length {
+		length = len(rightFraction)
+	}
+	leftFraction += strings.Repeat("0", length-len(leftFraction))
+	rightFraction += strings.Repeat("0", length-len(rightFraction))
+	if leftFraction < rightFraction {
+		return -1, true
+	}
+	if leftFraction > rightFraction {
+		return 1, true
+	}
+	return 0, true
+}
+
+func splitSlackTimestamp(value string) (string, string, bool) {
+	whole, fraction, hasFraction := strings.Cut(value, ".")
+	if !hasFraction {
+		fraction = ""
+	}
+	if whole == "" || strings.Contains(fraction, ".") {
+		return "", "", false
+	}
+	for _, character := range whole + fraction {
+		if character < '0' || character > '9' {
+			return "", "", false
+		}
+	}
+	whole = strings.TrimLeft(whole, "0")
+	if whole == "" {
+		whole = "0"
+	}
+	return whole, strings.TrimRight(fraction, "0"), true
+}
+func userOptions(values map[string][]string) servitorv1alpha1.UserOptions {
+	one := func(flag string) string {
+		if len(values[flag]) == 0 {
+			return ""
+		}
+		return values[flag][0]
+	}
+	workerCount, _ := strconv.Atoi(one("--worker-count"))
+	return servitorv1alpha1.UserOptions{Target: one("--target"), Provider: one("--provider"), Platform: one("--platform"), Version: one("--version"), ResourceGroup: one("--resource-group"), Zone: one("--zone"), Flavor: one("--flavor"), VPCID: one("--vpc-id"), Datacenter: one("--datacenter"), MachineType: one("--machine-type"), PublicVLANID: one("--public-vlan-id"), PrivateVLANID: one("--private-vlan-id"), SubnetIDs: append([]string(nil), values["--subnet-id"]...), PublicGatewayIDs: append([]string(nil), values["--public-gateway-id"]...), SatelliteZones: append([]string(nil), values["--satellite-zone"]...), SatelliteManagedFrom: one("--satellite-managed-from"), SatelliteLocationID: one("--satellite-location-id"), SatelliteHostImage: one("--satellite-host-image"), SatelliteHostProfile: one("--satellite-host-profile"), SatelliteSSHKeyID: one("--satellite-ssh-key-id"), SatelliteWorkerInstanceIDs: append([]string(nil), values["--satellite-worker-instance-id"]...), SatelliteWorkerOperatingSystem: one("--satellite-worker-operating-system"), Name: one("--name"), WorkerCount: workerCount}
+}
+func seconds(values []time.Duration) []int64 {
+	result := make([]int64, len(values))
+	for i, value := range values {
+		result[i] = int64(value / time.Second)
+	}
+	return result
+}
+func (b Bot) reviewTimeout() time.Duration {
+	if b.ConfirmationTimeout > 0 {
+		return b.ConfirmationTimeout
+	}
+	return 5 * time.Minute
+}
+func (b Bot) lease() time.Duration {
+	if b.Lease > 0 {
+		return b.Lease
+	}
+	return 4 * time.Hour
+}
 func (b Bot) now() time.Time {
 	if b.Clock != nil {
-		return b.Clock()
+		return b.Clock().UTC()
 	}
-	return time.Now()
+	return time.Now().UTC()
 }
-
-func (b Bot) respondHelp(text string, maintainer bool, respond func(string)) {
+func (b Bot) respond(ctx context.Context, channel, thread, text string) {
+	if b.Responder == nil {
+		return
+	}
+	if err := b.Responder.Reply(ctx, Response{Channel: channel, ThreadTimestamp: thread, Text: text}); err != nil {
+		b.logf("deliver Slack reply: %v", err)
+	}
+}
+func (b Bot) respondHelp(text string, respond func(string)) {
 	words := strings.Fields(text)
 	if len(words) > 2 {
 		respond(unknownText())
@@ -395,9 +432,6 @@ func (b Bot) respondHelp(text string, maintainer bool, respond func(string)) {
 	switch topic {
 	case "":
 		messages = helpOverview()
-		if maintainer {
-			messages = append(messages, "Maintainer DM commands\n```\n  status                show admission mode and activity counts\n  pause                 pause new modifying commands\n  unpause               resume modifying commands\n  stop                  drain active work and stop Servitor\n```")
-		}
 	case "create":
 		messages = createHelp(b.Defaults)
 	case "done":
@@ -416,7 +450,13 @@ func (b Bot) respondHelp(text string, maintainer bool, respond func(string)) {
 		}
 	}
 }
-
+func existingAllocationNotice(cluster *servitorv1alpha1.ServitorCluster, now time.Time) string {
+	expiry := time.Time{}
+	if cluster.Status.LeaseExpiresAt != nil {
+		expiry = cluster.Status.LeaseExpiresAt.Time
+	}
+	return "You already have an allocation in state " + listStatusCell(cluster.Status.Phase) + ". Lease: " + lifecycle.FormatLeaseExpiry(expiry, now) + "."
+}
 func channelCommand(text, self string) (string, bool) {
 	if self == "" {
 		return "", false
@@ -432,15 +472,10 @@ func channelCommand(text, self string) (string, bool) {
 	}
 	return trimASCIIWhitespace(rest), true
 }
-
-func trimASCIIWhitespace(value string) string {
-	return strings.TrimFunc(value, isASCIIWhitespace)
-}
-
+func trimASCIIWhitespace(value string) string { return strings.TrimFunc(value, isASCIIWhitespace) }
 func isASCIIWhitespace(character rune) bool {
 	return character == ' ' || character == '\t' || character == '\n' || character == '\r' || character == '\f' || character == '\v'
 }
-
 func firstToken(text string) string {
 	words := strings.Fields(text)
 	if len(words) == 0 {
@@ -448,144 +483,14 @@ func firstToken(text string) string {
 	}
 	return words[0]
 }
-
-func commandCategory(text string) string {
-	switch command := firstToken(text); command {
-	case "help", "list", "create", "done", "destroy", "extend", "yes", "no", "status", "pause", "unpause", "stop":
-		return command
-	default:
-		return "unknown"
-	}
-}
-
-func (b Bot) dmCommandAccepted(user, text, category string) bool {
-	if user == b.MaintainerID && len(strings.Fields(text)) == 1 && (category == "status" || category == "pause" || category == "unpause" || category == "stop") {
-		return true
-	}
-	return category == "help" || category == "list"
-}
-
-func (b Bot) channelCommandAccepted(category string, request lifecycle.Request) bool {
-	if modifyingCommand(category) && !b.admissionOpen() {
-		return false
-	}
-	switch category {
-	case "help", "list":
-		return true
-	case "create":
-		return !request.RawThread && b.Creator != nil
-	case "done", "destroy":
-		if request.RawThread {
-			return b.Lifecycle != nil && b.Lifecycle.OwnsThread(request)
-		}
-		return b.Creator != nil || b.Lifecycle != nil
-	case "extend":
-		return b.Lifecycle != nil && (!request.RawThread || b.Lifecycle.OwnsThread(request))
-	default:
-		return false
-	}
-}
-
-func (b Bot) logConfirmation(envelope Envelope, message Message, thread, category string, outcome lifecycle.ConfirmationOutcome) {
-	b.logCommandResult(envelope, message, thread, category, confirmationAdmitted(outcome), confirmationResult(outcome))
-}
-
-func confirmationAdmitted(outcome lifecycle.ConfirmationOutcome) bool {
-	return outcome == lifecycle.ConfirmationApproved || outcome == lifecycle.ConfirmationRejected
-}
-
-func confirmationResult(outcome lifecycle.ConfirmationOutcome) string {
-	switch outcome {
-	case lifecycle.ConfirmationNoLifecycle, lifecycle.ConfirmationWrongThread, lifecycle.ConfirmationPreReview,
-		lifecycle.ConfirmationReview, lifecycle.ConfirmationApplying, lifecycle.ConfirmationReady,
-		lifecycle.ConfirmationCleanup, lifecycle.ConfirmationUnresolved, lifecycle.ConfirmationApproved,
-		lifecycle.ConfirmationRejected:
-		return string(outcome)
-	default:
-		return "unknown"
-	}
-}
-
-func (b Bot) logCommand(envelope Envelope, message Message, thread, category string, accepted bool) {
-	b.logCommandResult(envelope, message, thread, category, accepted, "")
-}
-
-func (b Bot) logCommandResult(envelope Envelope, message Message, thread, category string, accepted bool, result string) {
-	admission := "rejected"
-	if accepted {
-		admission = "accepted"
-	}
-	mode := b.admissionMode()
-	if result == "" {
-		b.logf("command event_id=%q user_id=%q channel_id=%q thread_id=%q category=%q admission=%s mode=%s", envelope.ID, message.User, message.Channel, thread, category, admission, mode)
-		return
-	}
-	b.logf("command event_id=%q user_id=%q channel_id=%q thread_id=%q category=%q admission=%s result=%q mode=%s", envelope.ID, message.User, message.Channel, thread, category, admission, result, mode)
-}
-
-func (b Bot) admissionOpen() bool {
-	return b.Admission == nil || b.Admission.Accepting()
-}
-
-func (b Bot) admissionStatus() admission.Status {
-	if b.Admission == nil {
-		return admission.Status{Mode: admission.Accepting}
-	}
-	return b.Admission.Status()
-}
-
-func (b Bot) admissionMode() admission.Mode { return b.admissionStatus().Mode }
-
-func (b Bot) ownsThread(request lifecycle.Request) bool {
-	if b.Lifecycle != nil && b.Lifecycle.OwnsThread(request) {
-		return true
-	}
-	if b.Lifecycles == nil {
-		return false
-	}
-	record, found := b.Lifecycles.Get(request.UserID)
-	return found && record.Channel == request.Channel && record.ThreadTimestamp == request.ThreadTimestamp
-}
-
-func modifyingCommand(command string) bool {
-	switch command {
-	case "create", "yes", "no", "done", "destroy", "extend":
-		return true
-	default:
-		return false
-	}
-}
-
-func modeRejection(mode admission.Mode) string {
-	return rejectedText("Servitor is " + string(mode) + ". Only help and list are available while admission is " + string(mode) + ".")
-}
-
-func maintainerStatus(status admission.Status) string {
-	return fmt.Sprintf("Mode: %s\nPending reviews: %d\nActive applies: %d\nActive cleanup: %d", status.Mode, status.Reviews, status.Applies, status.Cleanup)
-}
-
-func unknownText() string {
-	return "Command unknown.\n\n" + helpOverview()[0]
-}
-
-func rejectedText(reason string) string {
-	return "Command rejected.\n\n" + reason
-}
-
+func unknownText() string               { return "Command unknown.\n\n" + helpOverview()[0] }
+func rejectedText(reason string) string { return "Command rejected.\n\n" + reason }
 func helpOverview() []string {
 	return []string{"Servitor provisions one temporary IBM Cloud cluster per Slack user.\n\nCommands\n```\nDM\n  help [command]          print help\n  list                    list clusters\n\nConfigured channel\n  @servitor help [command]  print help\n  @servitor create [flags]  provision a new cluster\n  @servitor done            release your resources\n  @servitor extend [N[h]]   extend your lease\n  @servitor list            list clusters\n\nLifecycle thread\n  yes                       approve the cluster plan\n  no                        reject the cluster plan\n  done                      release your resources\n  extend [N[h]]             extend your lease\n```"}
 }
-
 func createHelp(defaults command.CreateDefaults) []string {
-	defaultVersion := safeHelpCell(defaults.Version)
-	defaultTarget := safeHelpCell(defaults.Target)
-	defaultProvider := safeHelpCell(defaults.Provider)
-	return []string{
-		"`create` starts planning from the configured channel root. Defaults: version " + defaultVersion + ", target " + defaultTarget + ", provider " + defaultProvider + ".\n\nExamples\n```\n@servitor create\n@servitor create --version 1.36\n@servitor create --version 4.22 --provider classic --datacenter dal10\n```\nReview the plan in its thread, then reply with exact `yes` or `no` within five minutes.",
-		"Safe create flags\n```\nCommon\n  --target --provider --platform --version --resource-group --name --worker-count\n\nVPC Gen 2\n  --zone --flavor --vpc-id --subnet-id --public-gateway-id\n\nClassic\n  --datacenter --machine-type --public-vlan-id --private-vlan-id\n\nSatellite\n  --satellite-zone --satellite-managed-from --satellite-location-id\n  --satellite-host-image --satellite-host-profile --satellite-ssh-key-id\n  --satellite-worker-instance-id --satellite-worker-operating-system\n```",
-	}
+	return []string{"`create` starts planning from the configured channel root. Defaults: version " + safeHelpCell(defaults.Version) + ", target " + safeHelpCell(defaults.Target) + ", provider " + safeHelpCell(defaults.Provider) + ".\n\nReview the configuration in its thread, then reply with exact `yes` or `no` within five minutes.", "Safe create flags\n```\nCommon\n  --target --provider --platform --version --resource-group --name --worker-count\n\nVPC Gen 2\n  --zone --flavor --vpc-id --subnet-id --public-gateway-id\n\nClassic\n  --datacenter --machine-type --public-vlan-id --private-vlan-id\n\nSatellite\n  --satellite-zone --satellite-managed-from --satellite-location-id\n  --satellite-host-image --satellite-host-profile --satellite-ssh-key-id\n  --satellite-worker-instance-id --satellite-worker-operating-system\n```"}
 }
-
 func safeHelpCell(value string) string {
 	value = strings.Map(func(character rune) rune {
 		if unicode.IsControl(character) || character == '`' || character == '<' || character == '>' || character == '@' {
@@ -602,7 +507,6 @@ func safeHelpCell(value string) string {
 	}
 	return value
 }
-
 func boundedMessages(text string) []string {
 	if len(text) <= maxSlackMessage {
 		return []string{text}
@@ -658,7 +562,6 @@ func boundedMessages(text string) []string {
 	}
 	return chunks
 }
-
 func utf8Prefix(value string, limit int) (string, string) {
 	end := 0
 	for _, character := range value {
@@ -670,7 +573,6 @@ func utf8Prefix(value string, limit int) (string, string) {
 	}
 	return value[:end], value[end:]
 }
-
 func (b Bot) logf(format string, args ...any) {
 	if b.Logf != nil {
 		b.Logf(format, args...)

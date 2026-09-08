@@ -8,99 +8,102 @@ import (
 	"time"
 	"unicode"
 
+	servitorv1alpha1 "github.com/bevicted/servitor/api/v1alpha1"
 	"github.com/bevicted/servitor/internal/lifecycle"
-	"github.com/bevicted/servitor/internal/state"
 )
 
 const listSafeCellLimit = 160
 
-var listStatuses = map[string]bool{
-	"review": true, "applying": true, "ready": true, "cleanup": true, "unresolved": true,
+var listStatuses = map[string]string{
+	servitorv1alpha1.PhasePending: "planning", servitorv1alpha1.PhasePlanning: "planning", servitorv1alpha1.PhaseAwaitingApproval: "review", servitorv1alpha1.PhaseApplying: "applying", servitorv1alpha1.PhaseReady: "ready", servitorv1alpha1.PhaseCleanupPending: "cleanup", servitorv1alpha1.PhaseCleanupComplete: "cleanup", servitorv1alpha1.PhaseUnresolved: "unresolved",
 }
 
-type lifecycleListRow struct {
+type clusterListRow struct {
 	marker, cluster, status, location, expires string
-	record                                     state.LifecycleRecord
+	owner                                      string
+	updated                                    time.Time
 }
 
-func lifecycleListMessages(records []state.LifecycleRecord, caller string, now time.Time) []string {
-	userIDs := make([]string, 0, len(records))
-	for _, record := range records {
-		userIDs = append(userIDs, record.UserID)
+// clusterListMessages renders only status data held by namespaced CRs. Slack
+// owner identities remain a caller marker and are never resolved or displayed.
+func clusterListMessages(clusters []servitorv1alpha1.ServitorCluster, caller string, now time.Time) []string {
+	owners := make([]string, 0, len(clusters))
+	for _, cluster := range clusters {
+		owners = append(owners, cluster.Spec.Slack.OwnerID)
 	}
-	rows := make([]lifecycleListRow, 0, len(records))
-	for _, record := range records {
-		rows = append(rows, lifecycleListRow{
-			marker:   listMarker(record.UserID, caller),
-			cluster:  listClusterCell(record.ClusterName, userIDs),
-			status:   listStatusCell(record.Status),
-			location: listLocationCell(record.Location, userIDs),
-			expires:  listExpiry(record.LeaseExpiresAt, now),
-			record:   record,
-		})
+	rows := make([]clusterListRow, 0, len(clusters))
+	for _, cluster := range clusters {
+		expiry := time.Time{}
+		if cluster.Status.LeaseExpiresAt != nil {
+			expiry = cluster.Status.LeaseExpiresAt.Time
+		}
+		options := cluster.Status.ResolvedOptions
+		name, location := "", ""
+		if options != nil {
+			name = options.ClusterName
+			location = options.Region
+		}
+		rows = append(rows, clusterListRow{marker: listMarker(cluster.Spec.Slack.OwnerID, caller), cluster: listClusterCell(name, owners), status: listStatusCell(cluster.Status.Phase), location: listLocationCell(location, owners), expires: listExpiry(expiry, now), owner: cluster.Spec.Slack.OwnerID, updated: cluster.CreationTimestamp.Time})
 	}
 	sort.Slice(rows, func(i, j int) bool {
-		left, right := rows[i].record, rows[j].record
-		leftExpires, rightExpires := !left.LeaseExpiresAt.IsZero(), !right.LeaseExpiresAt.IsZero()
-		if leftExpires != rightExpires {
-			return leftExpires
+		left, right := rows[i], rows[j]
+		if left.expires != "-" && right.expires == "-" {
+			return true
 		}
-		if leftExpires && !left.LeaseExpiresAt.Equal(right.LeaseExpiresAt) {
-			return left.LeaseExpiresAt.Before(right.LeaseExpiresAt)
+		if left.expires == "-" && right.expires != "-" {
+			return false
 		}
-		if left.Status != right.Status {
-			return left.Status < right.Status
+		if left.expires != right.expires {
+			return left.expires < right.expires
 		}
-		if !left.UpdatedAt.Equal(right.UpdatedAt) {
-			return left.UpdatedAt.Before(right.UpdatedAt)
+		if left.status != right.status {
+			return left.status < right.status
 		}
-		return left.UserID < right.UserID
+		if !left.updated.Equal(right.updated) {
+			return left.updated.Before(right.updated)
+		}
+		return left.owner < right.owner
 	})
-
 	chunks := make([]string, 0, len(rows)/8+1)
-	current := make([]lifecycleListRow, 0, len(rows))
+	current := make([]clusterListRow, 0, len(rows))
 	for _, row := range rows {
-		candidate := append(append([]lifecycleListRow(nil), current...), row)
-		if len(current) > 0 && len(renderLifecycleList(candidate)) > maxSlackMessage {
-			chunks = append(chunks, renderLifecycleList(current))
+		candidate := append(append([]clusterListRow(nil), current...), row)
+		if len(current) > 0 && len(renderClusterList(candidate)) > maxSlackMessage {
+			chunks = append(chunks, renderClusterList(current))
 			current = current[:0]
 		}
 		current = append(current, row)
 	}
-	return append(chunks, renderLifecycleList(current))
+	return append(chunks, renderClusterList(current))
 }
-
-func renderLifecycleList(rows []lifecycleListRow) string {
+func renderClusterList(rows []clusterListRow) string {
 	var buffer bytes.Buffer
 	writer := tabwriter.NewWriter(&buffer, 0, 4, 2, ' ', 0)
-	writeLifecycleListRow(writer, []string{"", "cluster", "state", "location", "expires"})
+	writeListRow(writer, []string{"", "cluster", "state", "location", "expires"})
 	for _, row := range rows {
-		writeLifecycleListRow(writer, []string{row.marker, row.cluster, row.status, row.location, row.expires})
+		writeListRow(writer, []string{row.marker, row.cluster, row.status, row.location, row.expires})
 	}
 	_ = writer.Flush()
 	return "```\n" + strings.TrimSuffix(buffer.String(), "\n") + "\n```"
 }
-
-func writeLifecycleListRow(writer *tabwriter.Writer, row []string) {
-	for index, value := range row {
-		if index != 0 {
+func writeListRow(writer *tabwriter.Writer, row []string) {
+	for i, value := range row {
+		if i != 0 {
 			_, _ = writer.Write([]byte{'\t'})
 		}
 		_, _ = writer.Write([]byte(value))
 	}
 	_, _ = writer.Write([]byte{'\n'})
 }
-
-func listMarker(userID, caller string) string {
-	if userID == caller {
+func listMarker(owner, caller string) string {
+	if owner == caller {
 		return "*"
 	}
 	return " "
 }
-
-func listClusterCell(value string, userIDs []string) string {
+func listClusterCell(value string, owners []string) string {
 	value = listSafeCell(value)
-	if value == "-" || strings.ToLower(value) != value || strings.ContainsAny(value, "/._") || containsPrivateID(value, userIDs) {
+	if value == "-" || strings.ToLower(value) != value || strings.ContainsAny(value, "/._") || containsPrivateID(value, owners) {
 		return "-"
 	}
 	for _, character := range value {
@@ -110,10 +113,9 @@ func listClusterCell(value string, userIDs []string) string {
 	}
 	return value
 }
-
-func listLocationCell(value string, userIDs []string) string {
+func listLocationCell(value string, owners []string) string {
 	value = listSafeCell(value)
-	if value == "-" || strings.HasPrefix(value, "/") || strings.Contains(value, "..") || strings.Contains(value, ".") || containsPrivateID(value, userIDs) {
+	if value == "-" || strings.HasPrefix(value, "/") || strings.Contains(value, "..") || strings.Contains(value, ".") || containsPrivateID(value, owners) {
 		return "-"
 	}
 	for _, character := range value {
@@ -123,18 +125,13 @@ func listLocationCell(value string, userIDs []string) string {
 	}
 	return value
 }
-
 func listStatusCell(value string) string {
-	if !listStatuses[value] {
-		return "-"
+	if status := listStatuses[value]; status != "" {
+		return status
 	}
-	return value
+	return "-"
 }
-
-func listExpiry(value, now time.Time) string {
-	return lifecycle.FormatLeaseExpiry(value, now)
-}
-
+func listExpiry(value, now time.Time) string { return lifecycle.FormatLeaseExpiry(value, now) }
 func listSafeCell(value string) string {
 	value = strings.Map(func(character rune) rune {
 		if unicode.IsControl(character) || character == '`' || character == '@' || character == '<' || character == '>' {
@@ -151,10 +148,9 @@ func listSafeCell(value string) string {
 	}
 	return value
 }
-
-func containsPrivateID(value string, userIDs []string) bool {
-	for _, userID := range userIDs {
-		if userID != "" && strings.Contains(value, userID) {
+func containsPrivateID(value string, owners []string) bool {
+	for _, owner := range owners {
+		if owner != "" && strings.Contains(value, owner) {
 			return true
 		}
 	}

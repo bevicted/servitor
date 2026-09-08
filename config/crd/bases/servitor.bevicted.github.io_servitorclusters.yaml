@@ -153,6 +153,7 @@ spec:
                       }
                     approval: { type: string, enum: ["", approved, rejected] }
                     requestedExpiry: { type: string, format: date-time }
+                    extensionEventTimestamp: { type: string }
                     cleanupRequested: { type: boolean }
             status:
               type: object

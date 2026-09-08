@@ -57,6 +57,15 @@ var forbiddenCreateFlags = map[string]bool{"--config": true, "--owner": true, "-
 // ExplicitCreateOptions contains only user-supplied, safe options. It never includes defaults.
 type ExplicitCreateOptions struct{ values map[string][]string }
 
+// Values returns a copy of the explicitly supplied safe flag values.
+func (o ExplicitCreateOptions) Values() map[string][]string {
+	values := make(map[string][]string, len(o.values))
+	for flag, supplied := range o.values {
+		values[flag] = append([]string(nil), supplied...)
+	}
+	return values
+}
+
 // ParseCreateOptions validates the safe CLI grammar without applying operator defaults.
 func ParseCreateOptions(text string) (ExplicitCreateOptions, error) {
 	words, err := splitWords(text)

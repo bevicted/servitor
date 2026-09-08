@@ -22,6 +22,32 @@ type SocketMode struct {
 	client *socketmode.Client
 }
 
+// LeaderRunnable owns Socket Mode only while this manager replica holds
+// leadership. Losing leadership cancels intake; it never touches Tekton work.
+type LeaderRunnable struct {
+	transport Transport
+	bot       Bot
+}
+
+func NewLeaderRunnable(transport Transport, bot Bot) *LeaderRunnable {
+	return &LeaderRunnable{transport: transport, bot: bot}
+}
+
+func (r *LeaderRunnable) NeedLeaderElection() bool { return true }
+
+func (r *LeaderRunnable) Start(ctx context.Context) error {
+	self, err := r.transport.SelfUserID(ctx)
+	if err != nil {
+		return fmt.Errorf("authenticate Slack bot: %w", err)
+	}
+	bot := r.bot
+	bot.SelfUserID = self
+	if err := r.transport.Run(ctx, bot.Handle); err != nil && ctx.Err() == nil {
+		return err
+	}
+	return nil
+}
+
 // NewSocketMode creates a Socket Mode adapter from environment-supplied credentials.
 func NewSocketMode(botToken, appToken string) *SocketMode {
 	api := slack.New(botToken, slack.OptionAppLevelToken(appToken))

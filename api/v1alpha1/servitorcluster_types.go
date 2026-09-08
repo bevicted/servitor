@@ -63,11 +63,12 @@ type LifecyclePolicy struct {
 	Approval             string       `json:"approval,omitempty"`
 	// RequestedExpiry is an absolute extension target. Its value is stable across
 	// Slack redelivery, controller restarts, and optimistic-concurrency retries.
-	RequestedExpiry  *metav1.Time `json:"requestedExpiry,omitempty"`
-	CleanupRequested bool         `json:"cleanupRequested,omitempty"`
+	RequestedExpiry         *metav1.Time `json:"requestedExpiry,omitempty"`
+	ExtensionEventTimestamp string       `json:"extensionEventTimestamp,omitempty"`
+	CleanupRequested        bool         `json:"cleanupRequested,omitempty"`
 }
 
-// ServitorClusterSpec is immutable after creation except lifecycle approval intent.
+// ServitorClusterSpec is immutable after creation except lifecycle intent.
 type ServitorClusterSpec struct {
 	Slack       SlackIdentity   `json:"slack"`
 	UserOptions UserOptions     `json:"userOptions,omitempty"`
