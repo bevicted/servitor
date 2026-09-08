@@ -33,6 +33,7 @@ type Config struct {
 	Backend        servitorv1alpha1.BackendIdentity
 	BackendPrefix  string
 	ExecutionImage string
+	TaskConfig     pipeline.TaskConfig
 	ReviewTimeout  time.Duration
 }
 
@@ -279,7 +280,7 @@ func (r *Reconciler) waitForCleanupOperation(ctx context.Context, cluster *servi
 			if operation.Dispatched {
 				return r.unresolved(ctx, cluster, "DestroyRunMissing", errors.New("persisted destroy PipelineRun is missing"))
 			}
-			created, buildErr := pipeline.NewDestroyRun(cluster)
+			created, buildErr := pipeline.NewDestroyRun(cluster, r.Config.TaskConfig)
 			if buildErr != nil {
 				return r.unresolved(ctx, cluster, "InvalidOperation", buildErr)
 			}
@@ -423,9 +424,9 @@ func (r *Reconciler) observeOperation(ctx context.Context, cluster *servitorv1al
 		var buildErr error
 		switch operation.Kind {
 		case "plan":
-			created, buildErr = pipeline.NewPlanningRun(cluster)
+			created, buildErr = pipeline.NewPlanningRun(cluster, r.Config.TaskConfig)
 		case "apply":
-			created, buildErr = pipeline.NewApplyRun(cluster)
+			created, buildErr = pipeline.NewApplyRun(cluster, r.Config.TaskConfig)
 		default:
 			buildErr = errors.New("unsupported operation kind")
 		}

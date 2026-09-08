@@ -1,0 +1,13 @@
+apiVersion: servitor.bevicted.github.io/v1alpha1
+kind: ServitorCluster
+metadata:
+  name: example
+spec:
+  slack:
+    ownerID: U_REPLACE_ME
+    channelID: C_REPLACE_ME
+    threadTimestamp: "0.0"
+  userOptions: {}
+  lifecycle:
+    initialLeaseSeconds: 14400
+    retrySeconds: [60, 300, 900]

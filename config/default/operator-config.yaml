@@ -1,5 +1,4 @@
-# Non-secret OpenShift operator configuration. This file is mounted from the
-# servitor-operator-config ConfigMap; do not put credential values here.
+# Non-secret deployment inputs. Edit these values or generate this ConfigMap in an overlay.
 namespace: servitor
 slack:
   channel_id: C_REPLACE_ME
@@ -16,9 +15,7 @@ lifecycle:
   confirmation_timeout: 5m
   lease: 4h
   retry_intervals: [1m, 5m, 15m]
-ict:
-  target_config_map: servitor-ict-config
-  target_config_key: config.yaml
+# ICT and Secret resource names are supplied by operator-references.env in this ConfigMap.
 cos:
   endpoint: https://s3.us-south.cloud-object-storage.appdomain.cloud
   bucket: REPLACE_ME
@@ -31,10 +28,4 @@ cos:
   force_path_style: true
   use_lockfile: false
 images:
-  # Use the immutable digest built by `make task-image`.
-  execution: registry.example.invalid/servitor-task@sha256:REPLACE_WITH_64_HEX_DIGEST
-secrets:
-  # These are names only. Values remain in existing namespace Secrets.
-  slack: servitor-slack-credentials
-  cos: servitor-cos-credentials
-  ibm: servitor-ibm-credentials
+  execution: registry.example.invalid/servitor-task@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa

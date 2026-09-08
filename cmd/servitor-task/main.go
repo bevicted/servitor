@@ -72,7 +72,7 @@ type backendConfig struct {
 }
 
 func main() {
-	var uid, operation, kind, optionsFile, backendFile, recoveryFile, resultFile, reportFile, ictPath, terraformPath, optionsJSON, backendJSON, recoveryJSON string
+	var uid, operation, kind, optionsFile, backendFile, recoveryFile, resultFile, reportFile, emitReport, ictPath, terraformPath, optionsJSON, backendJSON, recoveryJSON string
 	flag.StringVar(&uid, "cluster-uid", "", "ServitorCluster UID")
 	flag.StringVar(&operation, "operation-id", "", "persisted operation ID")
 	flag.StringVar(&kind, "operation-kind", "", "plan, apply, or destroy")
@@ -84,9 +84,17 @@ func main() {
 	flag.StringVar(&recoveryJSON, "recovery-json", "", "frozen recovery JSON parameter")
 	flag.StringVar(&resultFile, "ict-result", "", "task-local ICT result JSON")
 	flag.StringVar(&reportFile, "report", "", "task-local report JSON")
+	flag.StringVar(&emitReport, "emit-report", "", "emit one validated task-local report JSON document")
 	flag.StringVar(&ictPath, "ict", "ict", "ICT executable")
 	flag.StringVar(&terraformPath, "terraform", "terraform", "Terraform executable")
 	flag.Parse()
+	if emitReport != "" {
+		if err := emitValidatedReport(emitReport); err != nil {
+			fmt.Fprintln(os.Stderr, "servitor-task:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	err := materializeParameterFile(optionsFile, optionsJSON)
 	if err == nil {
 		err = materializeParameterFile(backendFile, backendJSON)
@@ -101,6 +109,28 @@ func main() {
 		fmt.Fprintln(os.Stderr, "servitor-task:", err)
 		os.Exit(1)
 	}
+}
+
+func emitValidatedReport(path string) error {
+	if !filepath.IsAbs(path) {
+		return errors.New("task-local file paths must be absolute")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	if len(data) == 0 || len(data) > pipeline.MaxReportBytes || data[len(data)-1] != '\n' {
+		return errors.New("report is not a bounded complete JSON document")
+	}
+	var report pipeline.Report
+	if err := json.Unmarshal(data, &report); err != nil {
+		return fmt.Errorf("decode report: %w", err)
+	}
+	if err := report.Validate(report.ClusterUID, report.OperationID); err != nil {
+		return err
+	}
+	_, err = os.Stdout.Write(data)
+	return err
 }
 
 func materializeParameterFile(path, contents string) error {

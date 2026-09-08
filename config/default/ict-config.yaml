@@ -1,0 +1,4 @@
+# Supply the non-secret ICT target configuration as a ConfigMap value.
+# This placeholder is deliberately invalid for real operations.
+version: 1
+targets: {}

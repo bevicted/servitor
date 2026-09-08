@@ -11,9 +11,28 @@ spec:
     - { name: resolved-options, type: string }
     - { name: backend, type: string }
     - { name: recovery, type: string, default: "" }
+    - { name: ict-config-map, type: string }
+    - { name: ict-config-key, type: string }
+    - { name: cos-secret, type: string }
+    - { name: ibm-secret, type: string }
+  stepTemplate:
+    securityContext:
+      allowPrivilegeEscalation: false
+      capabilities: { drop: ["ALL"] }
+      readOnlyRootFilesystem: true
+      runAsNonRoot: true
+      seccompProfile: { type: RuntimeDefault }
   volumes:
     - name: operation-data
       emptyDir: {}
+    - name: tmp
+      emptyDir: {}
+    - name: ict-config
+      configMap:
+        name: $(params.ict-config-map)
+        items:
+          - key: $(params.ict-config-key)
+            path: config.yaml
   steps:
     - name: execute
       image: $(params.execution-image)
@@ -41,13 +60,22 @@ spec:
         - /operation/ict-result.json
         - -report
         - /operation/report.json
-      volumeMounts: [{ name: operation-data, mountPath: /operation }]
+      env:
+        - name: ICT_CONFIG
+          value: /etc/servitor/ict/config.yaml
+        - name: TMPDIR
+          value: /tmp
       envFrom:
-        - secretRef: { name: servitor-cos-credentials }
+        - secretRef: { name: $(params.cos-secret) }
+        - secretRef: { name: $(params.ibm-secret) }
+      volumeMounts:
+        - { name: operation-data, mountPath: /operation }
+        - { name: tmp, mountPath: /tmp }
+        - { name: ict-config, mountPath: /etc/servitor/ict, readOnly: true }
     - name: report
       image: $(params.execution-image)
-      command: ["cat"]
-      args: ["/operation/report.json"]
+      command: ["/usr/local/bin/servitor-task"]
+      args: ["-emit-report", "/operation/report.json"]
       volumeMounts: [{ name: operation-data, mountPath: /operation }]
 ---
 apiVersion: tekton.dev/v1
@@ -55,8 +83,6 @@ kind: Pipeline
 metadata:
   name: servitor-operation
 spec:
-  taskRunTemplate:
-    serviceAccountName: servitor-task
   params:
     - { name: operation-id, type: string }
     - { name: operation-kind, type: string }
@@ -65,9 +91,14 @@ spec:
     - { name: resolved-options, type: string }
     - { name: backend, type: string }
     - { name: recovery, type: string, default: "" }
+    - { name: ict-config-map, type: string }
+    - { name: ict-config-key, type: string }
+    - { name: cos-secret, type: string }
+    - { name: ibm-secret, type: string }
   tasks:
     - name: operation
       taskRef: { name: servitor-operation }
+      timeout: 95m
       params:
         - { name: operation-id, value: $(params.operation-id) }
         - { name: operation-kind, value: $(params.operation-kind) }
@@ -76,3 +107,7 @@ spec:
         - { name: resolved-options, value: $(params.resolved-options) }
         - { name: backend, value: $(params.backend) }
         - { name: recovery, value: $(params.recovery) }
+        - { name: ict-config-map, value: $(params.ict-config-map) }
+        - { name: ict-config-key, value: $(params.ict-config-key) }
+        - { name: cos-secret, value: $(params.cos-secret) }
+        - { name: ibm-secret, value: $(params.ibm-secret) }

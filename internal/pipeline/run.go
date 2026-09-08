@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	servitorv1alpha1 "github.com/bevicted/servitor/api/v1alpha1"
 	tektonv1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1"
@@ -17,6 +18,14 @@ const (
 	PipelineName    = "servitor-operation"
 )
 
+// TaskConfig names the non-secret ConfigMap and credential Secrets available to operation tasks.
+type TaskConfig struct {
+	ICTConfigMap string
+	ICTConfigKey string
+	COSSecret    string
+	IBMSecret    string
+}
+
 // DeterministicRunName is stable across controller restarts and bounded for Kubernetes names.
 func DeterministicRunName(uid, operation string) string {
 	digest := sha256.Sum256([]byte(uid + "\x00" + operation))
@@ -25,21 +34,21 @@ func DeterministicRunName(uid, operation string) string {
 
 // NewPlanningRun constructs one disposable planning PipelineRun. It has no owner reference,
 // so foreground CR deletion cannot cancel an active operation.
-func NewPlanningRun(cluster *servitorv1alpha1.ServitorCluster) (*tektonv1.PipelineRun, error) {
-	return newOperationRun(cluster, "plan")
+func NewPlanningRun(cluster *servitorv1alpha1.ServitorCluster, taskConfig TaskConfig) (*tektonv1.PipelineRun, error) {
+	return newOperationRun(cluster, "plan", taskConfig)
 }
 
 // NewApplyRun constructs a fresh, noninteractive apply from frozen planning status.
-func NewApplyRun(cluster *servitorv1alpha1.ServitorCluster) (*tektonv1.PipelineRun, error) {
-	return newOperationRun(cluster, "apply")
+func NewApplyRun(cluster *servitorv1alpha1.ServitorCluster, taskConfig TaskConfig) (*tektonv1.PipelineRun, error) {
+	return newOperationRun(cluster, "apply", taskConfig)
 }
 
 // NewDestroyRun constructs a context-driven remote destroy from frozen planning status.
-func NewDestroyRun(cluster *servitorv1alpha1.ServitorCluster) (*tektonv1.PipelineRun, error) {
-	return newOperationRun(cluster, "destroy")
+func NewDestroyRun(cluster *servitorv1alpha1.ServitorCluster, taskConfig TaskConfig) (*tektonv1.PipelineRun, error) {
+	return newOperationRun(cluster, "destroy", taskConfig)
 }
 
-func newOperationRun(cluster *servitorv1alpha1.ServitorCluster, kind string) (*tektonv1.PipelineRun, error) {
+func newOperationRun(cluster *servitorv1alpha1.ServitorCluster, kind string, taskConfig TaskConfig) (*tektonv1.PipelineRun, error) {
 	if cluster.Status.Operation == nil || cluster.Status.Operation.Kind != kind || cluster.Status.ResolvedOptions == nil || cluster.Status.Backend == nil || cluster.Status.ExecutionImage == "" {
 		return nil, fmt.Errorf("%s operation was not persisted", kind)
 	}
@@ -59,6 +68,10 @@ func newOperationRun(cluster *servitorv1alpha1.ServitorCluster, kind string) (*t
 		{Name: "execution-image", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: cluster.Status.ExecutionImage}},
 		{Name: "resolved-options", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: string(options)}},
 		{Name: "backend", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: string(backend)}},
+		{Name: "ict-config-map", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: taskConfig.ICTConfigMap}},
+		{Name: "ict-config-key", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: taskConfig.ICTConfigKey}},
+		{Name: "cos-secret", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: taskConfig.COSSecret}},
+		{Name: "ibm-secret", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: taskConfig.IBMSecret}},
 	}
 	if kind == "apply" || kind == "destroy" {
 		if cluster.Status.Recovery == nil {
@@ -70,14 +83,33 @@ func newOperationRun(cluster *servitorv1alpha1.ServitorCluster, kind string) (*t
 		}
 		params = append(params, tektonv1.Param{Name: "recovery", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: string(recovery)}})
 	}
+	taskRunTemplate, err := operationTaskRunTemplate()
+	if err != nil {
+		return nil, err
+	}
 	return &tektonv1.PipelineRun{
 		TypeMeta: metav1.TypeMeta{APIVersion: "tekton.dev/v1", Kind: "PipelineRun"},
 		ObjectMeta: metav1.ObjectMeta{
 			Name: operation.PipelineRunName, Namespace: cluster.Namespace,
 			Labels: map[string]string{OperationLabel: operation.ID, ClusterUIDLabel: string(cluster.UID)},
 		},
-		Spec: tektonv1.PipelineRunSpec{PipelineRef: &tektonv1.PipelineRef{Name: PipelineName}, Params: params},
+		Spec: tektonv1.PipelineRunSpec{
+			PipelineRef: &tektonv1.PipelineRef{Name: PipelineName}, Params: params,
+			TaskRunTemplate: taskRunTemplate,
+			Timeouts: &tektonv1.TimeoutFields{
+				Pipeline: &metav1.Duration{Duration: 100 * time.Minute},
+				Tasks:    &metav1.Duration{Duration: 95 * time.Minute},
+			},
+		},
 	}, nil
+}
+
+func operationTaskRunTemplate() (tektonv1.PipelineTaskRunTemplate, error) {
+	template := tektonv1.PipelineTaskRunTemplate{ServiceAccountName: "servitor-task"}
+	if err := json.Unmarshal([]byte(`{"podTemplate":{"securityContext":{"fsGroup":0}}}`), &template); err != nil {
+		return tektonv1.PipelineTaskRunTemplate{}, fmt.Errorf("configure operation task security: %w", err)
+	}
+	return template, nil
 }
 
 func MatchingRun(run *tektonv1.PipelineRun, uid, operation string) bool {

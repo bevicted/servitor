@@ -3,6 +3,7 @@ package pipeline
 import (
 	"encoding/json"
 	"testing"
+	"time"
 
 	servitorv1alpha1 "github.com/bevicted/servitor/api/v1alpha1"
 	tektonv1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1"
@@ -31,16 +32,15 @@ func TestNewPlanningRunSerializesICTBackendConfig(t *testing.T) {
 			Operation:      &servitorv1alpha1.OperationReference{ID: "plan-a", Kind: "plan", PipelineRunName: "run"},
 		},
 	}
-	run, err := NewPlanningRun(cluster)
+	run, err := NewPlanningRun(cluster, testTaskConfig)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var serialized string
+	params := map[string]string{}
 	for _, param := range run.Spec.Params {
-		if param.Name == "backend" {
-			serialized = param.Value.StringVal
-		}
+		params[param.Name] = param.Value.StringVal
 	}
+	serialized := params["backend"]
 	var backend map[string]any
 	if err := json.Unmarshal([]byte(serialized), &backend); err != nil {
 		t.Fatal(err)
@@ -52,6 +52,17 @@ func TestNewPlanningRunSerializesICTBackendConfig(t *testing.T) {
 	}
 	if _, ok := backend["skipCredentialsValidation"]; ok {
 		t.Fatalf("ICT backend config used status field names: %s", serialized)
+	}
+	if run.Spec.Timeouts == nil || run.Spec.Timeouts.Pipeline == nil || run.Spec.Timeouts.Tasks == nil || run.Spec.Timeouts.Pipeline.Duration != 100*time.Minute || run.Spec.Timeouts.Tasks.Duration != 95*time.Minute {
+		t.Fatalf("PipelineRun timeouts = %#v, want 100m pipeline and 95m tasks", run.Spec.Timeouts)
+	}
+	if run.Spec.TaskRunTemplate.ServiceAccountName != "servitor-task" || run.Spec.TaskRunTemplate.PodTemplate == nil || run.Spec.TaskRunTemplate.PodTemplate.SecurityContext == nil || run.Spec.TaskRunTemplate.PodTemplate.SecurityContext.FSGroup == nil || *run.Spec.TaskRunTemplate.PodTemplate.SecurityContext.FSGroup != 0 {
+		t.Fatalf("PipelineRun task security = %#v, want servitor-task with fsGroup 0", run.Spec.TaskRunTemplate)
+	}
+	for name, want := range map[string]string{"ict-config-map": testTaskConfig.ICTConfigMap, "ict-config-key": testTaskConfig.ICTConfigKey, "cos-secret": testTaskConfig.COSSecret, "ibm-secret": testTaskConfig.IBMSecret} {
+		if got := params[name]; got != want {
+			t.Errorf("PipelineRun param %q = %q, want %q", name, got, want)
+		}
 	}
 }
 
@@ -66,7 +77,7 @@ func TestNewApplyRunUsesFrozenPlanningInputs(t *testing.T) {
 			Operation:       &servitorv1alpha1.OperationReference{ID: "apply-a", Kind: "apply", PipelineRunName: "run"},
 		},
 	}
-	run, err := NewApplyRun(cluster)
+	run, err := NewApplyRun(cluster, testTaskConfig)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -90,7 +101,7 @@ func TestNewDestroyRunUsesFrozenContextAndHasNoOwner(t *testing.T) {
 			Operation:       &servitorv1alpha1.OperationReference{ID: "destroy-a", Kind: "destroy", PipelineRunName: "run"},
 		},
 	}
-	run, err := NewDestroyRun(cluster)
+	run, err := NewDestroyRun(cluster, testTaskConfig)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,6 +112,13 @@ func TestNewDestroyRunUsesFrozenContextAndHasNoOwner(t *testing.T) {
 	if params["operation-kind"] != "destroy" || params["recovery"] == "" || len(run.OwnerReferences) != 0 {
 		t.Fatalf("destroy run is not detached and frozen: %#v", run)
 	}
+}
+
+var testTaskConfig = TaskConfig{
+	ICTConfigMap: "configured-ict-config",
+	ICTConfigKey: "configured.yaml",
+	COSSecret:    "configured-cos",
+	IBMSecret:    "configured-ibm",
 }
 
 func TestReportContainerReturnsActualStepContainer(t *testing.T) {
