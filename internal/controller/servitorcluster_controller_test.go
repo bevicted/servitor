@@ -204,6 +204,19 @@ func TestReconcileApprovedApplyUsesFrozenInputsAndAdoptsReadyReport(t *testing.T
 	if stored.Status.Phase != servitorv1alpha1.PhaseReady || !stored.Status.Operation.Adopted || stored.Status.Ready == nil || len(stored.Status.Ready.Resources) != 1 {
 		t.Fatalf("apply report was not adopted as ready: %+v", stored.Status)
 	}
+	if stored.Status.LeaseExpiresAt == nil || !stored.Status.LeaseExpiresAt.Time.Equal(now.Add(time.Hour)) {
+		t.Fatalf("ready transition did not snapshot the initial lease: %+v", stored.Status.LeaseExpiresAt)
+	}
+	reconciler.Now = func() time.Time { return now.Add(10 * time.Minute) }
+	if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Get(context.Background(), request.NamespacedName, stored); err != nil {
+		t.Fatal(err)
+	}
+	if !stored.Status.LeaseExpiresAt.Time.Equal(now.Add(time.Hour)) {
+		t.Fatalf("duplicate ready reconcile moved lease expiry: %s", stored.Status.LeaseExpiresAt)
+	}
 }
 
 func TestReconcileApprovalSetBeforeReviewRequiresNewApproval(t *testing.T) {
@@ -653,6 +666,151 @@ func TestSuccessfulDestroyConsumesReportThenCompletesAndRemovesFinalizer(t *test
 	if err := client.Get(context.Background(), types.NamespacedName{Namespace: "ns", Name: "destroy-run"}, &tektonv1.PipelineRun{}); !apierrors.IsNotFound(err) {
 		t.Fatalf("completed destroy PipelineRun was not explicitly deleted: %v", err)
 	}
+}
+
+func TestReadyLeaseExtensionPersistsTargetAndRollingCap(t *testing.T) {
+	now := time.Date(2026, 9, 8, 12, 0, 0, 0, time.UTC)
+	for _, test := range []struct {
+		name       string
+		expiry     time.Time
+		increment  time.Duration
+		wantExpiry time.Time
+		wantAdded  time.Duration
+	}{
+		{name: "whole-hour extension", expiry: now.Add(4 * time.Hour), increment: 8 * time.Hour, wantExpiry: now.Add(12 * time.Hour), wantAdded: 8 * time.Hour},
+		{name: "sub-hour rolling-cap clamp", expiry: now.Add(24*time.Hour - 30*time.Second), increment: time.Hour, wantExpiry: now.Add(24 * time.Hour), wantAdded: 30 * time.Second},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cluster := readyLeaseCluster(now, test.expiry)
+			requested := metav1.NewTime(test.expiry.Add(test.increment))
+			cluster.Spec.Lifecycle.RequestedExpiry = &requested
+			client := fake.NewClientBuilder().WithScheme(cleanupScheme(t)).WithStatusSubresource(&servitorv1alpha1.ServitorCluster{}).WithObjects(cluster).Build()
+			reconciler := cleanupReconciler(client, now)
+			if _, err := reconciler.Reconcile(context.Background(), cleanupRequest()); err != nil {
+				t.Fatal(err)
+			}
+			stored := &servitorv1alpha1.ServitorCluster{}
+			if err := client.Get(context.Background(), cleanupRequest().NamespacedName, stored); err != nil {
+				t.Fatal(err)
+			}
+			result := stored.Status.LeaseExtension
+			if result == nil || result.Outcome != servitorv1alpha1.ExtensionOutcomeApplied || !result.RequestedExpiry.Time.Equal(requested.Time) || result.PreviousExpiry == nil || !result.PreviousExpiry.Time.Equal(test.expiry) || result.NewExpiry == nil || !result.NewExpiry.Time.Equal(test.wantExpiry) || result.AddedSeconds != int64(test.wantAdded.Seconds()) || stored.Status.LeaseExpiresAt == nil || !stored.Status.LeaseExpiresAt.Time.Equal(test.wantExpiry) {
+				t.Fatalf("extension result = %+v, lease = %+v", result, stored.Status.LeaseExpiresAt)
+			}
+			// A restarted reconciler sees the recorded absolute target and does not
+			// add the same duration again.
+			restarted := cleanupReconciler(client, now.Add(time.Minute))
+			if _, err := restarted.Reconcile(context.Background(), cleanupRequest()); err != nil {
+				t.Fatal(err)
+			}
+			if err := client.Get(context.Background(), cleanupRequest().NamespacedName, stored); err != nil {
+				t.Fatal(err)
+			}
+			if !stored.Status.LeaseExpiresAt.Time.Equal(test.wantExpiry) || stored.Status.LeaseExtension.AddedSeconds != int64(test.wantAdded.Seconds()) {
+				t.Fatalf("replayed extension changed durable result: %+v", stored.Status)
+			}
+		})
+	}
+}
+
+func TestReadyLeaseRejectsInvalidStateAndExpiredExtensionIntents(t *testing.T) {
+	now := time.Date(2026, 9, 8, 12, 0, 0, 0, time.UTC)
+	for _, test := range []struct {
+		name    string
+		setup   func(*servitorv1alpha1.ServitorCluster)
+		outcome servitorv1alpha1.ExtensionOutcome
+	}{
+		{name: "non-ready", setup: func(cluster *servitorv1alpha1.ServitorCluster) { cluster.Status.Phase = servitorv1alpha1.PhaseApplying }, outcome: servitorv1alpha1.ExtensionOutcomeNotReady},
+		{name: "invalid increment", setup: func(cluster *servitorv1alpha1.ServitorCluster) {
+			requested := metav1.NewTime(cluster.Status.LeaseExpiresAt.Time.Add(30 * time.Minute))
+			cluster.Spec.Lifecycle.RequestedExpiry = &requested
+		}, outcome: servitorv1alpha1.ExtensionOutcomeInvalid},
+		{name: "expired", setup: func(cluster *servitorv1alpha1.ServitorCluster) {
+			expired := metav1.NewTime(now)
+			cluster.Status.LeaseExpiresAt = &expired
+			requested := metav1.NewTime(now.Add(time.Hour))
+			cluster.Spec.Lifecycle.RequestedExpiry = &requested
+		}, outcome: servitorv1alpha1.ExtensionOutcomeExpired},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cluster := readyLeaseCluster(now, now.Add(4*time.Hour))
+			requested := metav1.NewTime(now.Add(5 * time.Hour))
+			cluster.Spec.Lifecycle.RequestedExpiry = &requested
+			test.setup(cluster)
+			original := cluster.Status.LeaseExpiresAt.DeepCopy()
+			client := fake.NewClientBuilder().WithScheme(cleanupScheme(t)).WithStatusSubresource(&servitorv1alpha1.ServitorCluster{}).WithObjects(cluster).Build()
+			if _, err := cleanupReconciler(client, now).Reconcile(context.Background(), cleanupRequest()); err != nil {
+				t.Fatal(err)
+			}
+			stored := &servitorv1alpha1.ServitorCluster{}
+			if err := client.Get(context.Background(), cleanupRequest().NamespacedName, stored); err != nil {
+				t.Fatal(err)
+			}
+			if stored.Status.LeaseExtension == nil || stored.Status.LeaseExtension.Outcome != test.outcome || stored.Status.LeaseExpiresAt == nil || !stored.Status.LeaseExpiresAt.Time.Equal(original.Time) {
+				t.Fatalf("invalid extension changed lease or missed typed result: %+v", stored.Status)
+			}
+			if test.outcome == servitorv1alpha1.ExtensionOutcomeExpired && (stored.Status.Cleanup == nil || stored.Status.Cleanup.Reason != servitorv1alpha1.CleanupReasonLeaseExpired) {
+				t.Fatalf("expired lease did not start cleanup: %+v", stored.Status.Cleanup)
+			}
+		})
+	}
+}
+
+type conflictStatusClient struct {
+	client.Client
+	failUpdate bool
+}
+
+func (c *conflictStatusClient) Status() client.SubResourceWriter {
+	return conflictStatusWriter{SubResourceWriter: c.Client.Status(), client: c}
+}
+
+type conflictStatusWriter struct {
+	client.SubResourceWriter
+	client *conflictStatusClient
+}
+
+func (w conflictStatusWriter) Update(ctx context.Context, object client.Object, options ...client.SubResourceUpdateOption) error {
+	if w.client.failUpdate {
+		w.client.failUpdate = false
+		return apierrors.NewConflict(schema.GroupResource{Group: servitorv1alpha1.GroupVersion.Group, Resource: "servitorclusters/status"}, object.GetName(), nil)
+	}
+	return w.SubResourceWriter.Update(ctx, object, options...)
+}
+
+func TestReadyLeaseExtensionRetriesConflictWithoutDoubleAddition(t *testing.T) {
+	now := time.Date(2026, 9, 8, 12, 0, 0, 0, time.UTC)
+	cluster := readyLeaseCluster(now, now.Add(4*time.Hour))
+	requested := metav1.NewTime(now.Add(5 * time.Hour))
+	cluster.Spec.Lifecycle.RequestedExpiry = &requested
+	base := fake.NewClientBuilder().WithScheme(cleanupScheme(t)).WithStatusSubresource(&servitorv1alpha1.ServitorCluster{}).WithObjects(cluster).Build()
+	client := &conflictStatusClient{Client: base, failUpdate: true}
+	reconciler := cleanupReconciler(client, now)
+	if _, err := reconciler.Reconcile(context.Background(), cleanupRequest()); !apierrors.IsConflict(err) {
+		t.Fatalf("first extension update error = %v, want conflict", err)
+	}
+	if _, err := reconciler.Reconcile(context.Background(), cleanupRequest()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconciler.Reconcile(context.Background(), cleanupRequest()); err != nil {
+		t.Fatal(err)
+	}
+	stored := &servitorv1alpha1.ServitorCluster{}
+	if err := base.Get(context.Background(), cleanupRequest().NamespacedName, stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status.LeaseExpiresAt == nil || !stored.Status.LeaseExpiresAt.Time.Equal(requested.Time) || stored.Status.LeaseExtension.AddedSeconds != int64(time.Hour.Seconds()) {
+		t.Fatalf("conflict retry added lease more than once: %+v", stored.Status)
+	}
+}
+
+func readyLeaseCluster(now, expiry time.Time) *servitorv1alpha1.ServitorCluster {
+	cluster := cleanupCluster(now)
+	leaseExpiry := metav1.NewTime(expiry)
+	cluster.Status.Phase = servitorv1alpha1.PhaseReady
+	cluster.Status.Ready = &servitorv1alpha1.ReadySummary{}
+	cluster.Status.LeaseExpiresAt = &leaseExpiry
+	return cluster
 }
 
 func TestDeletionWaitsForLabelledNonOwnedApply(t *testing.T) {

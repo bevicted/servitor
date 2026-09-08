@@ -138,7 +138,12 @@ spec:
                   properties:
                     confirmationDeadline: { type: string, format: date-time }
                     initialLeaseSeconds:
-                      { type: integer, minimum: 3600, maximum: 86400 }
+                      {
+                        type: integer,
+                        minimum: 3600,
+                        maximum: 86400,
+                        multipleOf: 3600,
+                      }
                     retrySeconds:
                       {
                         type: array,
@@ -362,6 +367,20 @@ spec:
                           id: { type: string, maxLength: 256 }
                           name: { type: string, maxLength: 256 }
                           reused: { type: boolean }
+                leaseExpiresAt: { type: string, format: date-time }
+                leaseExtension:
+                  type: object
+                  required: [requestedExpiry, outcome]
+                  properties:
+                    requestedExpiry: { type: string, format: date-time }
+                    previousExpiry: { type: string, format: date-time }
+                    newExpiry: { type: string, format: date-time }
+                    addedSeconds: { type: integer, format: int64 }
+                    outcome:
+                      {
+                        type: string,
+                        enum: [Applied, Invalid, NotReady, Expired],
+                      }
                 applyDispatched: { type: boolean }
                 cleanupRequested: { type: boolean }
                 cleanup:
@@ -377,6 +396,7 @@ spec:
                             ReviewExpired,
                             PlanningFailed,
                             ApplyFailed,
+                            LeaseExpired,
                             Explicit,
                             Deletion,
                           ],

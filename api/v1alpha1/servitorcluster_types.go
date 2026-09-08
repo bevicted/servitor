@@ -61,8 +61,10 @@ type LifecyclePolicy struct {
 	InitialLeaseSeconds  int64        `json:"initialLeaseSeconds"`
 	RetrySeconds         []int64      `json:"retrySeconds"`
 	Approval             string       `json:"approval,omitempty"`
-	RequestedExpiry      *metav1.Time `json:"requestedExpiry,omitempty"`
-	CleanupRequested     bool         `json:"cleanupRequested,omitempty"`
+	// RequestedExpiry is an absolute extension target. Its value is stable across
+	// Slack redelivery, controller restarts, and optimistic-concurrency retries.
+	RequestedExpiry  *metav1.Time `json:"requestedExpiry,omitempty"`
+	CleanupRequested bool         `json:"cleanupRequested,omitempty"`
 }
 
 // ServitorClusterSpec is immutable after creation except lifecycle approval intent.
@@ -151,6 +153,7 @@ const (
 	CleanupReasonReviewExpired  CleanupReason = "ReviewExpired"
 	CleanupReasonPlanningFailed CleanupReason = "PlanningFailed"
 	CleanupReasonApplyFailed    CleanupReason = "ApplyFailed"
+	CleanupReasonLeaseExpired   CleanupReason = "LeaseExpired"
 	CleanupReasonExplicit       CleanupReason = "Explicit"
 	CleanupReasonDeletion       CleanupReason = "Deletion"
 )
@@ -184,6 +187,27 @@ type ReadySummary struct {
 	Resources []SummaryResource `json:"resources,omitempty"`
 }
 
+// ExtensionOutcome is the controller's typed disposition of an extension intent.
+type ExtensionOutcome string
+
+const (
+	ExtensionOutcomeApplied  ExtensionOutcome = "Applied"
+	ExtensionOutcomeInvalid  ExtensionOutcome = "Invalid"
+	ExtensionOutcomeNotReady ExtensionOutcome = "NotReady"
+	ExtensionOutcomeExpired  ExtensionOutcome = "Expired"
+)
+
+// LeaseExtensionStatus records an extension request and its immutable outcome.
+// RequestedExpiry is sufficient request identity because an allocation's expiry
+// can never move to the same absolute timestamp twice.
+type LeaseExtensionStatus struct {
+	RequestedExpiry metav1.Time      `json:"requestedExpiry"`
+	PreviousExpiry  *metav1.Time     `json:"previousExpiry,omitempty"`
+	NewExpiry       *metav1.Time     `json:"newExpiry,omitempty"`
+	AddedSeconds    int64            `json:"addedSeconds,omitempty"`
+	Outcome         ExtensionOutcome `json:"outcome"`
+}
+
 // ServitorClusterStatus is written exclusively by the controller.
 type ServitorClusterStatus struct {
 	Phase           string              `json:"phase,omitempty"`
@@ -197,13 +221,15 @@ type ServitorClusterStatus struct {
 	ReviewDeadline  *metav1.Time        `json:"reviewDeadline,omitempty"`
 	// ReviewGeneration and ReviewApproval record the spec state that entered AwaitingApproval.
 	// An approval must be written in a later generation.
-	ReviewGeneration int64          `json:"reviewGeneration,omitempty"`
-	ReviewApproval   string         `json:"reviewApproval,omitempty"`
-	Ready            *ReadySummary  `json:"ready,omitempty"`
-	ApplyDispatched  bool           `json:"applyDispatched,omitempty"`
-	CleanupRequested bool           `json:"cleanupRequested,omitempty"`
-	Cleanup          *CleanupStatus `json:"cleanup,omitempty"`
-	Diagnostic       string         `json:"diagnostic,omitempty"`
+	ReviewGeneration int64                 `json:"reviewGeneration,omitempty"`
+	ReviewApproval   string                `json:"reviewApproval,omitempty"`
+	Ready            *ReadySummary         `json:"ready,omitempty"`
+	LeaseExpiresAt   *metav1.Time          `json:"leaseExpiresAt,omitempty"`
+	LeaseExtension   *LeaseExtensionStatus `json:"leaseExtension,omitempty"`
+	ApplyDispatched  bool                  `json:"applyDispatched,omitempty"`
+	CleanupRequested bool                  `json:"cleanupRequested,omitempty"`
+	Cleanup          *CleanupStatus        `json:"cleanup,omitempty"`
+	Diagnostic       string                `json:"diagnostic,omitempty"`
 }
 
 // +kubebuilder:object:root=true
@@ -231,8 +257,8 @@ func (s ServitorClusterSpec) Validate() error {
 	if s.UserOptions.WorkerCount < 0 || s.UserOptions.WorkerCount > 100 {
 		return fmt.Errorf("workerCount must be from 1 through 100 when supplied")
 	}
-	if s.Lifecycle.InitialLeaseSeconds < 3600 || s.Lifecycle.InitialLeaseSeconds > 86400 {
-		return fmt.Errorf("initialLeaseSeconds must be from 3600 through 86400")
+	if s.Lifecycle.InitialLeaseSeconds < 3600 || s.Lifecycle.InitialLeaseSeconds > 86400 || s.Lifecycle.InitialLeaseSeconds%3600 != 0 {
+		return fmt.Errorf("initialLeaseSeconds must be a whole number of hours from 1 through 24")
 	}
 	if len(s.Lifecycle.RetrySeconds) > 8 {
 		return fmt.Errorf("retrySeconds has too many values")
@@ -352,6 +378,19 @@ func (in *ServitorClusterStatus) DeepCopy() *ServitorClusterStatus {
 	}
 	if in.ReviewDeadline != nil {
 		out.ReviewDeadline = in.ReviewDeadline.DeepCopy()
+	}
+	if in.LeaseExpiresAt != nil {
+		out.LeaseExpiresAt = in.LeaseExpiresAt.DeepCopy()
+	}
+	if in.LeaseExtension != nil {
+		v := *in.LeaseExtension
+		if in.LeaseExtension.PreviousExpiry != nil {
+			v.PreviousExpiry = in.LeaseExtension.PreviousExpiry.DeepCopy()
+		}
+		if in.LeaseExtension.NewExpiry != nil {
+			v.NewExpiry = in.LeaseExtension.NewExpiry.DeepCopy()
+		}
+		out.LeaseExtension = &v
 	}
 	if in.Cleanup != nil {
 		v := *in.Cleanup

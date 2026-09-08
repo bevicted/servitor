@@ -78,6 +78,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.
 		}
 		return r.reconcileCleanup(ctx, cluster)
 	}
+	if cluster.Spec.Lifecycle.RequestedExpiry != nil && cluster.Status.Phase != servitorv1alpha1.PhaseReady && !extensionRecorded(cluster) {
+		return r.recordExtensionOutcome(ctx, cluster, servitorv1alpha1.ExtensionOutcomeNotReady, nil, nil)
+	}
 	if cluster.Spec.Lifecycle.CleanupRequested && cluster.Status.Cleanup == nil {
 		return r.requestCleanup(ctx, cluster, servitorv1alpha1.CleanupReasonExplicit)
 	}
@@ -91,7 +94,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.
 	if cluster.Status.Phase == servitorv1alpha1.PhaseAwaitingApproval {
 		return r.reconcileApproval(ctx, cluster)
 	}
-	if cluster.Status.Phase == servitorv1alpha1.PhaseReady || cluster.Status.Phase == servitorv1alpha1.PhaseCleanupComplete || cluster.Status.Phase == servitorv1alpha1.PhaseUnresolved {
+	if cluster.Status.Phase == servitorv1alpha1.PhaseReady {
+		return r.reconcileReady(ctx, cluster)
+	}
+	if cluster.Status.Phase == servitorv1alpha1.PhaseCleanupComplete || cluster.Status.Phase == servitorv1alpha1.PhaseUnresolved {
 		return ctrl.Result{}, nil
 	}
 	if cluster.Status.Operation == nil {
@@ -102,6 +108,81 @@ func (r *Reconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.
 		return ctrl.Result{}, r.Status().Update(ctx, cluster)
 	}
 	return r.observeOperation(ctx, cluster)
+}
+
+// reconcileReady observes durable lease state. It intentionally uses requeues
+// rather than process-local timers, so expiry remains correct after restarts.
+func (r *Reconciler) reconcileReady(ctx context.Context, cluster *servitorv1alpha1.ServitorCluster) (ctrl.Result, error) {
+	expiry := cluster.Status.LeaseExpiresAt
+	if expiry == nil {
+		return r.recordExtensionOutcome(ctx, cluster, servitorv1alpha1.ExtensionOutcomeNotReady, nil, nil)
+	}
+	if !r.now().Before(expiry.Time) {
+		if cluster.Spec.Lifecycle.RequestedExpiry != nil && !extensionRecorded(cluster) {
+			r.setExtensionOutcome(cluster, servitorv1alpha1.ExtensionOutcomeExpired, expiry, expiry)
+		}
+		return r.requestCleanup(ctx, cluster, servitorv1alpha1.CleanupReasonLeaseExpired)
+	}
+	if requested := cluster.Spec.Lifecycle.RequestedExpiry; requested != nil && !extensionRecorded(cluster) {
+		increment := requested.Time.Sub(expiry.Time)
+		if increment < time.Hour || increment > 24*time.Hour || increment%time.Hour != 0 {
+			return r.recordExtensionOutcome(ctx, cluster, servitorv1alpha1.ExtensionOutcomeInvalid, expiry, expiry)
+		}
+		maximum := r.now().Add(24 * time.Hour)
+		newExpiry := requested.Time.UTC()
+		if newExpiry.After(maximum) {
+			newExpiry = maximum
+		}
+		return r.recordExtensionOutcome(ctx, cluster, servitorv1alpha1.ExtensionOutcomeApplied, expiry, &metav1.Time{Time: newExpiry})
+	}
+	return ctrl.Result{RequeueAfter: expiry.Time.Sub(r.now())}, nil
+}
+
+// extensionRecorded makes the persisted target an idempotency key. Retried
+// spec updates and reconciles therefore preserve the original result.
+func extensionRecorded(cluster *servitorv1alpha1.ServitorCluster) bool {
+	return cluster.Spec.Lifecycle.RequestedExpiry != nil && cluster.Status.LeaseExtension != nil && cluster.Status.LeaseExtension.RequestedExpiry.Equal(cluster.Spec.Lifecycle.RequestedExpiry)
+}
+
+func (r *Reconciler) recordExtensionOutcome(ctx context.Context, cluster *servitorv1alpha1.ServitorCluster, outcome servitorv1alpha1.ExtensionOutcome, previous, next *metav1.Time) (ctrl.Result, error) {
+	if !r.setExtensionOutcome(cluster, outcome, previous, next) {
+		return ctrl.Result{}, nil
+	}
+	if err := r.Status().Update(ctx, cluster); err != nil {
+		return ctrl.Result{}, err
+	}
+	if outcome == servitorv1alpha1.ExtensionOutcomeApplied && next != nil {
+		return ctrl.Result{RequeueAfter: next.Time.Sub(r.now())}, nil
+	}
+	return ctrl.Result{}, nil
+}
+
+func (r *Reconciler) setExtensionOutcome(cluster *servitorv1alpha1.ServitorCluster, outcome servitorv1alpha1.ExtensionOutcome, previous, next *metav1.Time) bool {
+	requested := cluster.Spec.Lifecycle.RequestedExpiry
+	if requested == nil {
+		return false
+	}
+	result := &servitorv1alpha1.LeaseExtensionStatus{
+		RequestedExpiry: metav1.NewTime(requested.Time.UTC()),
+		Outcome:         outcome,
+	}
+	if previous != nil {
+		result.PreviousExpiry = previous.DeepCopy()
+	}
+	if next != nil {
+		result.NewExpiry = next.DeepCopy()
+	}
+	if previous != nil && next != nil {
+		result.AddedSeconds = int64(next.Time.Sub(previous.Time).Seconds())
+	}
+	cluster.Status.LeaseExtension = result
+	if outcome == servitorv1alpha1.ExtensionOutcomeApplied && next != nil {
+		cluster.Status.LeaseExpiresAt = next.DeepCopy()
+	}
+	if outcome == servitorv1alpha1.ExtensionOutcomeExpired {
+		setCondition(cluster, "Ready", metav1.ConditionFalse, "LeaseExpired", "the lease expired before the extension could be applied")
+	}
+	return true
 }
 
 func (r *Reconciler) reconcileApproval(ctx context.Context, cluster *servitorv1alpha1.ServitorCluster) (ctrl.Result, error) {
@@ -424,6 +505,12 @@ func (r *Reconciler) adoptReport(ctx context.Context, cluster *servitorv1alpha1.
 	} else {
 		cluster.Status.Ready = &report.Ready
 		cluster.Status.Phase = servitorv1alpha1.PhaseReady
+		// This is the sole Ready transition. Never recompute this persisted
+		// deadline during report adoption or later duplicate reconciles.
+		if cluster.Status.LeaseExpiresAt == nil {
+			expiry := metav1.NewTime(r.now().Add(time.Duration(cluster.Spec.Lifecycle.InitialLeaseSeconds) * time.Second))
+			cluster.Status.LeaseExpiresAt = &expiry
+		}
 		setCondition(cluster, "Ready", metav1.ConditionTrue, "ReportAdopted", "validated apply report adopted")
 	}
 	return ctrl.Result{}, r.Status().Update(ctx, cluster)

@@ -33,3 +33,19 @@ func ParseExtend(text string) (time.Duration, error) {
 	}
 	return time.Duration(hours) * time.Hour, nil
 }
+
+// ExtensionTarget converts parsed extension input into the durable absolute
+// target stored in a ServitorCluster spec. A zero increment uses the
+// snapshotted default lease rather than a process-local value.
+func ExtensionTarget(expiry time.Time, increment, defaultLease time.Duration) (time.Time, error) {
+	if expiry.IsZero() {
+		return time.Time{}, fmt.Errorf("only an unexpired ready lifecycle can be extended")
+	}
+	if increment == 0 {
+		increment = defaultLease
+	}
+	if increment < time.Hour || increment > 24*time.Hour || increment%time.Hour != 0 {
+		return time.Time{}, fmt.Errorf("extend accepts an optional whole number of hours from 1 through 24")
+	}
+	return expiry.Add(increment).UTC(), nil
+}

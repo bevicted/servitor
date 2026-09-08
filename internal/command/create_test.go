@@ -37,6 +37,31 @@ func TestParseExtendAcceptsOnlyWholeHourGrammar(t *testing.T) {
 	}
 }
 
+func TestExtensionTargetUsesSnapshotDefaultAndKeepsUTC(t *testing.T) {
+	expiry := time.Date(2026, 9, 8, 16, 0, 0, 0, time.FixedZone("CDT", -5*60*60))
+	for _, test := range []struct {
+		name      string
+		increment time.Duration
+		want      time.Time
+	}{
+		{name: "bare command", increment: 0, want: expiry.Add(4 * time.Hour)},
+		{name: "number", increment: 2 * time.Hour, want: expiry.Add(2 * time.Hour)},
+		{name: "number with h suffix", increment: 3 * time.Hour, want: expiry.Add(3 * time.Hour)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := ExtensionTarget(expiry, test.increment, 4*time.Hour)
+			if err != nil || !got.Equal(test.want) || got.Location() != time.UTC {
+				t.Fatalf("ExtensionTarget() = %s, %v; want %s UTC", got, err, test.want.UTC())
+			}
+		})
+	}
+	for _, increment := range []time.Duration{30 * time.Minute, 25 * time.Hour} {
+		if _, err := ExtensionTarget(expiry, increment, 4*time.Hour); err == nil {
+			t.Fatalf("ExtensionTarget accepted %s", increment)
+		}
+	}
+}
+
 func TestParseCreateAcceptsEverySafeFlag(t *testing.T) {
 	request, err := ParseCreate(`create --target test --provider vpc-gen2 --platform openshift --version 4.22 --resource-group "Platform Team" --zone us-south-3 --flavor custom --vpc-id vpc-id --subnet-id subnet-one --subnet-id subnet-two --public-gateway-id gateway-one --public-gateway-id gateway-two --datacenter dal10 --machine-type b3c.4x16 --public-vlan-id public-vlan --private-vlan-id private-vlan --satellite-zone us-south-1 --satellite-zone us-south-2 --satellite-managed-from managed-from --satellite-location-id location-id --satellite-host-image image-id --satellite-host-profile bx2-4x16 --satellite-ssh-key-id ssh-key --satellite-worker-instance-id worker-one --satellite-worker-instance-id worker-two --satellite-worker-operating-system RHCOS --worker-count 3 --name 'team cluster'`, testCreateDefaults)
 	if err != nil {
