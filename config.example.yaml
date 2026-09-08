@@ -1,0 +1,36 @@
+# Copy this file to $XDG_CONFIG_HOME/servitor/config.yaml (or the platform config directory) and restrict it to the service account.
+# This template is intentionally incomplete: fill every empty value before startup.
+# Slack tokens are supplied only through SLACK_BOT_TOKEN and SLACK_APP_TOKEN.
+# Minimum Slack app setup: app scope connections:write; bot scopes chat:write,
+# im:history, and channels:history (public) and/or groups:history (private);
+# event subscriptions message.im and message.channels (public) and/or message.groups
+# (private). Do not add app mentions, reactions, profile, conversation-membership,
+# im:read, or im:write scopes. The configured maintainer may DM status, pause,
+# unpause, and stop; these commands are not for ordinary users.
+slack:
+  channel_id: ""
+  maintainer_id: ""
+ict:
+  path: ""
+  config_path: ""
+  terraform_path: ""
+paths:
+  state: ""
+  logs: ""
+defaults:
+  version: ""
+  target: ""
+  provider: ""
+  resource_group: ""
+  zone: ""
+  vpc_name: ""
+  vpc_id: ""
+  openshift_flavor: ""
+  kubernetes_flavor: ""
+lifecycle:
+  confirmation_timeout: 5m
+  lease: 4h # Initial lease; whole hours only, from 1h through 24h. Extensions roll from expiry and cap remaining time at 24h.
+  retry_intervals: [1m, 5m, 15m]
+logs:
+  max_size_bytes: 10485760
+  resolved_retention: 720h

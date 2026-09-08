@@ -1,0 +1,21 @@
+# Private operator and runtime data. Keep config.example.yaml as the only config in Git.
+servitor.yaml
+config.yaml
+*.token
+.env
+.env.*
+
+# Servitor private state and diagnostics.
+/state/
+logs/
+runtime/
+events.json
+lifecycles.json
+*.log
+
+# Terraform and ICT workspaces.
+.terraform/
+*.tfplan
+*.tfstate
+*.tfstate.*
+ict-workspaces/
