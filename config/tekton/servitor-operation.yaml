@@ -1,0 +1,66 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: servitor-operation
+spec:
+  params:
+    - { name: operation-id, type: string }
+    - { name: cluster-uid, type: string }
+    - { name: execution-image, type: string }
+    - { name: resolved-options, type: string }
+    - { name: backend, type: string }
+  volumes:
+    - name: operation-data
+      emptyDir: {}
+  steps:
+    - name: execute
+      image: $(params.execution-image)
+      command: ["/usr/local/bin/servitor-task"]
+      args:
+        - -cluster-uid
+        - $(params.cluster-uid)
+        - -operation-id
+        - $(params.operation-id)
+        - -resolved-options
+        - /operation/options.json
+        - -resolved-options-json
+        - $(params.resolved-options)
+        - -backend-config
+        - /operation/backend.json
+        - -backend-json
+        - $(params.backend)
+        - -ict-result
+        - /operation/ict-result.json
+        - -report
+        - /operation/report.json
+      volumeMounts: [{ name: operation-data, mountPath: /operation }]
+      envFrom:
+        - secretRef: { name: servitor-cos-credentials }
+    - name: report
+      image: $(params.execution-image)
+      command: ["cat"]
+      args: ["/operation/report.json"]
+      volumeMounts: [{ name: operation-data, mountPath: /operation }]
+---
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: servitor-operation
+spec:
+  taskRunTemplate:
+    serviceAccountName: servitor-task
+  params:
+    - { name: operation-id, type: string }
+    - { name: cluster-uid, type: string }
+    - { name: execution-image, type: string }
+    - { name: resolved-options, type: string }
+    - { name: backend, type: string }
+  tasks:
+    - name: operation
+      taskRef: { name: servitor-operation }
+      params:
+        - { name: operation-id, value: $(params.operation-id) }
+        - { name: cluster-uid, value: $(params.cluster-uid) }
+        - { name: execution-image, value: $(params.execution-image) }
+        - { name: resolved-options, value: $(params.resolved-options) }
+        - { name: backend, value: $(params.backend) }

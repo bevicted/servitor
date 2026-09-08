@@ -1,0 +1,10 @@
+domain: bevicted.github.io
+layout:
+- go.kubebuilder.io/v4
+projectName: servitor
+repo: github.com/bevicted/servitor
+resources:
+- group: servitor
+  kind: ServitorCluster
+  version: v1alpha1
+version: "3-alpha"

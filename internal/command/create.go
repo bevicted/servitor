@@ -54,42 +54,61 @@ var createFlags = map[string]bool{
 var repeatableCreateFlags = map[string]bool{"--subnet-id": true, "--public-gateway-id": true, "--satellite-zone": true, "--satellite-worker-instance-id": true}
 var forbiddenCreateFlags = map[string]bool{"--config": true, "--owner": true, "--prefix": true, "--auto-approve": true, "--confirm-stdin": true, "--satellite-ssh-public-key": true}
 
-// ParseCreate accepts exactly the safe, named ICT create inputs and adds defaults.
-func ParseCreate(text string, defaults CreateDefaults) (CreateRequest, error) {
+// ExplicitCreateOptions contains only user-supplied, safe options. It never includes defaults.
+type ExplicitCreateOptions struct{ values map[string][]string }
+
+// ParseCreateOptions validates the safe CLI grammar without applying operator defaults.
+func ParseCreateOptions(text string) (ExplicitCreateOptions, error) {
 	words, err := splitWords(text)
 	if err != nil {
-		return CreateRequest{}, err
+		return ExplicitCreateOptions{}, err
 	}
 	if len(words) == 0 || words[0] != "create" {
-		return CreateRequest{}, fmt.Errorf("command must start with create")
+		return ExplicitCreateOptions{}, fmt.Errorf("command must start with create")
 	}
-	seen := map[string]bool{}
-	values := map[string][]string{}
+	seen, values := map[string]bool{}, map[string][]string{}
 	for i := 1; i < len(words); {
 		flag, value, joined := strings.Cut(words[i], "=")
 		if forbiddenCreateFlags[flag] {
-			return CreateRequest{}, fmt.Errorf("%s is not permitted", flag)
+			return ExplicitCreateOptions{}, fmt.Errorf("%s is not permitted", flag)
 		}
 		if !createFlags[flag] {
-			return CreateRequest{}, fmt.Errorf("unknown create flag %q", flag)
+			return ExplicitCreateOptions{}, fmt.Errorf("unknown create flag %q", flag)
 		}
 		if !joined {
 			if i+1 == len(words) || strings.HasPrefix(words[i+1], "--") {
-				return CreateRequest{}, fmt.Errorf("%s requires a value", flag)
+				return ExplicitCreateOptions{}, fmt.Errorf("%s requires a value", flag)
 			}
-			value = words[i+1]
-			i += 2
+			value, i = words[i+1], i+2
 		} else {
 			if value == "" {
-				return CreateRequest{}, fmt.Errorf("%s requires a value", flag)
+				return ExplicitCreateOptions{}, fmt.Errorf("%s requires a value", flag)
 			}
 			i++
 		}
 		if seen[flag] && !repeatableCreateFlags[flag] {
-			return CreateRequest{}, fmt.Errorf("%s may only be supplied once", flag)
+			return ExplicitCreateOptions{}, fmt.Errorf("%s may only be supplied once", flag)
 		}
 		seen[flag] = true
 		values[flag] = append(values[flag], value)
+	}
+	return ExplicitCreateOptions{values: values}, nil
+}
+
+// ParseCreate remains the compatibility helper for callers that immediately resolve defaults.
+func ParseCreate(text string, defaults CreateDefaults) (CreateRequest, error) {
+	options, err := ParseCreateOptions(text)
+	if err != nil {
+		return CreateRequest{}, err
+	}
+	return ResolveCreateOptions(options, defaults)
+}
+
+// ResolveCreateOptions overlays startup defaults once onto explicit options.
+func ResolveCreateOptions(options ExplicitCreateOptions, defaults CreateDefaults) (CreateRequest, error) {
+	values := make(map[string][]string, len(options.values))
+	for flag, supplied := range options.values {
+		values[flag] = append([]string(nil), supplied...)
 	}
 	version := one(values, "--version")
 	if version == "" {
@@ -132,7 +151,7 @@ func ParseCreate(text string, defaults CreateDefaults) (CreateRequest, error) {
 		}
 	}
 	ordered := []string{"--target", "--provider", "--platform", "--version", "--resource-group", "--zone", "--flavor", "--vpc-id", "--subnet-id", "--public-gateway-id", "--datacenter", "--machine-type", "--public-vlan-id", "--private-vlan-id", "--satellite-zone", "--satellite-managed-from", "--satellite-location-id", "--satellite-host-image", "--satellite-host-profile", "--satellite-ssh-key-id", "--satellite-worker-instance-id", "--satellite-worker-operating-system", "--worker-count", "--name"}
-	args := make([]string, 0, len(words)+12)
+	args := make([]string, 0, len(values)*2+12)
 	for _, flag := range ordered {
 		for _, value := range values[flag] {
 			args = append(args, flag, value)
