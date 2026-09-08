@@ -15,6 +15,7 @@ const (
 	PhaseApplying         = "Applying"
 	PhaseReady            = "Ready"
 	PhaseCleanupPending   = "CleanupPending"
+	PhaseCleanupComplete  = "CleanupComplete"
 	PhaseUnresolved       = "Unresolved"
 	CleanupFinalizer      = "servitor.bevicted.github.io/cleanup"
 )
@@ -61,6 +62,7 @@ type LifecyclePolicy struct {
 	RetrySeconds         []int64      `json:"retrySeconds"`
 	Approval             string       `json:"approval,omitempty"`
 	RequestedExpiry      *metav1.Time `json:"requestedExpiry,omitempty"`
+	CleanupRequested     bool         `json:"cleanupRequested,omitempty"`
 }
 
 // ServitorClusterSpec is immutable after creation except lifecycle approval intent.
@@ -137,7 +139,30 @@ type OperationReference struct {
 	Kind            string      `json:"kind"`
 	PipelineRunName string      `json:"pipelineRunName"`
 	StartedAt       metav1.Time `json:"startedAt"`
+	Dispatched      bool        `json:"dispatched,omitempty"`
 	Adopted         bool        `json:"adopted,omitempty"`
+}
+
+// CleanupReason identifies the terminal transition that requested cleanup.
+type CleanupReason string
+
+const (
+	CleanupReasonRejected       CleanupReason = "Rejected"
+	CleanupReasonReviewExpired  CleanupReason = "ReviewExpired"
+	CleanupReasonPlanningFailed CleanupReason = "PlanningFailed"
+	CleanupReasonApplyFailed    CleanupReason = "ApplyFailed"
+	CleanupReasonExplicit       CleanupReason = "Explicit"
+	CleanupReasonDeletion       CleanupReason = "Deletion"
+)
+
+// CleanupStatus is the persisted, restart-safe cleanup state machine.
+type CleanupStatus struct {
+	Reason          CleanupReason `json:"reason"`
+	RequestedAt     metav1.Time   `json:"requestedAt"`
+	RequiresDestroy bool          `json:"requiresDestroy"`
+	RetryCount      int           `json:"retryCount,omitempty"`
+	NextRetryAt     *metav1.Time  `json:"nextRetryAt,omitempty"`
+	CompletedAt     *metav1.Time  `json:"completedAt,omitempty"`
 }
 
 // SummaryResource is deliberately bounded, sanitized review metadata.
@@ -172,11 +197,13 @@ type ServitorClusterStatus struct {
 	ReviewDeadline  *metav1.Time        `json:"reviewDeadline,omitempty"`
 	// ReviewGeneration and ReviewApproval record the spec state that entered AwaitingApproval.
 	// An approval must be written in a later generation.
-	ReviewGeneration int64         `json:"reviewGeneration,omitempty"`
-	ReviewApproval   string        `json:"reviewApproval,omitempty"`
-	Ready            *ReadySummary `json:"ready,omitempty"`
-	CleanupRequested bool          `json:"cleanupRequested,omitempty"`
-	Diagnostic       string        `json:"diagnostic,omitempty"`
+	ReviewGeneration int64          `json:"reviewGeneration,omitempty"`
+	ReviewApproval   string         `json:"reviewApproval,omitempty"`
+	Ready            *ReadySummary  `json:"ready,omitempty"`
+	ApplyDispatched  bool           `json:"applyDispatched,omitempty"`
+	CleanupRequested bool           `json:"cleanupRequested,omitempty"`
+	Cleanup          *CleanupStatus `json:"cleanup,omitempty"`
+	Diagnostic       string         `json:"diagnostic,omitempty"`
 }
 
 // +kubebuilder:object:root=true
@@ -325,6 +352,16 @@ func (in *ServitorClusterStatus) DeepCopy() *ServitorClusterStatus {
 	}
 	if in.ReviewDeadline != nil {
 		out.ReviewDeadline = in.ReviewDeadline.DeepCopy()
+	}
+	if in.Cleanup != nil {
+		v := *in.Cleanup
+		if in.Cleanup.NextRetryAt != nil {
+			v.NextRetryAt = in.Cleanup.NextRetryAt.DeepCopy()
+		}
+		if in.Cleanup.CompletedAt != nil {
+			v.CompletedAt = in.Cleanup.CompletedAt.DeepCopy()
+		}
+		out.Cleanup = &v
 	}
 	return out
 }

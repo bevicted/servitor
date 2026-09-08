@@ -1,4 +1,4 @@
-// Package controller reconciles ServitorCluster planning operations.
+// Package controller reconciles ServitorCluster operations.
 package controller
 
 import (
@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"time"
@@ -48,7 +49,7 @@ type Reconciler struct {
 // +kubebuilder:rbac:groups=servitor.bevicted.github.io,resources=servitorclusters,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=servitor.bevicted.github.io,resources=servitorclusters/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=servitor.bevicted.github.io,resources=servitorclusters/finalizers,verbs=update
-// +kubebuilder:rbac:groups=tekton.dev,resources=pipelineruns;taskruns,verbs=get;list;watch;create
+// +kubebuilder:rbac:groups=tekton.dev,resources=pipelineruns;taskruns,verbs=get;list;watch;create;delete
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list
 // +kubebuilder:rbac:groups="",resources=pods/log,verbs=get
 func (r *Reconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.Result, error) {
@@ -67,14 +68,22 @@ func (r *Reconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.
 			cluster.Finalizers = append(cluster.Finalizers, servitorv1alpha1.CleanupFinalizer)
 			return ctrl.Result{}, r.Update(ctx, cluster)
 		}
-	} else if !cluster.Status.CleanupRequested {
-		cluster.Status.CleanupRequested = true
-		if cluster.Status.Phase != servitorv1alpha1.PhaseApplying {
-			cluster.Status.Phase = servitorv1alpha1.PhaseCleanupPending
-		}
-		return ctrl.Result{}, r.Status().Update(ctx, cluster)
+	} else if cluster.Status.Cleanup != nil && cluster.Status.Cleanup.CompletedAt != nil {
+		return r.removeFinalizer(ctx, cluster)
 	}
 
+	if !cluster.DeletionTimestamp.IsZero() {
+		if cluster.Status.Cleanup == nil {
+			return r.requestCleanup(ctx, cluster, servitorv1alpha1.CleanupReasonDeletion)
+		}
+		return r.reconcileCleanup(ctx, cluster)
+	}
+	if cluster.Spec.Lifecycle.CleanupRequested && cluster.Status.Cleanup == nil {
+		return r.requestCleanup(ctx, cluster, servitorv1alpha1.CleanupReasonExplicit)
+	}
+	if cluster.Status.Cleanup != nil || cluster.Status.CleanupRequested {
+		return r.reconcileCleanup(ctx, cluster)
+	}
 	if cluster.Status.ResolvedOptions == nil {
 		r.snapshot(cluster)
 		return ctrl.Result{}, r.Status().Update(ctx, cluster)
@@ -82,7 +91,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.
 	if cluster.Status.Phase == servitorv1alpha1.PhaseAwaitingApproval {
 		return r.reconcileApproval(ctx, cluster)
 	}
-	if cluster.Status.Phase == servitorv1alpha1.PhaseReady || cluster.Status.Phase == servitorv1alpha1.PhaseCleanupPending || cluster.Status.Phase == servitorv1alpha1.PhaseUnresolved {
+	if cluster.Status.Phase == servitorv1alpha1.PhaseReady || cluster.Status.Phase == servitorv1alpha1.PhaseCleanupComplete || cluster.Status.Phase == servitorv1alpha1.PhaseUnresolved {
 		return ctrl.Result{}, nil
 	}
 	if cluster.Status.Operation == nil {
@@ -98,17 +107,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.
 func (r *Reconciler) reconcileApproval(ctx context.Context, cluster *servitorv1alpha1.ServitorCluster) (ctrl.Result, error) {
 	deadline := cluster.Status.ReviewDeadline
 	if deadline == nil || !r.now().Before(deadline.Time) {
-		cluster.Status.CleanupRequested = true
-		cluster.Status.Phase = servitorv1alpha1.PhaseCleanupPending
-		setCondition(cluster, "Ready", metav1.ConditionFalse, "ApprovalExpired", "approval was not received before the review deadline")
-		return ctrl.Result{}, r.Status().Update(ctx, cluster)
+		return r.requestCleanup(ctx, cluster, servitorv1alpha1.CleanupReasonReviewExpired)
 	}
 	switch cluster.Spec.Lifecycle.Approval {
 	case "rejected":
-		cluster.Status.CleanupRequested = true
-		cluster.Status.Phase = servitorv1alpha1.PhaseCleanupPending
-		setCondition(cluster, "Ready", metav1.ConditionFalse, "ApprovalRejected", "configuration approval was rejected")
-		return ctrl.Result{}, r.Status().Update(ctx, cluster)
+		return r.requestCleanup(ctx, cluster, servitorv1alpha1.CleanupReasonRejected)
 	case "":
 		if cluster.Status.ReviewApproval == "approved" {
 			cluster.Status.ReviewGeneration = cluster.Generation
@@ -122,10 +125,211 @@ func (r *Reconciler) reconcileApproval(ctx context.Context, cluster *servitorv1a
 		}
 		operation := applyID(string(cluster.UID))
 		cluster.Status.Operation = &servitorv1alpha1.OperationReference{ID: operation, Kind: "apply", PipelineRunName: pipeline.DeterministicRunName(string(cluster.UID), operation), StartedAt: metav1.NewTime(r.now())}
+		// Persist this before run creation: a lost create response must be treated as
+		// an apply that may have reached Terraform.
+		cluster.Status.ApplyDispatched = true
 		cluster.Status.Phase = servitorv1alpha1.PhaseApplying
 		return ctrl.Result{}, r.Status().Update(ctx, cluster)
 	}
 	return ctrl.Result{RequeueAfter: deadline.Time.Sub(r.now())}, nil
+}
+
+func (r *Reconciler) requestCleanup(ctx context.Context, cluster *servitorv1alpha1.ServitorCluster, reason servitorv1alpha1.CleanupReason) (ctrl.Result, error) {
+	if cluster.Status.Cleanup == nil {
+		cluster.Status.Cleanup = &servitorv1alpha1.CleanupStatus{
+			Reason:          reason,
+			RequestedAt:     metav1.NewTime(r.now()),
+			RequiresDestroy: applyMayHaveRun(cluster),
+		}
+	}
+	cluster.Status.CleanupRequested = true
+	if reason == servitorv1alpha1.CleanupReasonApplyFailed {
+		cluster.Status.Diagnostic = "ApplyFailed"
+	}
+	cluster.Status.Phase = servitorv1alpha1.PhaseCleanupPending
+	setCondition(cluster, "Ready", metav1.ConditionFalse, string(cluster.Status.Cleanup.Reason), "cleanup is required")
+	return ctrl.Result{}, r.Status().Update(ctx, cluster)
+}
+
+func applyMayHaveRun(cluster *servitorv1alpha1.ServitorCluster) bool {
+	if cluster.Status.ApplyDispatched || cluster.Status.Ready != nil || cluster.Status.Phase == servitorv1alpha1.PhaseReady || cluster.Status.Phase == servitorv1alpha1.PhaseApplying {
+		return true
+	}
+	return cluster.Status.Operation != nil && cluster.Status.Operation.Kind == "apply"
+}
+
+func (r *Reconciler) reconcileCleanup(ctx context.Context, cluster *servitorv1alpha1.ServitorCluster) (ctrl.Result, error) {
+	if cluster.Status.Cleanup == nil {
+		return r.requestCleanup(ctx, cluster, servitorv1alpha1.CleanupReasonExplicit)
+	}
+	cleanup := cluster.Status.Cleanup
+	if cleanup.CompletedAt != nil {
+		return r.removeFinalizer(ctx, cluster)
+	}
+	if cluster.Status.Phase == servitorv1alpha1.PhaseUnresolved {
+		return ctrl.Result{}, nil
+	}
+	if cleanup.NextRetryAt != nil && r.now().Before(cleanup.NextRetryAt.Time) {
+		return ctrl.Result{RequeueAfter: cleanup.NextRetryAt.Time.Sub(r.now())}, nil
+	}
+	if cluster.Status.Operation != nil {
+		return r.waitForCleanupOperation(ctx, cluster)
+	}
+	if !cleanup.RequiresDestroy {
+		return r.completeCleanup(ctx, cluster)
+	}
+	operation := destroyID(string(cluster.UID), cleanup.RetryCount)
+	cluster.Status.Operation = &servitorv1alpha1.OperationReference{
+		ID: operation, Kind: "destroy", PipelineRunName: pipeline.DeterministicRunName(string(cluster.UID), operation), StartedAt: metav1.NewTime(r.now()),
+	}
+	cleanup.NextRetryAt = nil
+	cluster.Status.Phase = servitorv1alpha1.PhaseCleanupPending
+	return ctrl.Result{}, r.Status().Update(ctx, cluster)
+}
+
+// waitForCleanupOperation serializes destroy behind any persisted plan/apply run.
+func (r *Reconciler) waitForCleanupOperation(ctx context.Context, cluster *servitorv1alpha1.ServitorCluster) (ctrl.Result, error) {
+	operation := cluster.Status.Operation
+	run := &tektonv1.PipelineRun{}
+	err := r.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: operation.PipelineRunName}, run)
+	if apierrors.IsNotFound(err) {
+		if operation.Kind == "destroy" {
+			if operation.Dispatched {
+				return r.unresolved(ctx, cluster, "DestroyRunMissing", errors.New("persisted destroy PipelineRun is missing"))
+			}
+			created, buildErr := pipeline.NewDestroyRun(cluster)
+			if buildErr != nil {
+				return r.unresolved(ctx, cluster, "InvalidOperation", buildErr)
+			}
+			if createErr := r.Create(ctx, created); createErr != nil && !apierrors.IsAlreadyExists(createErr) {
+				return ctrl.Result{}, createErr
+			}
+			operation.Dispatched = true
+			return ctrl.Result{RequeueAfter: time.Second}, r.Status().Update(ctx, cluster)
+		}
+		// The operation was persisted but never observed in the API. It cannot be
+		// running; apply ownership was already conservatively recorded at launch.
+		cluster.Status.Operation = nil
+		return ctrl.Result{}, r.Status().Update(ctx, cluster)
+	}
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if !pipeline.MatchingRun(run, string(cluster.UID), operation.ID) {
+		return r.unresolved(ctx, cluster, "OperationIdentityMismatch", errors.New("existing PipelineRun does not match active operation"))
+	}
+	done, succeeded := pipeline.Succeeded(run)
+	if !done {
+		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
+	}
+	if operation.Kind != "destroy" {
+		if operation.Kind == "apply" {
+			cluster.Status.ApplyDispatched = true
+		}
+		cluster.Status.Operation = nil
+		return ctrl.Result{}, r.Status().Update(ctx, cluster)
+	}
+	if !succeeded {
+		return r.recordDestroyFailure(ctx, cluster)
+	}
+	if err := r.consumeDestroyReport(ctx, cluster, run); err != nil {
+		return r.handleDestroyReportError(ctx, cluster, err)
+	}
+	return r.completeCleanup(ctx, cluster)
+}
+
+func (r *Reconciler) consumeDestroyReport(ctx context.Context, cluster *servitorv1alpha1.ServitorCluster, run *tektonv1.PipelineRun) error {
+	taskRunName := pipeline.ReportTaskRunName(run)
+	if taskRunName == "" {
+		return errors.New("completed destroy PipelineRun has no operation TaskRun")
+	}
+	taskRun := &tektonv1.TaskRun{}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: taskRunName}, taskRun); err != nil {
+		return err
+	}
+	container := pipeline.ReportContainer(taskRun)
+	if taskRun.Status.PodName == "" || container == "" {
+		return errors.New("completed destroy operation has no report container log")
+	}
+	if r.Logs == nil {
+		return errors.New("Pod log client is not configured")
+	}
+	_, err := pipeline.ReadReport(ctx, r.Logs, cluster.Namespace, taskRun.Status.PodName, container, string(cluster.UID), cluster.Status.Operation.ID)
+	return err
+}
+
+func (r *Reconciler) handleDestroyReportError(ctx context.Context, cluster *servitorv1alpha1.ServitorCluster, err error) (ctrl.Result, error) {
+	if pipeline.IsLogReadError(err) && !apierrors.IsNotFound(err) && !apierrors.IsBadRequest(err) {
+		return ctrl.Result{RequeueAfter: r.logRetry()}, nil
+	}
+	return r.unresolved(ctx, cluster, "DestroyReportMissing", err)
+}
+
+func (r *Reconciler) recordDestroyFailure(ctx context.Context, cluster *servitorv1alpha1.ServitorCluster) (ctrl.Result, error) {
+	cleanup := cluster.Status.Cleanup
+	cluster.Status.Operation = nil
+	cluster.Status.Diagnostic = "DestroyFailed"
+	if cleanup.RetryCount >= len(cluster.Spec.Lifecycle.RetrySeconds) {
+		cleanup.NextRetryAt = nil
+		cluster.Status.Phase = servitorv1alpha1.PhaseUnresolved
+		setCondition(cluster, "Ready", metav1.ConditionFalse, "Unresolved", "destroy retries are exhausted; recovery context and finalizer are retained")
+		return ctrl.Result{}, r.Status().Update(ctx, cluster)
+	}
+	delay := time.Duration(cluster.Spec.Lifecycle.RetrySeconds[cleanup.RetryCount]) * time.Second
+	cleanup.RetryCount++
+	next := metav1.NewTime(r.now().Add(delay))
+	cleanup.NextRetryAt = &next
+	cluster.Status.Phase = servitorv1alpha1.PhaseCleanupPending
+	setCondition(cluster, "Ready", metav1.ConditionFalse, "DestroyRetry", "destroy failed; retry is scheduled")
+	return ctrl.Result{RequeueAfter: delay}, r.Status().Update(ctx, cluster)
+}
+
+func (r *Reconciler) completeCleanup(ctx context.Context, cluster *servitorv1alpha1.ServitorCluster) (ctrl.Result, error) {
+	if err := r.deleteTerminalOperationRuns(ctx, cluster); err != nil {
+		return ctrl.Result{}, err
+	}
+	now := metav1.NewTime(r.now())
+	cluster.Status.Operation = nil
+	cluster.Status.Cleanup.NextRetryAt = nil
+	cluster.Status.Cleanup.CompletedAt = &now
+	cluster.Status.Phase = servitorv1alpha1.PhaseCleanupComplete
+	cluster.Status.Diagnostic = ""
+	setCondition(cluster, "Ready", metav1.ConditionFalse, "CleanupComplete", "cleanup completed")
+	if err := r.Status().Update(ctx, cluster); err != nil {
+		return ctrl.Result{}, err
+	}
+	return r.removeFinalizer(ctx, cluster)
+}
+
+func (r *Reconciler) deleteTerminalOperationRuns(ctx context.Context, cluster *servitorv1alpha1.ServitorCluster) error {
+	var runs tektonv1.PipelineRunList
+	if err := r.List(ctx, &runs, client.InNamespace(cluster.Namespace), client.MatchingLabels{pipeline.ClusterUIDLabel: string(cluster.UID)}); err != nil {
+		return err
+	}
+	for i := range runs.Items {
+		done, _ := pipeline.Succeeded(&runs.Items[i])
+		if !done {
+			return fmt.Errorf("active PipelineRun %q cannot be removed during cleanup", runs.Items[i].Name)
+		}
+		if err := r.Delete(ctx, &runs.Items[i]); err != nil && !apierrors.IsNotFound(err) {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *Reconciler) removeFinalizer(ctx context.Context, cluster *servitorv1alpha1.ServitorCluster) (ctrl.Result, error) {
+	if !contains(cluster.Finalizers, servitorv1alpha1.CleanupFinalizer) {
+		return ctrl.Result{}, nil
+	}
+	finalizers := make([]string, 0, len(cluster.Finalizers)-1)
+	for _, finalizer := range cluster.Finalizers {
+		if finalizer != servitorv1alpha1.CleanupFinalizer {
+			finalizers = append(finalizers, finalizer)
+		}
+	}
+	cluster.Finalizers = finalizers
+	return ctrl.Result{}, r.Update(ctx, cluster)
 }
 
 func (r *Reconciler) observeOperation(ctx context.Context, cluster *servitorv1alpha1.ServitorCluster) (ctrl.Result, error) {
@@ -149,7 +353,8 @@ func (r *Reconciler) observeOperation(ctx context.Context, cluster *servitorv1al
 		if createErr := r.Create(ctx, created); createErr != nil && !apierrors.IsAlreadyExists(createErr) {
 			return ctrl.Result{}, createErr
 		}
-		return ctrl.Result{RequeueAfter: time.Second}, nil
+		operation.Dispatched = true
+		return ctrl.Result{RequeueAfter: time.Second}, r.Status().Update(ctx, cluster)
 	}
 	if err != nil {
 		return ctrl.Result{}, err
@@ -163,13 +368,9 @@ func (r *Reconciler) observeOperation(ctx context.Context, cluster *servitorv1al
 	}
 	if !succeeded {
 		if operation.Kind == "apply" {
-			cluster.Status.CleanupRequested = true
-			cluster.Status.Phase = servitorv1alpha1.PhaseCleanupPending
-			cluster.Status.Diagnostic = "ApplyFailed"
-			setCondition(cluster, "Ready", metav1.ConditionFalse, "ApplyFailed", "apply PipelineRun failed; cleanup is required")
-			return ctrl.Result{}, r.Status().Update(ctx, cluster)
+			return r.requestCleanup(ctx, cluster, servitorv1alpha1.CleanupReasonApplyFailed)
 		}
-		return r.unresolved(ctx, cluster, "PlanningFailed", errors.New("planning PipelineRun failed"))
+		return r.requestCleanup(ctx, cluster, servitorv1alpha1.CleanupReasonPlanningFailed)
 	}
 	if operation.Adopted {
 		return ctrl.Result{}, nil
@@ -222,12 +423,8 @@ func (r *Reconciler) adoptReport(ctx context.Context, cluster *servitorv1alpha1.
 		setCondition(cluster, "PlanningSucceeded", metav1.ConditionTrue, "ReportAdopted", "validated planning report adopted")
 	} else {
 		cluster.Status.Ready = &report.Ready
-		if cluster.Status.CleanupRequested {
-			cluster.Status.Phase = servitorv1alpha1.PhaseCleanupPending
-		} else {
-			cluster.Status.Phase = servitorv1alpha1.PhaseReady
-			setCondition(cluster, "Ready", metav1.ConditionTrue, "ReportAdopted", "validated apply report adopted")
-		}
+		cluster.Status.Phase = servitorv1alpha1.PhaseReady
+		setCondition(cluster, "Ready", metav1.ConditionTrue, "ReportAdopted", "validated apply report adopted")
 	}
 	return ctrl.Result{}, r.Status().Update(ctx, cluster)
 }
@@ -270,13 +467,14 @@ func (r *Reconciler) reviewTimeout() time.Duration {
 	}
 	return 5 * time.Minute
 }
-func planningID(uid string) string {
-	digest := sha256.Sum256([]byte(uid))
-	return "plan-" + hex.EncodeToString(digest[:])[:16]
+func planningID(uid string) string { return operationID(uid, "plan") }
+func applyID(uid string) string    { return operationID(uid, "apply") }
+func destroyID(uid string, retry int) string {
+	return operationID(uid, fmt.Sprintf("destroy-%d", retry))
 }
-func applyID(uid string) string {
-	digest := sha256.Sum256([]byte(uid + "\\x00apply"))
-	return "apply-" + hex.EncodeToString(digest[:])[:16]
+func operationID(uid, kind string) string {
+	digest := sha256.Sum256([]byte(uid + "\x00" + kind))
+	return kind + "-" + hex.EncodeToString(digest[:])[:16]
 }
 func contains(items []string, item string) bool {
 	for _, value := range items {

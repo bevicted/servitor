@@ -75,7 +75,7 @@ func main() {
 	var uid, operation, kind, optionsFile, backendFile, recoveryFile, resultFile, reportFile, ictPath, terraformPath, optionsJSON, backendJSON, recoveryJSON string
 	flag.StringVar(&uid, "cluster-uid", "", "ServitorCluster UID")
 	flag.StringVar(&operation, "operation-id", "", "persisted operation ID")
-	flag.StringVar(&kind, "operation-kind", "", "plan or apply")
+	flag.StringVar(&kind, "operation-kind", "", "plan, apply, or destroy")
 	flag.StringVar(&optionsFile, "resolved-options", "", "task-local frozen options JSON")
 	flag.StringVar(&optionsJSON, "resolved-options-json", "", "frozen options JSON parameter")
 	flag.StringVar(&backendFile, "backend-config", "", "task-local backend config JSON")
@@ -114,11 +114,11 @@ func materializeParameterFile(path, contents string) error {
 }
 
 func run(ctx context.Context, uid, operation, kind, optionsFile, backendFile, recoveryFile, resultFile, reportFile, ictPath, terraformPath string) error {
-	if uid == "" || operation == "" || (kind != "plan" && kind != "apply") {
+	if uid == "" || operation == "" || (kind != "plan" && kind != "apply" && kind != "destroy") {
 		return errors.New("cluster UID, operation ID, and operation kind are required")
 	}
 	paths := []string{optionsFile, backendFile, resultFile, reportFile}
-	if kind == "apply" {
+	if kind == "apply" || kind == "destroy" {
 		paths = append(paths, recoveryFile)
 	}
 	for _, path := range paths {
@@ -133,7 +133,10 @@ func run(ctx context.Context, uid, operation, kind, optionsFile, backendFile, re
 	if kind == "plan" {
 		return runPlan(ctx, uid, operation, options, backendFile, resultFile, reportFile, ictPath, terraformPath)
 	}
-	return runApply(ctx, uid, operation, options, backendFile, recoveryFile, resultFile, reportFile, ictPath, terraformPath)
+	if kind == "apply" {
+		return runApply(ctx, uid, operation, options, backendFile, recoveryFile, resultFile, reportFile, ictPath, terraformPath)
+	}
+	return runDestroy(ctx, uid, operation, options, backendFile, recoveryFile, resultFile, reportFile, ictPath)
 }
 
 func runPlan(ctx context.Context, uid, operation string, options servitorv1alpha1.ResolvedOptions, backendFile, resultFile, reportFile, ictPath, terraformPath string) error {
@@ -159,24 +162,9 @@ func runPlan(ctx context.Context, uid, operation string, options servitorv1alpha
 }
 
 func runApply(ctx context.Context, uid, operation string, options servitorv1alpha1.ResolvedOptions, backendFile, recoveryFile, resultFile, reportFile, ictPath, terraformPath string) error {
-	recovery, err := readJSON[servitorv1alpha1.RecoveryMetadata](recoveryFile)
+	recovery, contextFile, err := frozenContext(operation, backendFile, recoveryFile, resultFile)
 	if err != nil {
-		return fmt.Errorf("read recovery metadata: %w", err)
-	}
-	backend, err := readJSON[backendConfig](backendFile)
-	if err != nil {
-		return fmt.Errorf("read backend configuration: %w", err)
-	}
-	contextFile := filepath.Join(filepath.Dir(resultFile), "context.json")
-	handoff := ictContext{Version: 1, StateID: operation, Values: recovery.Values, Backend: backend, PlanPath: filepath.Join(filepath.Dir(resultFile), "disposable.tfplan")}
-	handoff.Recovery.Version = recovery.Version
-	handoff.Recovery.Target = recovery.Target
-	handoff.Recovery.Endpoints = recovery.Endpoints
-	handoff.Recovery.Values = recovery.Values
-	handoff.Recovery.SatelliteSSHPublicKeyFingerprint = recovery.SatelliteSSHPublicKeyFingerprint
-	handoff.Recovery.TFVarsSHA256 = recovery.TFVarsSHA256
-	if err := writeJSON(contextFile, handoff); err != nil {
-		return fmt.Errorf("write frozen apply context: %w", err)
+		return err
 	}
 	if _, err := (command.Runner{MaxOutput: 64 * 1024, Log: os.Stderr}).Run(ctx, ictPath, "apply", operation, "--context-file", contextFile, "--backend-config", backendFile, "--result-file", resultFile, "--auto-approve"); err != nil {
 		return err
@@ -194,6 +182,44 @@ func runApply(ctx context.Context, uid, operation string, options servitorv1alph
 		return fmt.Errorf("sanitize Terraform state: %w", err)
 	}
 	return writeReport(reportFile, pipeline.Report{Version: 1, ClusterUID: uid, OperationID: operation, ResolvedOptions: options, Recovery: recovery, Ready: summaryFromState(state)})
+}
+
+func runDestroy(ctx context.Context, uid, operation string, options servitorv1alpha1.ResolvedOptions, backendFile, recoveryFile, resultFile, reportFile, ictPath string) error {
+	recovery, contextFile, err := frozenContext(operation, backendFile, recoveryFile, resultFile)
+	if err != nil {
+		return err
+	}
+	if _, err := (command.Runner{MaxOutput: 64 * 1024, Log: os.Stderr}).Run(ctx, ictPath, "destroy", operation, "--context-file", contextFile, "--backend-config", backendFile, "--result-file", resultFile); err != nil {
+		return err
+	}
+	result, err := readJSON[ictOperationResult](resultFile)
+	if err != nil || result.Version != 1 || result.Operation != "destroy" {
+		return errors.New("ICT produced no valid destroy result")
+	}
+	return writeReport(reportFile, pipeline.Report{Version: 1, ClusterUID: uid, OperationID: operation, ResolvedOptions: options, Recovery: recovery})
+}
+
+func frozenContext(operation, backendFile, recoveryFile, resultFile string) (servitorv1alpha1.RecoveryMetadata, string, error) {
+	recovery, err := readJSON[servitorv1alpha1.RecoveryMetadata](recoveryFile)
+	if err != nil {
+		return servitorv1alpha1.RecoveryMetadata{}, "", fmt.Errorf("read recovery metadata: %w", err)
+	}
+	backend, err := readJSON[backendConfig](backendFile)
+	if err != nil {
+		return servitorv1alpha1.RecoveryMetadata{}, "", fmt.Errorf("read backend configuration: %w", err)
+	}
+	contextFile := filepath.Join(filepath.Dir(resultFile), "context.json")
+	handoff := ictContext{Version: 1, StateID: operation, Values: recovery.Values, Backend: backend, PlanPath: filepath.Join(filepath.Dir(resultFile), "disposable.tfplan")}
+	handoff.Recovery.Version = recovery.Version
+	handoff.Recovery.Target = recovery.Target
+	handoff.Recovery.Endpoints = recovery.Endpoints
+	handoff.Recovery.Values = recovery.Values
+	handoff.Recovery.SatelliteSSHPublicKeyFingerprint = recovery.SatelliteSSHPublicKeyFingerprint
+	handoff.Recovery.TFVarsSHA256 = recovery.TFVarsSHA256
+	if err := writeJSON(contextFile, handoff); err != nil {
+		return servitorv1alpha1.RecoveryMetadata{}, "", fmt.Errorf("write frozen operation context: %w", err)
+	}
+	return recovery, contextFile, nil
 }
 
 func readJSON[T any](path string) (T, error) {

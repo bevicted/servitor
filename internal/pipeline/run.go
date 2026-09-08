@@ -34,6 +34,11 @@ func NewApplyRun(cluster *servitorv1alpha1.ServitorCluster) (*tektonv1.PipelineR
 	return newOperationRun(cluster, "apply")
 }
 
+// NewDestroyRun constructs a context-driven remote destroy from frozen planning status.
+func NewDestroyRun(cluster *servitorv1alpha1.ServitorCluster) (*tektonv1.PipelineRun, error) {
+	return newOperationRun(cluster, "destroy")
+}
+
 func newOperationRun(cluster *servitorv1alpha1.ServitorCluster, kind string) (*tektonv1.PipelineRun, error) {
 	if cluster.Status.Operation == nil || cluster.Status.Operation.Kind != kind || cluster.Status.ResolvedOptions == nil || cluster.Status.Backend == nil || cluster.Status.ExecutionImage == "" {
 		return nil, fmt.Errorf("%s operation was not persisted", kind)
@@ -55,9 +60,9 @@ func newOperationRun(cluster *servitorv1alpha1.ServitorCluster, kind string) (*t
 		{Name: "resolved-options", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: string(options)}},
 		{Name: "backend", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: string(backend)}},
 	}
-	if kind == "apply" {
+	if kind == "apply" || kind == "destroy" {
 		if cluster.Status.Recovery == nil {
-			return nil, fmt.Errorf("apply recovery metadata was not persisted")
+			return nil, fmt.Errorf("%s recovery metadata was not persisted", kind)
 		}
 		recovery, err := json.Marshal(cluster.Status.Recovery)
 		if err != nil {

@@ -148,6 +148,7 @@ spec:
                       }
                     approval: { type: string, enum: ["", approved, rejected] }
                     requestedExpiry: { type: string, format: date-time }
+                    cleanupRequested: { type: boolean }
             status:
               type: object
               properties:
@@ -162,6 +163,7 @@ spec:
                         Applying,
                         Ready,
                         CleanupPending,
+                        CleanupComplete,
                         Unresolved,
                       ],
                   }
@@ -250,6 +252,7 @@ spec:
                         kind: { type: string },
                         pipelineRunName: { type: string, maxLength: 63 },
                         startedAt: { type: string, format: date-time },
+                        dispatched: { type: boolean },
                         adopted: { type: boolean },
                       },
                   }
@@ -359,5 +362,28 @@ spec:
                           id: { type: string, maxLength: 256 }
                           name: { type: string, maxLength: 256 }
                           reused: { type: boolean }
+                applyDispatched: { type: boolean }
                 cleanupRequested: { type: boolean }
+                cleanup:
+                  type: object
+                  required: [reason, requestedAt, requiresDestroy]
+                  properties:
+                    reason:
+                      {
+                        type: string,
+                        enum:
+                          [
+                            Rejected,
+                            ReviewExpired,
+                            PlanningFailed,
+                            ApplyFailed,
+                            Explicit,
+                            Deletion,
+                          ],
+                      }
+                    requestedAt: { type: string, format: date-time }
+                    requiresDestroy: { type: boolean }
+                    retryCount: { type: integer, minimum: 0, maximum: 8 }
+                    nextRetryAt: { type: string, format: date-time }
+                    completedAt: { type: string, format: date-time }
                 diagnostic: { type: string, maxLength: 128 }
