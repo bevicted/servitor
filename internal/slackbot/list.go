@@ -26,6 +26,7 @@ type clusterListRow struct {
 	marker, cluster, status, location, expires string
 	owner                                      string
 	updated                                    time.Time
+	hasExpiry                                  bool
 }
 
 // clusterListMessages renders only status data held by namespaced CRs. Slack
@@ -50,15 +51,12 @@ func clusterListMessages(clusters []servitorv1alpha1.ServitorCluster, caller str
 			name = options.ClusterName
 			location = options.Region
 		}
-		rows = append(rows, clusterListRow{marker: listMarker(cluster.Spec.Slack.OwnerID, caller), cluster: listClusterCell(name, owners), status: listStatusCell(cluster.Status.Phase), location: listLocationCell(location, owners), expires: listExpiry(expiry, now), owner: cluster.Spec.Slack.OwnerID, updated: cluster.CreationTimestamp.Time})
+		rows = append(rows, clusterListRow{marker: listMarker(cluster.Spec.Slack.OwnerID, caller), cluster: listClusterCell(name, owners), status: listStatusCell(cluster.Status.Phase), location: listLocationCell(location, owners), expires: listExpiry(expiry, now), owner: cluster.Spec.Slack.OwnerID, updated: cluster.CreationTimestamp.Time, hasExpiry: !expiry.IsZero()})
 	}
 	sort.Slice(rows, func(i, j int) bool {
 		left, right := rows[i], rows[j]
-		if left.expires != "-" && right.expires == "-" {
-			return true
-		}
-		if left.expires == "-" && right.expires != "-" {
-			return false
+		if left.hasExpiry != right.hasExpiry {
+			return left.hasExpiry
 		}
 		if left.expires != right.expires {
 			return left.expires < right.expires

@@ -161,7 +161,7 @@ func TestStatusNoticesIncludePersistedReviewAndReadySummaries(t *testing.T) {
 	cluster.Status.LeaseExtension = &servitorv1alpha1.LeaseExtensionStatus{RequestedExpiry: expiry, PreviousExpiry: &previous, NewExpiry: &expiry, AddedSeconds: int64((2 * time.Hour).Seconds()), Outcome: servitorv1alpha1.ExtensionOutcomeApplied}
 	ready := statusNotices(cluster)
 	readyText := joinNotices(ready)
-	for _, wanted := range []string{"Your cluster is ready.", "Created", "Reused", "Resource", "Name", "ID", "Cluster", "VPC", "Lease extended.", "Previous expiry:", "New expiry:", "Added:", "2h", "Remaining lease time is capped at 24 hours."} {
+	for _, wanted := range []string{"Your cluster is ready.", "Created", "Reused", "Resource", "Name", "ID", "Cluster", "VPC", "Lease extended.", "Previous expiry:", "New expiry:", "Added:", "Remaining lease time is capped at 24 hours.", "extend [N[h]]", "@servitor extend [N[h]]", "`done`", "@servitor done"} {
 		if !strings.Contains(readyText, wanted) {
 			t.Fatalf("ready notice missing %q: %s", wanted, readyText)
 		}
@@ -175,6 +175,47 @@ func TestStatusNoticesIncludePersistedReviewAndReadySummaries(t *testing.T) {
 		if len(notice.text) > maxSlackMessage || strings.Count(notice.text, "```") != 2 {
 			t.Fatalf("notice is not bounded and balanced: %q", notice.text)
 		}
+	}
+}
+
+func TestStatusNotifierReadyLeasePresentationUsesFixedClock(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := servitorv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
+	for _, test := range []struct {
+		name      string
+		expiresAt time.Time
+		want      string
+	}{
+		{name: "minutes remaining", expiresAt: now.Add(29*time.Minute + 59*time.Second), want: "2026-09-08 00:29:59 UTC (29m)"},
+		{name: "less than one minute", expiresAt: now.Add(30 * time.Second), want: "2026-09-08 00:00:30 UTC (<1m)"},
+		{name: "expired", expiresAt: now, want: "2026-09-08 00:00:00 UTC (expired)"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			expiresAt := metav1.NewTime(test.expiresAt)
+			cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "slack-owner", Namespace: "servitor"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{ChannelID: "C1", ThreadTimestamp: "root"}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseReady, LeaseExpiresAt: &expiresAt}}
+			kube := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(cluster).Build()
+			responses := &memoryResponder{}
+			notifier := &StatusNotifier{Client: kube, Namespace: "servitor", Responder: responses, Receipts: state.NewEventStore(kube, "servitor"), Clock: func() time.Time { return now }}
+			if err := notifier.notify(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			var texts []string
+			for _, response := range responses.responses {
+				if len(response.Text) > maxSlackMessage {
+					t.Fatalf("ready response is not bounded: %q", response.Text)
+				}
+				texts = append(texts, response.Text)
+			}
+			if !strings.Contains(strings.Join(texts, "\n"), test.want) {
+				t.Fatalf("responses = %+v, want expiry %q", responses.responses, test.want)
+			}
+		})
 	}
 }
 

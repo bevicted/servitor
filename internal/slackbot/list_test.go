@@ -1,6 +1,7 @@
 package slackbot
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"testing"
@@ -37,6 +38,31 @@ func TestClusterListRendersSafeStatusWithoutSlackIDs(t *testing.T) {
 	for _, private := range []string{"Ucaller", "Uother", "Ucleanup-pending", "Ucleanup-complete", "bad"} {
 		if strings.Contains(text, private) {
 			t.Fatalf("list leaked %q: %s", private, text)
+		}
+	}
+}
+
+func TestClusterListFormatsLeasePresentationBoundaries(t *testing.T) {
+	now := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
+	minuteExpiry := metav1.NewTime(now.Add(59*time.Minute + 59*time.Second))
+	expiredExpiry := metav1.NewTime(now)
+	clusters := []servitorv1alpha1.ServitorCluster{
+		{ObjectMeta: metav1.ObjectMeta{Name: "minute", Namespace: "servitor"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "Ucaller"}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseReady, LeaseExpiresAt: &minuteExpiry}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "expired", Namespace: "servitor"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "Uother"}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseReady, LeaseExpiresAt: &expiredExpiry}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "unavailable", Namespace: "servitor"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "Uunknown"}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseReady}},
+	}
+	bot, responses := botForTest(t, &clusters[0], &clusters[1], &clusters[2])
+	if err := bot.Handle(context.Background(), Envelope{ID: "list-boundaries", Message: Message{Channel: "C1", ChannelType: "channel", User: "Ucaller", Text: "<@BOT> list", Timestamp: "123"}}); err != nil {
+		t.Fatal(err)
+	}
+	var messages []string
+	for _, response := range responses.responses {
+		messages = append(messages, response.Text)
+	}
+	text := strings.Join(messages, "\n")
+	for _, want := range []string{"2026-09-08 00:59:59 UTC (59m)", "2026-09-08 00:00:00 UTC (expired)", "unavailable"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("list missing %q: %s", want, text)
 		}
 	}
 }

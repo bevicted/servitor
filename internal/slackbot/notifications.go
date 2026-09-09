@@ -130,7 +130,7 @@ func statusNoticesAt(cluster *servitorv1alpha1.ServitorCluster, now time.Time) [
 		if cluster.Status.LeaseExpiresAt != nil {
 			expiry = cluster.Status.LeaseExpiresAt.Time
 		}
-		texts = readyNoticeTexts(cluster.Status.Ready, expiry, time.Now().UTC())
+		texts = readyNoticeTexts(cluster.Status.Ready, expiry, now)
 	case servitorv1alpha1.PhaseCleanupComplete:
 		texts = []string{"Cleanup complete."}
 	case servitorv1alpha1.PhaseUnresolved:
@@ -391,7 +391,7 @@ func readyNoticeTexts(ready *servitorv1alpha1.ReadySummary, expiry, now time.Tim
 	}
 	header := []string{"Resource", "Name", "ID"}
 	texts := statusTableChunks("Your cluster is ready.\n\nCreated", header, created, "")
-	conclusion := "\nThis lease will expire at " + lifecycle.FormatLeaseExpiry(expiry, now) + ".\nReply with `done` in this thread or send `@servitor done` in the configured channel to free up your resources sooner."
+	conclusion := "\nThis lease will expire at " + lifecycle.FormatLeaseExpiry(expiry, now) + ".\nUse `extend [N[h]]` in this thread or `@servitor extend [N[h]]` in the configured channel. Use `done` or `@servitor done` to release resources sooner."
 	return append(texts, statusTableChunks("Reused", header, reused, conclusion)...)
 }
 

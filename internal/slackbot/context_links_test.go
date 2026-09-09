@@ -63,6 +63,31 @@ func TestExistingAllocationLinksOnlyOwnerLifecycleThread(t *testing.T) {
 	}
 }
 
+func TestExistingAllocationUsesSharedLeasePresentation(t *testing.T) {
+	now := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
+	for _, test := range []struct {
+		name   string
+		expiry *metav1.Time
+		want   string
+	}{
+		{name: "minutes remaining", expiry: &metav1.Time{Time: now.Add(29*time.Minute + 59*time.Second)}, want: "2026-09-08 00:29:59 UTC (29m)"},
+		{name: "expired", expiry: &metav1.Time{Time: now}, want: "2026-09-08 00:00:00 UTC (expired)"},
+		{name: "unavailable", want: "unavailable"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cluster := existingAllocation("U1")
+			cluster.Status.LeaseExpiresAt = test.expiry
+			bot, responses := botForTest(t, cluster)
+			if err := bot.Handle(context.Background(), Envelope{ID: "existing-" + test.name, Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "<@BOT> create", Timestamp: "1710000010.000100"}}); err != nil {
+				t.Fatal(err)
+			}
+			if len(responses.responses) != 1 || !strings.Contains(responses.responses[0].Text, test.want) {
+				t.Fatalf("responses = %+v, want lease %q", responses.responses, test.want)
+			}
+		})
+	}
+}
+
 func TestExistingAllocationNavigationFallsBackWithoutCrossOwnerLink(t *testing.T) {
 	for _, test := range []struct {
 		name  string
