@@ -712,6 +712,90 @@ func TestHelpDoesNotExposeMaintainerControls(t *testing.T) {
 		}
 	}
 }
+func TestHandleListReportsEmptyAndLifecycleStatesInDMAndChannel(t *testing.T) {
+	run := func(t *testing.T, bot Bot, responses *memoryResponder, expected []string) {
+		t.Helper()
+		for _, test := range []struct {
+			name, channel, channelType, text, timestamp, thread string
+		}{
+			{name: "DM", channel: "D1", channelType: "im", text: "list", timestamp: "dm-list"},
+			{name: "mentioned channel", channel: "C1", channelType: "channel", text: "<@BOT> list", timestamp: "channel-list", thread: "channel-list"},
+		} {
+			t.Run(test.name, func(t *testing.T) {
+				before := len(responses.responses)
+				event := Envelope{ID: "list-" + test.name, Message: Message{Channel: test.channel, ChannelType: test.channelType, User: "Ucaller", Text: test.text, Timestamp: test.timestamp}}
+				if err := bot.Handle(context.Background(), event); err != nil {
+					t.Fatal(err)
+				}
+				if len(responses.responses) != before+1 {
+					t.Fatalf("responses = %+v", responses.responses[before:])
+				}
+				response := responses.responses[before]
+				if response.Channel != test.channel || response.ThreadTimestamp != test.thread {
+					t.Fatalf("response routing = %+v", response)
+				}
+				for _, want := range expected {
+					if !strings.Contains(response.Text, want) {
+						t.Fatalf("response missing %q: %s", want, response.Text)
+					}
+				}
+			})
+		}
+	}
+
+	t.Run("empty", func(t *testing.T) {
+		bot, responses := botForTest(t)
+		run(t, bot, responses, []string{listEmptyMessage})
+	})
+
+	t.Run("all lifecycle phases", func(t *testing.T) {
+		phases := []string{
+			servitorv1alpha1.PhasePending,
+			servitorv1alpha1.PhasePlanning,
+			servitorv1alpha1.PhaseAwaitingApproval,
+			servitorv1alpha1.PhaseApplying,
+			servitorv1alpha1.PhaseReady,
+			servitorv1alpha1.PhaseCleanupPending,
+			servitorv1alpha1.PhaseCleanupComplete,
+			servitorv1alpha1.PhaseUnresolved,
+		}
+		objects := make([]runtime.Object, 0, len(phases))
+		for index, phase := range phases {
+			owner := fmt.Sprintf("Uother-%d", index)
+			if phase == servitorv1alpha1.PhaseReady {
+				owner = "Ucaller"
+			}
+			objects = append(objects, &servitorv1alpha1.ServitorCluster{
+				ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("allocation-%d", index), Namespace: "servitor"},
+				Spec:       servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: owner}},
+				Status:     servitorv1alpha1.ServitorClusterStatus{Phase: phase, ResolvedOptions: &servitorv1alpha1.ResolvedOptions{ClusterName: fmt.Sprintf("cluster-%d", index), Region: "us-south/us-south-1"}},
+			})
+		}
+		bot, responses := botForTest(t, objects...)
+		run(t, bot, responses, []string{listLegend, "planning", "review", "applying", "ready", "cleanup in progress", "cleanup complete", "unresolved"})
+		for _, response := range responses.responses {
+			if strings.Contains(response.Text, "Ucaller") || strings.Contains(response.Text, "Uother-") {
+				t.Fatalf("list leaked owner identity: %s", response.Text)
+			}
+		}
+	})
+}
+
+func TestListHelpExplainsOwnershipAndCleanupStates(t *testing.T) {
+	bot, responses := botForTest(t)
+	if err := bot.Handle(context.Background(), Envelope{ID: "list-help", Message: Message{Channel: "D1", ChannelType: "im", User: "Ucaller", Text: "help list"}}); err != nil {
+		t.Fatal(err)
+	}
+	if len(responses.responses) != 1 {
+		t.Fatalf("responses = %+v", responses.responses)
+	}
+	for _, want := range []string{"`*` marks your allocation", "cleanup in progress", "cleanup complete"} {
+		if !strings.Contains(responses.responses[0].Text, want) {
+			t.Fatalf("list help missing %q: %s", want, responses.responses[0].Text)
+		}
+	}
+}
+
 func TestLifecycleHelpExplainsAvailableStates(t *testing.T) {
 	bot, responses := botForTest(t)
 	for _, topic := range []struct {

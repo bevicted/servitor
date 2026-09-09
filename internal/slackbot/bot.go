@@ -706,7 +706,7 @@ func (b Bot) respondHelp(text string, respond func(string)) {
 	case "extend":
 		messages = []string{"`extend [N[h]]` extends your ready lease by the configured duration or by 1 through 24 whole hours. Use it in your lifecycle thread or as `@servitor extend` in the configured channel. It is available only while the lease is ready, not during planning, cleanup, or after expiry."}
 	case "list":
-		messages = []string{"`list` shows available cluster state. Use it in a DM or as `@servitor list` in the configured channel."}
+		messages = []string{"`list` shows available cluster state. `*` marks your allocation; cleanup in progress and cleanup complete are shown separately. Use it in a DM or as `@servitor list` in the configured channel."}
 	default:
 		respond(unknownText())
 		return

@@ -12,10 +12,14 @@ import (
 	"github.com/bevicted/servitor/internal/lifecycle"
 )
 
-const listSafeCellLimit = 160
+const (
+	listSafeCellLimit = 160
+	listEmptyMessage  = "No cluster allocations found."
+	listLegend        = "`*` marks your allocation."
+)
 
 var listStatuses = map[string]string{
-	servitorv1alpha1.PhasePending: "planning", servitorv1alpha1.PhasePlanning: "planning", servitorv1alpha1.PhaseAwaitingApproval: "review", servitorv1alpha1.PhaseApplying: "applying", servitorv1alpha1.PhaseReady: "ready", servitorv1alpha1.PhaseCleanupPending: "cleanup", servitorv1alpha1.PhaseCleanupComplete: "cleanup", servitorv1alpha1.PhaseUnresolved: "unresolved",
+	servitorv1alpha1.PhasePending: "planning", servitorv1alpha1.PhasePlanning: "planning", servitorv1alpha1.PhaseAwaitingApproval: "review", servitorv1alpha1.PhaseApplying: "applying", servitorv1alpha1.PhaseReady: "ready", servitorv1alpha1.PhaseCleanupPending: "cleanup in progress", servitorv1alpha1.PhaseCleanupComplete: "cleanup complete", servitorv1alpha1.PhaseUnresolved: "unresolved",
 }
 
 type clusterListRow struct {
@@ -27,6 +31,9 @@ type clusterListRow struct {
 // clusterListMessages renders only status data held by namespaced CRs. Slack
 // owner identities remain a caller marker and are never resolved or displayed.
 func clusterListMessages(clusters []servitorv1alpha1.ServitorCluster, caller string, now time.Time) []string {
+	if len(clusters) == 0 {
+		return []string{listEmptyMessage}
+	}
 	owners := make([]string, 0, len(clusters))
 	for _, cluster := range clusters {
 		owners = append(owners, cluster.Spec.Slack.OwnerID)
@@ -84,7 +91,7 @@ func renderClusterList(rows []clusterListRow) string {
 		writeListRow(writer, []string{row.marker, row.cluster, row.status, row.location, row.expires})
 	}
 	_ = writer.Flush()
-	return "```\n" + strings.TrimSuffix(buffer.String(), "\n") + "\n```"
+	return listLegend + "\n```\n" + strings.TrimSuffix(buffer.String(), "\n") + "\n```"
 }
 func writeListRow(writer *tabwriter.Writer, row []string) {
 	for i, value := range row {
