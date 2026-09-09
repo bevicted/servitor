@@ -1,0 +1,97 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: servitor-inventory
+spec:
+  params:
+    - { name: inventory-target, type: string }
+    - { name: inventory-run-id, type: string }
+    - { name: inventory-revision, type: string }
+    - { name: execution-image, type: string }
+    - { name: ict-config-map, type: string }
+    - { name: ict-config-key, type: string }
+    - { name: ibm-secret, type: string }
+  stepTemplate:
+    env:
+      - name: HOME
+        value: /tekton/home
+    securityContext:
+      allowPrivilegeEscalation: false
+      capabilities: { drop: ["ALL"] }
+      readOnlyRootFilesystem: true
+      runAsNonRoot: true
+      seccompProfile: { type: RuntimeDefault }
+  volumes:
+    - name: inventory-data
+      emptyDir: {}
+    - name: tmp
+      emptyDir: {}
+    - name: ict-config
+      configMap:
+        name: $(params.ict-config-map)
+        items:
+          - key: $(params.ict-config-key)
+            path: config.yaml
+  steps:
+    - name: execute
+      image: $(params.execution-image)
+      command: ["/usr/local/bin/servitor-task"]
+      args:
+        - -inventory-config
+        - /etc/servitor/ict/config.yaml
+        - -inventory-target
+        - $(params.inventory-target)
+        - -inventory-run-id
+        - $(params.inventory-run-id)
+        - -inventory-revision
+        - $(params.inventory-revision)
+        - -inventory-report
+        - /inventory/report.json
+      env:
+        - name: TMPDIR
+          value: /tmp
+      envFrom:
+        - secretRef: { name: $(params.ibm-secret) }
+      volumeMounts:
+        - { name: inventory-data, mountPath: /inventory }
+        - { name: tmp, mountPath: /tmp }
+        - { name: ict-config, mountPath: /etc/servitor/ict, readOnly: true }
+    - name: report
+      image: $(params.execution-image)
+      command: ["/usr/local/bin/servitor-task"]
+      args:
+        - -emit-inventory-report
+        - /inventory/report.json
+        - -inventory-target
+        - $(params.inventory-target)
+        - -inventory-run-id
+        - $(params.inventory-run-id)
+        - -inventory-revision
+        - $(params.inventory-revision)
+      volumeMounts: [{ name: inventory-data, mountPath: /inventory }]
+---
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: servitor-inventory
+spec:
+  params:
+    - { name: inventory-target, type: string }
+    - { name: inventory-run-id, type: string }
+    - { name: inventory-revision, type: string }
+    - { name: execution-image, type: string }
+    - { name: ict-config-map, type: string }
+    - { name: ict-config-key, type: string }
+    - { name: ibm-secret, type: string }
+  tasks:
+    - name: inventory
+      taskRef: { name: servitor-inventory }
+      timeout: 14m
+      params:
+        - { name: inventory-target, value: $(params.inventory-target) }
+        - { name: inventory-run-id, value: $(params.inventory-run-id) }
+        - { name: inventory-revision, value: $(params.inventory-revision) }
+        - { name: execution-image, value: $(params.execution-image) }
+        - { name: ict-config-map, value: $(params.ict-config-map) }
+        - { name: ict-config-key, value: $(params.ict-config-key) }
+        - { name: ibm-secret, value: $(params.ibm-secret) }

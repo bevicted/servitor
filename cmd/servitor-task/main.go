@@ -15,6 +15,7 @@ import (
 
 	servitorv1alpha1 "github.com/bevicted/servitor/api/v1alpha1"
 	"github.com/bevicted/servitor/internal/command"
+	"github.com/bevicted/servitor/internal/inventory"
 	"github.com/bevicted/servitor/internal/pipeline"
 	"github.com/bevicted/servitor/internal/terraformview"
 )
@@ -75,6 +76,7 @@ const maxTerraformShowBytes = 4 * 1024 * 1024
 
 func main() {
 	var uid, operation, kind, optionsFile, backendFile, recoveryFile, resultFile, reportFile, emitReport, ictPath, terraformPath, optionsJSON, backendJSON, recoveryJSON string
+	var inventoryConfig, inventoryTarget, inventoryRunID, inventoryRevision, inventoryReport, emitInventoryReport, apiKeyEnv string
 	flag.StringVar(&uid, "cluster-uid", "", "ServitorCluster UID")
 	flag.StringVar(&operation, "operation-id", "", "persisted operation ID")
 	flag.StringVar(&kind, "operation-kind", "", "plan, apply, or destroy")
@@ -87,11 +89,31 @@ func main() {
 	flag.StringVar(&resultFile, "ict-result", "", "task-local ICT result JSON")
 	flag.StringVar(&reportFile, "report", "", "task-local report JSON")
 	flag.StringVar(&emitReport, "emit-report", "", "emit one validated task-local report JSON document")
+	flag.StringVar(&inventoryConfig, "inventory-config", "", "mounted inventory target configuration")
+	flag.StringVar(&inventoryTarget, "inventory-target", "", "configured inventory target")
+	flag.StringVar(&inventoryRunID, "inventory-run-id", "", "inventory run identity")
+	flag.StringVar(&inventoryRevision, "inventory-revision", "", "target configuration revision")
+	flag.StringVar(&inventoryReport, "inventory-report", "", "task-local inventory report JSON")
+	flag.StringVar(&emitInventoryReport, "emit-inventory-report", "", "emit one validated task-local inventory report JSON document")
+	flag.StringVar(&apiKeyEnv, "ibm-api-key-env", "IBMCLOUD_API_KEY", "environment variable containing the IBM API key")
 	flag.StringVar(&ictPath, "ict", "ict", "ICT executable")
 	flag.StringVar(&terraformPath, "terraform", "terraform", "Terraform executable")
 	flag.Parse()
-	if emitReport != "" {
-		if err := emitValidatedReport(emitReport); err != nil {
+	if emitReport != "" || emitInventoryReport != "" {
+		var err error
+		if emitReport != "" {
+			err = emitValidatedReport(emitReport)
+		} else {
+			err = emitValidatedInventoryReport(emitInventoryReport, inventoryTarget, inventoryRunID, inventoryRevision)
+		}
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "servitor-task:", err)
+			os.Exit(1)
+		}
+		return
+	}
+	if inventoryConfig != "" || inventoryTarget != "" || inventoryRunID != "" || inventoryRevision != "" || inventoryReport != "" {
+		if err := runInventory(context.Background(), inventoryConfig, inventoryTarget, inventoryRunID, inventoryRevision, inventoryReport, os.Getenv(apiKeyEnv)); err != nil {
 			fmt.Fprintln(os.Stderr, "servitor-task:", err)
 			os.Exit(1)
 		}
@@ -133,6 +155,55 @@ func emitValidatedReport(path string) error {
 	}
 	_, err = os.Stdout.Write(data)
 	return err
+}
+
+func emitValidatedInventoryReport(path, target, runID, revision string) error {
+	if !filepath.IsAbs(path) {
+		return errors.New("task-local file paths must be absolute")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	if len(data) == 0 || len(data) > pipeline.MaxInventoryReportBytes || data[len(data)-1] != '\n' {
+		return errors.New("inventory report is not a bounded complete JSON document")
+	}
+	if _, err := pipeline.DecodeInventoryReport(data, target, runID, revision); err != nil {
+		return err
+	}
+	_, err = os.Stdout.Write(data)
+	return err
+}
+
+func runInventory(ctx context.Context, configPath, target, runID, revision, reportPath, apiKey string) error {
+	if !filepath.IsAbs(configPath) || !filepath.IsAbs(reportPath) || target == "" || runID == "" || revision == "" {
+		return errors.New("inventory configuration, identity, and report paths are required")
+	}
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return errors.New("inventory configuration is unavailable")
+	}
+	config, err := inventory.LoadConfig(data)
+	if err != nil {
+		return err
+	}
+	catalog, err := inventory.Discover(ctx, config, target, apiKey, nil)
+	if err != nil {
+		return inventory.RedactedError(err)
+	}
+	report := pipeline.InventoryReport{Version: 1, Target: target, RunID: runID, Revision: revision, Catalog: catalog}
+	if err := report.Validate(target, runID, revision); err != nil {
+		return err
+	}
+	encoded, err := json.Marshal(report)
+	if err != nil {
+		return errors.New("encode inventory report failed")
+	}
+	encoded = append(encoded, '\n')
+	if len(encoded) > pipeline.MaxInventoryReportBytes {
+		return errors.New("inventory report exceeds byte limit")
+	}
+	return os.WriteFile(reportPath, encoded, 0o600)
 }
 
 func materializeParameterFile(path, contents string) error {

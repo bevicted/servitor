@@ -30,6 +30,12 @@ Copy `config.example.yaml` to the ConfigMap input used by `config/default`. It c
 
 The manager reads its mounted configuration from `/etc/servitor/config/config.yaml`; `-config PATH` or `SERVITOR_CONFIG` can select another mounted path. The controller receives the Slack Secret only. Tekton execution receives COS HMAC and IBM credentials from namespace Secrets; the report step receives neither. The task service account has no CR or status write permissions.
 
+## Private inventory export
+
+`servitor-inventory` is a one-shot internal Tekton Pipeline for the configured target's common create options. It reads the mounted non-secret target configuration and IBM credential only in its execute step, then emits a separately validated inventory report from a credential-free report step. It does not use COS, Terraform, ICT provisioning, Kubernetes writes, or allocation operation labels. The catalog includes configured provider names, version/default metadata, resource groups, VPC zones and flavors, Classic datacenters and machine types, and regional VPC profiles for supported Satellite host-profile matching. It is not a Slack command or scheduler; publication and refresh are controller work.
+
+The mounted target config has version `1`, target names, `providers`, and configured service `endpoints`. Service bases are preserved, including `/global` and `/v1` prefixes. Inventory uses IAM `identity/token` and `identity/userinfo`, Resource Management `v2/resource_groups`, Container Service version/zone/flavor routes, and VPC `instance/profiles` pinned to API version `2026-08-04`. All discovery failures, malformed responses, pagination errors, and reports exceeding 512 KiB fail without publishing a partial catalog.
+
 Apply the rendered resources in the target namespace. They include the CRD, controller Role, empty-permission task Role, controller Deployment, ConfigMaps, Tekton Task/Pipeline, and a sample CR. The controller reads the selected report container's private Pod log after a PipelineRun completes and validates its bounded structured result before changing status.
 
 ## Slack interface

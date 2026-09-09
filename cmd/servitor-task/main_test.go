@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -10,6 +12,7 @@ import (
 	"testing"
 
 	servitorv1alpha1 "github.com/bevicted/servitor/api/v1alpha1"
+	"github.com/bevicted/servitor/internal/inventory"
 	"github.com/bevicted/servitor/internal/pipeline"
 )
 
@@ -261,6 +264,85 @@ func TestRunPlanPassesKubernetesPlatformToICT(t *testing.T) {
 		if !strings.Contains(string(trace), wanted) {
 			t.Fatalf("ICT plan arguments = %q, want %q", trace, wanted)
 		}
+	}
+}
+
+func TestRunInventoryWritesIsolatedValidatedReport(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/iam/identity/token":
+			_, _ = w.Write([]byte(`{"access_token":"synthetic-token"}`))
+		case "/iam/identity/userinfo":
+			_, _ = w.Write([]byte(`{"account_id":"account-1"}`))
+		case "/rm/v2/resource_groups":
+			_, _ = w.Write([]byte(`{"resources":[{"name":"Default","state":"ACTIVE"}]}`))
+		case "/containers/v1/versions":
+			_, _ = w.Write([]byte(`{"openshift":[{"major":4,"minor":22,"default":true}]}`))
+		case "/containers/v2/vpc/getZones":
+			_, _ = w.Write([]byte(`[{"name":"us-south-1"}]`))
+		case "/containers/v2/getFlavors":
+			_, _ = w.Write([]byte(`[{"name":"bx2.4x16"}]`))
+		default:
+			t.Fatalf("unexpected synthetic inventory request %s", r.URL.RequestURI())
+		}
+	}))
+	defer server.Close()
+	directory := t.TempDir()
+	configPath := filepath.Join(directory, "config.yaml")
+	reportPath := filepath.Join(directory, "report.json")
+	config := `version: 1
+targets:
+  target-a:
+    providers: [vpc-gen2]
+    endpoints:
+      IAM: ` + server.URL + `/iam
+      ResourceManagement: ` + server.URL + `/rm
+      ContainerService: ` + server.URL + `/containers
+`
+	if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := runInventory(context.Background(), configPath, "target-a", "inventory-a", "revision-a", reportPath, "synthetic-key"); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(reportPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pipeline.DecodeInventoryReport(data, "target-a", "inventory-a", "revision-a"); err != nil {
+		t.Fatalf("inventory report is not controller-valid: %v", err)
+	}
+	if strings.Contains(string(data), "synthetic-key") || strings.Contains(string(data), server.URL) {
+		t.Fatalf("inventory report disclosed a credential or endpoint: %s", data)
+	}
+}
+
+func TestEmitValidatedInventoryReportRejectsUnknownFields(t *testing.T) {
+	directory := t.TempDir()
+	reportPath := filepath.Join(directory, "report.json")
+	data, err := json.Marshal(pipeline.InventoryReport{
+		Version:  1,
+		Target:   "target-a",
+		RunID:    "inventory-a",
+		Revision: "revision-a",
+		Catalog: inventory.Catalog{
+			Version:        inventory.CatalogVersion,
+			Target:         "target-a",
+			Providers:      []string{"vpc-gen2"},
+			Versions:       []inventory.Version{{Name: "4.22_openshift", Platform: "openshift", Default: true, Supported: true}},
+			ResourceGroups: []string{"Default"},
+			VPCLocations:   []inventory.Location{{Name: "us-south-1", Flavors: []string{"bx2.4x16"}}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data = append(data[:len(data)-1], []byte(",\"endpoint\":\"https://credentialed.example.invalid\"}\n")...)
+	if err := os.WriteFile(reportPath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := emitValidatedInventoryReport(reportPath, "target-a", "inventory-a", "revision-a"); err == nil || strings.Contains(err.Error(), "credentialed.example.invalid") {
+		t.Fatalf("unknown endpoint field error = %v", err)
 	}
 }
 
