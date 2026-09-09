@@ -10,10 +10,21 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	servitorv1alpha1 "github.com/bevicted/servitor/api/v1alpha1"
+	"github.com/bevicted/servitor/internal/command"
+	"github.com/bevicted/servitor/internal/controller"
 	"github.com/bevicted/servitor/internal/inventory"
 	"github.com/bevicted/servitor/internal/pipeline"
+	"github.com/bevicted/servitor/internal/slackbot"
+	"github.com/bevicted/servitor/internal/state"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
 func planningValidationFixture(t *testing.T, directory string) (string, string) {
@@ -51,6 +62,73 @@ targets:
 		t.Fatal(err)
 	}
 	return configPath, "synthetic-key"
+}
+
+type planningSlackResponder struct{}
+
+func (planningSlackResponder) Reply(context.Context, slackbot.Response) error { return nil }
+
+func TestKeyedCreateWithoutCatalogReachesFreshPlanningPreflight(t *testing.T) {
+	directory := t.TempDir()
+	planningConfig, apiKey := planningValidationFixture(t, directory)
+	configData, err := os.ReadFile(planningConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := servitorv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	kube := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&servitorv1alpha1.ServitorCluster{}).WithObjects(&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "targets", Namespace: "servitor"}, Data: map[string]string{"config.yaml": string(configData)}}).Build()
+	defaults := servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Target: "target", Provider: "vpc-gen2", Version: "4.22", ResourceGroup: "Default", Zone: "us-south-1"}, Platform: "openshift"}
+	bot := slackbot.Bot{ChannelID: "C1", SelfUserID: "BOT", Namespace: "servitor", Client: kube, Events: state.NewEventStore(kube, "servitor"), Defaults: command.CreateDefaults{Target: "target", Provider: "vpc-gen2", Version: "4.22", Zone: "us-south-1"}, InventoryConfigMap: "targets", InventoryConfigKey: "config.yaml", InventoryMaximumAge: time.Hour, Lease: time.Hour, RetryIntervals: []time.Duration{time.Minute}, Responder: planningSlackResponder{}}
+
+	if err := bot.Handle(context.Background(), slackbot.Envelope{ID: "bare", Message: slackbot.Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "<@BOT> create New\\ Group", Timestamp: "1"}}); err != nil {
+		t.Fatal(err)
+	}
+	clusters := &servitorv1alpha1.ServitorClusterList{}
+	if err := kube.List(context.Background(), clusters); err != nil || len(clusters.Items) != 0 {
+		t.Fatalf("bare create clusters=%+v, err=%v", clusters.Items, err)
+	}
+
+	if err := bot.Handle(context.Background(), slackbot.Envelope{ID: "keyed", Message: slackbot.Message{Channel: "C1", ChannelType: "channel", User: "U2", Text: "<@BOT> create resource-group=New\\ Group", Timestamp: "2"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := kube.List(context.Background(), clusters); err != nil || len(clusters.Items) != 1 || clusters.Items[0].Spec.UserOptions.ResourceGroup != "New Group" {
+		t.Fatalf("keyed create clusters=%+v, err=%v", clusters.Items, err)
+	}
+
+	reconciler := &controller.Reconciler{Client: kube, Scheme: scheme, Config: controller.Config{Namespace: "servitor", Defaults: defaults, OpenShiftFlavor: "bx2.4x16"}}
+	request := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: clusters.Items[0].Namespace, Name: clusters.Items[0].Name}}
+	for range 2 {
+		if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := kube.Get(context.Background(), request.NamespacedName, &clusters.Items[0]); err != nil {
+		t.Fatal(err)
+	}
+	if clusters.Items[0].Status.ResolvedOptions == nil || clusters.Items[0].Status.ResolvedOptions.ResourceGroup != "New Group" {
+		t.Fatalf("controller resolved options=%+v", clusters.Items[0].Status.ResolvedOptions)
+	}
+
+	ictTrace := filepath.Join(directory, "ict.trace")
+	ict := filepath.Join(directory, "ict")
+	if err := os.WriteFile(ict, []byte("#!/bin/sh\nprintf invoked > \"$ICT_TRACE_FILE\"\nexit 1\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("ICT_TRACE_FILE", ictTrace)
+	err = runPlan(context.Background(), "uid", "plan-keyed", *clusters.Items[0].Status.ResolvedOptions, filepath.Join(directory, "backend.json"), filepath.Join(directory, "result.json"), filepath.Join(directory, "report.json"), ict, filepath.Join(directory, "terraform"), planningConfig, apiKey)
+	if err == nil {
+		t.Fatal("runPlan unexpectedly succeeded with a failing synthetic ICT")
+	}
+	if _, err := os.Stat(ictTrace); err != nil {
+		t.Fatalf("fresh planning preflight did not reach ICT for keyed value: %v", err)
+	}
 }
 
 func TestRunPlanUsesInitializedWorkspaceAndSanitizesOversizedPlan(t *testing.T) {

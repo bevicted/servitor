@@ -14,7 +14,10 @@ import (
 
 	servitorv1alpha1 "github.com/bevicted/servitor/api/v1alpha1"
 	"github.com/bevicted/servitor/internal/command"
+	"github.com/bevicted/servitor/internal/inventory"
 	"github.com/bevicted/servitor/internal/lifecycle"
+	"github.com/bevicted/servitor/internal/state"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -47,6 +50,9 @@ type Bot struct {
 	Client                client.Client
 	Events                EventStore
 	Defaults              command.CreateDefaults
+	InventoryConfigMap    string
+	InventoryConfigKey    string
+	InventoryMaximumAge   time.Duration
 	Lease                 time.Duration
 	RetryIntervals        []time.Duration
 	Responder             Responder
@@ -155,6 +161,16 @@ func (b Bot) create(ctx context.Context, message Message, text string, respond f
 	options, err := command.ParseCreateOptions(text)
 	if err != nil {
 		respond(rejectedText(err.Error()))
+		return true
+	}
+	if b.InventoryConfigMap != "" {
+		options, err = b.matchBareOptions(ctx, options)
+		if err != nil {
+			respond(rejectedText(err.Error()))
+			return true
+		}
+	} else if len(options.BareValues()) != 0 {
+		respond(rejectedText("Common-option inventory is missing. Use an explicit key such as resource-group=value or retry later."))
 		return true
 	}
 	userOptions, err := userOptions(options)
@@ -397,6 +413,53 @@ func splitSlackTimestamp(value string) (string, string, bool) {
 	}
 	return whole, strings.TrimRight(fraction, "0"), true
 }
+func (b Bot) matchBareOptions(ctx context.Context, options command.ExplicitCreateOptions) (command.ExplicitCreateOptions, error) {
+	if b.Client == nil || b.Namespace == "" || b.InventoryConfigKey == "" {
+		return command.ExplicitCreateOptions{}, fmt.Errorf("common-option inventory is missing; use an explicit key such as resource-group=value or retry later")
+	}
+	configMap := &corev1.ConfigMap{}
+	if err := b.Client.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: b.InventoryConfigMap}, configMap); err != nil {
+		return command.ExplicitCreateOptions{}, fmt.Errorf("configured target inventory is unavailable; use an explicit key or retry later")
+	}
+	configured, err := inventory.LoadConfig([]byte(configMap.Data[b.InventoryConfigKey]))
+	if err != nil {
+		return command.ExplicitCreateOptions{}, fmt.Errorf("configured target inventory is unavailable; use an explicit key or retry later")
+	}
+	options, targetConfig, err := command.ResolveBareSelectors(options, b.Defaults, configured.Targets)
+	if err != nil {
+		return command.ExplicitCreateOptions{}, err
+	}
+	if len(options.BareValues()) == 0 {
+		return options, nil
+	}
+	revision, err := inventory.Revision(targetConfig)
+	if err != nil {
+		return command.ExplicitCreateOptions{}, fmt.Errorf("configured target inventory is unavailable; use an explicit key or retry later")
+	}
+	catalog, disposition, err := state.NewInventoryStore(b.Client, b.Namespace).Snapshot(ctx, selectedTarget(options, b.Defaults), revision, b.now(), b.inventoryMaximumAge())
+	if err != nil {
+		return command.ExplicitCreateOptions{}, fmt.Errorf("configured target inventory is unavailable; use an explicit key or retry later")
+	}
+	if disposition != state.InventorySucceeded {
+		return command.ExplicitCreateOptions{}, fmt.Errorf("common-option inventory is %s; use an explicit key such as resource-group=value or retry later", disposition)
+	}
+	return command.MatchBareCreateOptions(options, b.Defaults, catalog)
+}
+
+func selectedTarget(options command.ExplicitCreateOptions, defaults command.CreateDefaults) string {
+	if values := options.Values()["--target"]; len(values) != 0 {
+		return values[0]
+	}
+	return defaults.Target
+}
+
+func (b Bot) inventoryMaximumAge() time.Duration {
+	if b.InventoryMaximumAge > 0 {
+		return b.InventoryMaximumAge
+	}
+	return 24 * time.Hour
+}
+
 func userOptions(options command.ExplicitCreateOptions) (servitorv1alpha1.UserOptions, error) {
 	values := options.Values()
 	one := func(flag string) string {
@@ -509,7 +572,7 @@ func helpOverview() []string {
 	return []string{"Servitor provisions one temporary IBM Cloud cluster per Slack user.\n\nCommands\n```\nDM\n  help [command]          print help\n  list                    list clusters\n\nConfigured channel\n  @servitor help [command]  print help\n  @servitor create [safe options]  provision a new cluster\n  @servitor done            release your resources\n  @servitor extend [N[h]]   extend your lease\n  @servitor list            list clusters\n\nLifecycle thread\n  yes                       approve the cluster plan\n  no                        reject the cluster plan\n  done                      release your resources\n  extend [N[h]]             extend your lease\n```"}
 }
 func createHelp(defaults command.CreateDefaults) []string {
-	return []string{"`create` starts planning from the configured channel root. Configured defaults: version " + safeHelpCell(defaults.Version) + ", target " + safeHelpCell(defaults.Target) + ", provider " + safeHelpCell(defaults.Provider) + ". `--provider` chooses infrastructure; version chooses Kubernetes or OpenShift. Cluster names are generated internally.\n\nUse `key=value`, `--key=value`, or `--key value`; forms can be mixed, for example `create target=synthetic-target --version=4.22 --resource-group \"Platform Team\" worker-count=3`. Use `roks` (also `openshift` or `default_openshift`) for the cloud default OpenShift stream, or `iks` (also `kubernetes`, `k8s`, or `default_kubernetes`) for Kubernetes. A compatible numeric stream can refine an alias: `create roks 4.17`.\n\nReview the resolved stream and configuration in its thread, then reply with exact `yes` or `no` within five minutes.", "Safe create options\n```\nCommon\n  --target --provider --version --resource-group --worker-count\n\nVPC Gen 2\n  --zone --flavor --vpc-id --subnet-id --public-gateway-id\n\nClassic\n  --datacenter --machine-type --public-vlan-id --private-vlan-id\n\nSatellite\n  --satellite-zone --satellite-managed-from --satellite-location-id\n  --satellite-host-image --satellite-host-profile --satellite-ssh-key-id\n  --satellite-worker-instance-id --satellite-worker-operating-system\n```"}
+	return []string{"`create` starts planning from the configured channel root. Configured defaults: version " + safeHelpCell(defaults.Version) + ", target " + safeHelpCell(defaults.Target) + ", provider " + safeHelpCell(defaults.Provider) + ". `--provider` chooses infrastructure; version chooses Kubernetes or OpenShift. Cluster names are generated internally.\n\nUse `key=value`, `--key=value`, or `--key value`; forms can be mixed. A current common-option inventory also recognizes unique bare values, for example `create target=synthetic-target vpc-gen2 us-south-1 bx2.4x16 resource-group=\"Platform Team\"`. Unknown or colliding shorthand must use a key such as `flavor=value`; worker counts and uncommon Satellite values stay keyed. Use `roks` (also `openshift` or `default_openshift`) for the cloud default OpenShift stream, or `iks` (also `kubernetes`, `k8s`, or `default_kubernetes`) for Kubernetes. A compatible numeric stream can refine an alias: `create roks 4.17`. These reserved aliases require a key when used as resource names.\n\nReview the resolved stream and configuration in its thread, then reply with exact `yes` or `no` within five minutes.", "Safe create options\n```\nCommon\n  --target --provider --version --resource-group --worker-count\n\nVPC Gen 2\n  --zone --flavor --vpc-id --subnet-id --public-gateway-id\n\nClassic\n  --datacenter --machine-type --public-vlan-id --private-vlan-id\n\nSatellite\n  --satellite-zone --satellite-managed-from --satellite-location-id\n  --satellite-host-image --satellite-host-profile --satellite-ssh-key-id\n  --satellite-worker-instance-id --satellite-worker-operating-system\n```"}
 }
 func safeHelpCell(value string) string {
 	value = strings.Map(func(character rune) rune {

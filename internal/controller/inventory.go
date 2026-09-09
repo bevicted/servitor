@@ -2,9 +2,6 @@ package controller
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -84,7 +81,7 @@ func (r *InventoryReconciler) Sync(ctx context.Context) (ctrl.Result, error) {
 	now := r.now()
 	var wakeAt *time.Time
 	for target, targetConfig := range configured.Targets {
-		revision, err := inventoryRevision(targetConfig)
+		revision, err := inventory.Revision(targetConfig)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
@@ -350,13 +347,5 @@ func (r *InventoryReconciler) now() time.Time {
 		return r.Now().UTC()
 	}
 	return time.Now().UTC()
-}
-func inventoryRevision(target inventory.TargetConfig) (string, error) {
-	encoded, err := json.Marshal(target)
-	if err != nil {
-		return "", err
-	}
-	digest := sha256.Sum256(encoded)
-	return "v1-" + hex.EncodeToString(digest[:]), nil
 }
 func ptrTime(value time.Time) *metav1.Time { result := metav1.NewTime(value); return &result }

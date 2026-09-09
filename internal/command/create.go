@@ -58,7 +58,10 @@ var forbiddenCreateFlags = map[string]bool{"--config": true, "--owner": true, "-
 var numericVersion = regexp.MustCompile(`^[0-9]+\.[0-9]+(?:\.[0-9]+)?(?:_openshift)?$`)
 
 // ExplicitCreateOptions contains only user-supplied, safe options. It never includes defaults.
-type ExplicitCreateOptions struct{ values map[string][]string }
+type ExplicitCreateOptions struct {
+	values map[string][]string
+	bare   []string
+}
 
 // Values returns a copy of the explicitly supplied safe flag values.
 func (o ExplicitCreateOptions) Values() map[string][]string {
@@ -67,6 +70,11 @@ func (o ExplicitCreateOptions) Values() map[string][]string {
 		values[flag] = append([]string(nil), supplied...)
 	}
 	return values
+}
+
+// BareValues returns unmatched positional values for inventory matching.
+func (o ExplicitCreateOptions) BareValues() []string {
+	return append([]string(nil), o.bare...)
 }
 
 // WorkerCount returns the explicit worker count, or zero when it was omitted.
@@ -92,6 +100,7 @@ func ParseCreateOptions(text string) (ExplicitCreateOptions, error) {
 		return ExplicitCreateOptions{}, fmt.Errorf("command must start with create")
 	}
 	seen, values := map[string]bool{}, map[string][]string{}
+	var bare []string
 	for i := 1; i < len(words); {
 		if !strings.HasPrefix(words[i], "-") && !strings.Contains(words[i], "=") {
 			if canonical, alias, ok := versionSyntax(words[i]); ok {
@@ -101,6 +110,9 @@ func ParseCreateOptions(text string) (ExplicitCreateOptions, error) {
 				i++
 				continue
 			}
+			bare = append(bare, words[i])
+			i++
+			continue
 		}
 		flag, value, joined := strings.Cut(words[i], "=")
 		if joined && !strings.HasPrefix(flag, "--") {
@@ -139,7 +151,7 @@ func ParseCreateOptions(text string) (ExplicitCreateOptions, error) {
 		seen[flag] = true
 		values[flag] = append(values[flag], value)
 	}
-	options := ExplicitCreateOptions{values: values}
+	options := ExplicitCreateOptions{values: values, bare: bare}
 	if _, err := options.WorkerCount(); err != nil {
 		return ExplicitCreateOptions{}, err
 	}
@@ -157,6 +169,9 @@ func ParseCreate(text string, defaults CreateDefaults) (CreateRequest, error) {
 
 // ResolveCreateOptions overlays startup defaults once onto explicit options.
 func ResolveCreateOptions(options ExplicitCreateOptions, defaults CreateDefaults) (CreateRequest, error) {
+	if len(options.bare) != 0 {
+		return CreateRequest{}, fmt.Errorf("unknown shorthand value; use an explicit key such as resource-group=value")
+	}
 	values := make(map[string][]string, len(options.values))
 	for flag, supplied := range options.values {
 		values[flag] = append([]string(nil), supplied...)

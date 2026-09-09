@@ -4,6 +4,8 @@ package inventory
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -88,6 +90,16 @@ func LoadConfig(data []byte) (Config, error) {
 		}
 	}
 	return config, nil
+}
+
+// Revision returns the stable configuration revision used to bind snapshots to a target.
+func Revision(target TargetConfig) (string, error) {
+	encoded, err := json.Marshal(target)
+	if err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256(encoded)
+	return "v1-" + hex.EncodeToString(digest[:]), nil
 }
 
 func (t TargetConfig) validate() error {

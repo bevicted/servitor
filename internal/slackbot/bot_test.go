@@ -11,6 +11,7 @@ import (
 
 	servitorv1alpha1 "github.com/bevicted/servitor/api/v1alpha1"
 	"github.com/bevicted/servitor/internal/command"
+	"github.com/bevicted/servitor/internal/inventory"
 	"github.com/bevicted/servitor/internal/state"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -273,7 +274,7 @@ func TestCreateRejectsPlatformAndHelpDoesNotAdvertiseIt(t *testing.T) {
 
 func TestCreateHelpDistinguishesDefaultsAliasesStreamsAndProvider(t *testing.T) {
 	help := strings.Join(createHelp(command.CreateDefaults{}), "\n")
-	for _, wanted := range []string{"Configured defaults", "--provider", "key=value", "--key=value", "--key value", "target=synthetic-target", "resource-group \"Platform Team\"", "roks", "iks", "k8s", "default_openshift", "default_kubernetes", "4.17"} {
+	for _, wanted := range []string{"Configured defaults", "--provider", "key=value", "--key=value", "--key value", "target=synthetic-target", "resource-group=\"Platform Team\"", "roks", "iks", "k8s", "default_openshift", "default_kubernetes", "4.17"} {
 		if !containsText(help, wanted) {
 			t.Fatalf("create help missing %q: %s", wanted, help)
 		}
@@ -309,6 +310,116 @@ func TestHelpDoesNotExposeMaintainerControls(t *testing.T) {
 		}
 	}
 }
+func TestCreateMatchesPublishedInventoryBareValues(t *testing.T) {
+	bot, responses := botWithPublishedInventory(t, false)
+	event := Envelope{ID: "mixed-bare", Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "<@BOT> create bx2.4x16 Platform\\ Team target-a vpc-gen2 us-south-1 --version=4.22", Timestamp: "123"}}
+	if err := bot.Handle(context.Background(), event); err != nil {
+		t.Fatal(err)
+	}
+	cluster := &servitorv1alpha1.ServitorCluster{}
+	if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: ownerClusterName("U1")}, cluster); err != nil {
+		t.Fatal(err)
+	}
+	want := servitorv1alpha1.UserOptions{Target: "target-a", Provider: "vpc-gen2", Version: "4.22", ResourceGroup: "Platform Team", Zone: "us-south-1", Flavor: "bx2.4x16"}
+	if !reflect.DeepEqual(cluster.Spec.UserOptions, want) || len(responses.responses) != 1 {
+		t.Fatalf("bare create = %+v, responses=%+v", cluster.Spec.UserOptions, responses.responses)
+	}
+
+	explicit, _ := botWithPublishedInventory(t, false)
+	if err := explicit.Handle(context.Background(), Envelope{ID: "explicit", Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "<@BOT> create target=target-a provider=vpc-gen2 version=4.22 resource-group=Platform\\ Team zone=us-south-1 flavor=bx2.4x16", Timestamp: "123"}}); err != nil {
+		t.Fatal(err)
+	}
+	explicitCluster := &servitorv1alpha1.ServitorCluster{}
+	if err := explicit.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: ownerClusterName("U1")}, explicitCluster); err != nil || !reflect.DeepEqual(explicitCluster.Spec.UserOptions, want) {
+		t.Fatalf("explicit create = %+v, %v", explicitCluster.Spec.UserOptions, err)
+	}
+
+	defaults, _ := botWithPublishedInventory(t, false)
+	if err := defaults.Handle(context.Background(), Envelope{ID: "defaults", Message: Message{Channel: "C1", ChannelType: "channel", User: "U2", Text: "<@BOT> create Platform\\ Team", Timestamp: "124"}}); err != nil {
+		t.Fatal(err)
+	}
+	defaultCluster := &servitorv1alpha1.ServitorCluster{}
+	if err := defaults.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: ownerClusterName("U2")}, defaultCluster); err != nil || !reflect.DeepEqual(defaultCluster.Spec.UserOptions, servitorv1alpha1.UserOptions{ResourceGroup: "Platform Team"}) {
+		t.Fatalf("default create = %+v, %v", defaultCluster.Spec.UserOptions, err)
+	}
+}
+
+func TestCreateBareValuesRequireCurrentInventoryButKeysProceed(t *testing.T) {
+	for _, expired := range []bool{false, true} {
+		t.Run(fmt.Sprintf("snapshot expired=%t", expired), func(t *testing.T) {
+			bot, responses := botWithPublishedInventory(t, expired)
+			if !expired {
+				if err := state.NewInventoryStore(bot.Client, bot.Namespace).Delete(context.Background(), "target-a"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := bot.Handle(context.Background(), Envelope{ID: "bare", Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "<@BOT> create Platform\\ Team", Timestamp: "123"}}); err != nil {
+				t.Fatal(err)
+			}
+			if len(responses.responses) != 1 || !containsText(responses.responses[0].Text, "inventory is") {
+				t.Fatalf("bare response=%+v", responses.responses)
+			}
+			cluster := &servitorv1alpha1.ServitorCluster{}
+			if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: ownerClusterName("U1")}, cluster); err == nil {
+				t.Fatal("bare value created an allocation without a usable snapshot")
+			}
+		})
+	}
+
+	bot, _ := botWithPublishedInventory(t, false)
+	store := state.NewInventoryStore(bot.Client, bot.Namespace)
+	if err := store.Delete(context.Background(), "target-a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := bot.Handle(context.Background(), Envelope{ID: "keyed", Message: Message{Channel: "C1", ChannelType: "channel", User: "U2", Text: "<@BOT> create resource-group=Uncatalogued", Timestamp: "124"}}); err != nil {
+		t.Fatal(err)
+	}
+	cluster := &servitorv1alpha1.ServitorCluster{}
+	if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: ownerClusterName("U2")}, cluster); err != nil || cluster.Spec.UserOptions.ResourceGroup != "Uncatalogued" {
+		t.Fatalf("keyed create = %+v, %v", cluster.Spec.UserOptions, err)
+	}
+	for _, text := range []string{"<@BOT> create target=unknown resource-group=value", "<@BOT> create provider=classic resource-group=value"} {
+		invalid, responses := botWithPublishedInventory(t, false)
+		if err := invalid.Handle(context.Background(), Envelope{ID: text, Message: Message{Channel: "C1", ChannelType: "channel", User: "U3", Text: text, Timestamp: "125"}}); err != nil {
+			t.Fatal(err)
+		}
+		if len(responses.responses) != 1 || !containsText(responses.responses[0].Text, "not configured") {
+			t.Fatalf("invalid selector response=%+v", responses.responses)
+		}
+	}
+}
+
+func botWithPublishedInventory(t *testing.T, expired bool) (Bot, *memoryResponder) {
+	t.Helper()
+	configData := "version: 1\ntargets:\n  target-a:\n    providers: [vpc-gen2]\n    endpoints:\n      IAM: https://iam.example.invalid\n      ResourceManagement: https://resource-manager.example.invalid\n      ContainerService: https://containers.example.invalid\n"
+	configMap := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "targets", Namespace: "servitor"}, Data: map[string]string{"config.yaml": configData}}
+	bot, responses := botForTest(t, configMap)
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	bot.Clock = func() time.Time { return now }
+	bot.Defaults = command.CreateDefaults{Target: "target-a", Provider: "vpc-gen2", Zone: "us-south-1"}
+	bot.InventoryConfigMap, bot.InventoryConfigKey, bot.InventoryMaximumAge = "targets", "config.yaml", time.Hour
+	target := inventory.TargetConfig{Providers: []string{"vpc-gen2"}, Endpoints: map[string]string{"IAM": "https://iam.example.invalid", "ResourceManagement": "https://resource-manager.example.invalid", "ContainerService": "https://containers.example.invalid"}}
+	revision, err := inventory.Revision(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	catalog := inventory.Catalog{Version: inventory.CatalogVersion, Target: "target-a", Providers: []string{"vpc-gen2"}, Versions: []inventory.Version{{Name: "4.22_openshift", Platform: "openshift", Default: true, Supported: true}}, ResourceGroups: []string{"Platform Team"}, VPCLocations: []inventory.Location{{Name: "us-south-1", Flavors: []string{"bx2.4x16"}}}}
+	published := now
+	if expired {
+		published = now.Add(-2 * time.Hour)
+	}
+	if _, err := state.NewInventoryStore(bot.Client, bot.Namespace).Update(context.Background(), "target-a", func(current *state.InventoryState) error {
+		current.Revision, current.Catalog, current.Disposition = revision, &catalog, state.InventorySucceeded
+		current.PublishedAt = ptrTime(published)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return bot, responses
+}
+
+func ptrTime(value time.Time) *metav1.Time { result := metav1.NewTime(value); return &result }
+
 func containsText(text, part string) bool {
 	for i := 0; i+len(part) <= len(text); i++ {
 		if text[i:i+len(part)] == part {

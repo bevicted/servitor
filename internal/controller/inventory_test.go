@@ -5,11 +5,15 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"reflect"
 	"testing"
 	"time"
 
+	servitorv1alpha1 "github.com/bevicted/servitor/api/v1alpha1"
+	"github.com/bevicted/servitor/internal/command"
 	"github.com/bevicted/servitor/internal/inventory"
 	"github.com/bevicted/servitor/internal/pipeline"
+	"github.com/bevicted/servitor/internal/slackbot"
 	"github.com/bevicted/servitor/internal/state"
 	tektonv1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -24,6 +28,13 @@ import (
 )
 
 type inventoryLogs struct{ data []byte }
+
+type inventoryBotResponder struct{ responses []slackbot.Response }
+
+func (r *inventoryBotResponder) Reply(_ context.Context, response slackbot.Response) error {
+	r.responses = append(r.responses, response)
+	return nil
+}
 
 func (l *inventoryLogs) ReadContainerLog(context.Context, string, string, string) (io.ReadCloser, error) {
 	return io.NopCloser(bytes.NewReader(l.data)), nil
@@ -90,6 +101,39 @@ func TestInventoryRefreshPublishesHourlyAndAdoptsPersistedRun(t *testing.T) {
 	catalog, disposition, err := store.Snapshot(context.Background(), "target-a", second.Revision, now, 24*time.Hour)
 	if err != nil || disposition != state.InventorySucceeded || catalog.ResourceGroups[0] != "Group Two" {
 		t.Fatalf("hourly snapshot = %+v, %s, %v", catalog, disposition, err)
+	}
+}
+
+func TestPublishedInventoryMatchesBareSlackCreate(t *testing.T) {
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	refresher, kube, logs := newInventoryHarness(t, &now, targetConfigYAML("vpc-gen2"))
+	if _, err := refresher.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	store := state.NewInventoryStore(kube, "servitor")
+	published, err := store.Get(context.Background(), "target-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	completeInventoryRun(t, kube, published.ActiveRunID, "published-task")
+	logs.data = inventoryReportBytes(t, "target-a", published.ActiveRunID, published.Revision, "Platform Team")
+	if _, err := refresher.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	responder := &inventoryBotResponder{}
+	bot := slackbot.Bot{ChannelID: "C1", SelfUserID: "BOT", Namespace: "servitor", Client: kube, Events: state.NewEventStore(kube, "servitor"), Defaults: command.CreateDefaults{Target: "target-a", Provider: "vpc-gen2", Zone: "us-south-1"}, InventoryConfigMap: "servitor-ict-config", InventoryConfigKey: "config.yaml", InventoryMaximumAge: time.Hour, Lease: time.Hour, RetryIntervals: []time.Duration{time.Minute}, Responder: responder, Clock: func() time.Time { return now }}
+	if err := bot.Handle(context.Background(), slackbot.Envelope{ID: "mixed", Message: slackbot.Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "<@BOT> create bx2.4x16 Platform\\ Team target-a vpc-gen2 us-south-1 --version=4.22", Timestamp: "123"}}); err != nil {
+		t.Fatal(err)
+	}
+	clusters := &servitorv1alpha1.ServitorClusterList{}
+	if err := kube.List(context.Background(), clusters); err != nil || len(clusters.Items) != 1 {
+		t.Fatalf("Slack create clusters=%+v, %v", clusters.Items, err)
+	}
+	got := clusters.Items[0].Spec.UserOptions
+	want := servitorv1alpha1.UserOptions{Target: "target-a", Provider: "vpc-gen2", Version: "4.22", ResourceGroup: "Platform Team", Zone: "us-south-1", Flavor: "bx2.4x16"}
+	if len(responder.responses) != 1 || !reflect.DeepEqual(got, want) {
+		t.Fatalf("Slack create options=%+v, responses=%+v", got, responder.responses)
 	}
 }
 
@@ -167,7 +211,7 @@ func TestInventoryRefreshRetainsLastGoodAndInvalidatesChangedTarget(t *testing.T
 	refresher, kube, _ := newInventoryHarness(t, &now, targetConfigYAML("vpc-gen2"))
 	store := state.NewInventoryStore(kube, "servitor")
 	target := inventory.TargetConfig{Providers: []string{"vpc-gen2"}, Endpoints: inventoryEndpoints()}
-	revision, err := inventoryRevision(target)
+	revision, err := inventory.Revision(target)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -242,6 +286,9 @@ func newInventoryHarness(t *testing.T, now *time.Time, contents string) (*Invent
 		t.Fatal(err)
 	}
 	if err := tektonv1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := servitorv1alpha1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
 	}
 	config := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "servitor-ict-config", Namespace: "servitor"}, Data: map[string]string{"config.yaml": contents}}
