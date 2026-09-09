@@ -20,7 +20,7 @@ rules:
     verbs: [get, list, watch]
   - apiGroups: [""]
     resources: [configmaps]
-    verbs: [get, create, update]
+    verbs: [get, list, watch, create, update, patch]
   - apiGroups: [""]
     resources: [events]
     verbs: [create, patch]
