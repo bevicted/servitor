@@ -90,7 +90,7 @@ func main() {
 		ChannelID: operator.Slack.ChannelID, Namespace: operator.Namespace, Client: manager.GetClient(),
 		Events: state.NewEventStore(manager.GetClient(), operator.Namespace), Defaults: commandDefaults(operator),
 		InventoryConfigMap: operator.ICT.TargetConfigMap, InventoryConfigKey: operator.ICT.TargetConfigKey, InventoryMaximumAge: operator.InventoryMaximumAge(),
-		Lease: operator.Lifecycle.Lease, RetryIntervals: operator.Lifecycle.RetryIntervals, Responder: transport,
+		Lease: operator.Lifecycle.Lease, RetryIntervals: operator.Lifecycle.RetryIntervals, Responder: transport, Permalinks: transport,
 	}
 	if err := manager.Add(slackbot.NewLeaderRunnable(transport, bot)); err != nil {
 		fail(fmt.Errorf("configure Slack intake: %w", err))

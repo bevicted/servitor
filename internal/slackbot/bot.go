@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log"
+	"net/url"
 	"strings"
 	"time"
 	"unicode"
@@ -37,6 +38,9 @@ type EventStore interface {
 type Responder interface {
 	Reply(context.Context, Response) error
 }
+type PermalinkLookup interface {
+	Permalink(context.Context, string, string) (string, error)
+}
 type Message struct{ Channel, ChannelType, User, Text, Timestamp, ThreadTimestamp, Subtype, BotID string }
 type Envelope struct {
 	ID          string
@@ -59,6 +63,7 @@ type Bot struct {
 	Lease                 time.Duration
 	RetryIntervals        []time.Duration
 	Responder             Responder
+	Permalinks            PermalinkLookup
 	Clock                 func() time.Time
 	Logf                  func(string, ...any)
 }
@@ -155,7 +160,7 @@ func (b Bot) handleDM(ctx context.Context, message Message) {
 	case "list":
 		b.list(ctx, message.User, respond)
 	case "create", "done", "destroy", "extend":
-		respond(rejectedText("That command is available only in the configured channel."))
+		respond(rejectedText(channelOnlyText(b.ChannelID)))
 	default:
 		respond(unknownText())
 	}
@@ -190,7 +195,7 @@ func (b Bot) create(ctx context.Context, message Message, text string, respond f
 	existing := &servitorv1alpha1.ServitorCluster{}
 	err = b.Client.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: name}, existing)
 	if err == nil {
-		respond(existingAllocationNotice(existing, b.now()))
+		respond(b.existingAllocationNotice(ctx, existing, message.User))
 		return true
 	}
 	if !apierrors.IsNotFound(err) {
@@ -208,7 +213,6 @@ func (b Bot) create(ctx context.Context, message Message, text string, respond f
 		b.logf("deliver create acceptance: %v", err)
 		return false
 	}
-	now := b.now()
 	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: b.Namespace}, Spec: servitorv1alpha1.ServitorClusterSpec{
 		Slack:       servitorv1alpha1.SlackIdentity{OwnerID: message.User, ChannelID: message.Channel, ThreadTimestamp: message.Timestamp},
 		UserOptions: userOptions,
@@ -217,7 +221,7 @@ func (b Bot) create(ctx context.Context, message Message, text string, respond f
 	if err := b.Client.Create(ctx, cluster); err != nil {
 		if apierrors.IsAlreadyExists(err) {
 			if getErr := b.Client.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: name}, existing); getErr == nil {
-				respond(existingAllocationNotice(existing, now))
+				respond(b.existingAllocationNotice(ctx, existing, message.User))
 				return true
 			}
 		}
@@ -713,12 +717,40 @@ func (b Bot) respondHelp(text string, respond func(string)) {
 		}
 	}
 }
-func existingAllocationNotice(cluster *servitorv1alpha1.ServitorCluster, now time.Time) string {
+func (b Bot) existingAllocationNotice(ctx context.Context, cluster *servitorv1alpha1.ServitorCluster, owner string) string {
 	expiry := time.Time{}
 	if cluster.Status.LeaseExpiresAt != nil {
 		expiry = cluster.Status.LeaseExpiresAt.Time
 	}
-	return "You already have an allocation in state " + listStatusCell(cluster.Status.Phase) + ". Lease: " + lifecycle.FormatLeaseExpiry(expiry, now) + "."
+	text := "You already have an allocation in state " + listStatusCell(cluster.Status.Phase) + ". Lease: " + lifecycle.FormatLeaseExpiry(expiry, b.now()) + "."
+	if cluster.Spec.Slack.OwnerID != owner || b.Permalinks == nil || cluster.Spec.Slack.ChannelID == "" || cluster.Spec.Slack.ThreadTimestamp == "" {
+		return text + " Open the original allocation thread in the configured channel."
+	}
+	permalink, err := b.Permalinks.Permalink(ctx, cluster.Spec.Slack.ChannelID, cluster.Spec.Slack.ThreadTimestamp)
+	if err != nil || !safePermalink(permalink) {
+		return text + " Open the original allocation thread in the configured channel."
+	}
+	return text + " <" + permalink + "|Open allocation thread>."
+}
+
+func safePermalink(value string) bool {
+	if len(value) == 0 || len(value) > 2048 || strings.ContainsAny(value, "<>|\r\n") {
+		return false
+	}
+	parsed, err := url.ParseRequestURI(value)
+	return err == nil && parsed.Scheme == "https" && parsed.Host != "" && parsed.User == nil
+}
+
+func channelOnlyText(channel string) string {
+	if len(channel) > 0 && len(channel) <= 64 {
+		for _, character := range channel {
+			if !(character >= 'A' && character <= 'Z') && !(character >= '0' && character <= '9') {
+				return "That command is available only in the configured channel."
+			}
+		}
+		return "That command is available only in <#" + channel + ">."
+	}
+	return "That command is available only in the configured channel."
 }
 func channelCommand(text, self string) (string, bool) {
 	if self == "" {

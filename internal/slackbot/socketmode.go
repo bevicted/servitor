@@ -73,6 +73,15 @@ func (s *SocketMode) Reply(ctx context.Context, response Response) error {
 	return err
 }
 
+// Permalink resolves a Slack-provided link for a persisted lifecycle message.
+func (s *SocketMode) Permalink(ctx context.Context, channel, timestamp string) (string, error) {
+	permalink, err := s.client.GetPermalinkContext(ctx, &slack.PermalinkParameters{Channel: channel, Ts: timestamp})
+	if err != nil {
+		return "", fmt.Errorf("get Slack message permalink: %w", err)
+	}
+	return permalink, nil
+}
+
 // Run delivers Events API message events until context cancellation or connection failure.
 func (s *SocketMode) Run(ctx context.Context, handler func(context.Context, Envelope) error) error {
 	errors := make(chan error, 1)
