@@ -148,6 +148,8 @@ func TestSnapshotDerivesPlatformAndWorkerDefaultsFromVersion(t *testing.T) {
 	}{
 		{version: "4.22", platform: "openshift", flavor: "bx2.4x16"},
 		{version: "1.31", platform: "kubernetes", flavor: "bx2.2x8"},
+		{version: "default_openshift", platform: "openshift", flavor: "bx2.4x16"},
+		{version: "default_kubernetes", platform: "kubernetes", flavor: "bx2.2x8"},
 	} {
 		cluster := &servitorv1alpha1.ServitorCluster{Spec: servitorv1alpha1.ServitorClusterSpec{UserOptions: servitorv1alpha1.UserOptions{Provider: "vpc-gen2", Version: test.version}}}
 		reconciler := Reconciler{Config: Config{

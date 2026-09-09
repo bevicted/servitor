@@ -2,6 +2,7 @@ package command
 
 import (
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 	"unicode"
@@ -54,6 +55,8 @@ var createFlags = map[string]bool{
 var repeatableCreateFlags = map[string]bool{"--subnet-id": true, "--public-gateway-id": true, "--satellite-zone": true, "--satellite-worker-instance-id": true}
 var forbiddenCreateFlags = map[string]bool{"--config": true, "--owner": true, "--prefix": true, "--auto-approve": true, "--confirm-stdin": true, "--satellite-ssh-public-key": true}
 
+var numericVersion = regexp.MustCompile(`^[0-9]+\.[0-9]+(?:\.[0-9]+)?(?:_openshift)?$`)
+
 // ExplicitCreateOptions contains only user-supplied, safe options. It never includes defaults.
 type ExplicitCreateOptions struct{ values map[string][]string }
 
@@ -90,6 +93,15 @@ func ParseCreateOptions(text string) (ExplicitCreateOptions, error) {
 	}
 	seen, values := map[string]bool{}, map[string][]string{}
 	for i := 1; i < len(words); {
+		if !strings.HasPrefix(words[i], "-") && !strings.Contains(words[i], "=") {
+			if canonical, alias, ok := versionSyntax(words[i]); ok {
+				if err := addVersion(values, canonical, alias); err != nil {
+					return ExplicitCreateOptions{}, err
+				}
+				i++
+				continue
+			}
+		}
 		flag, value, joined := strings.Cut(words[i], "=")
 		if joined && !strings.HasPrefix(flag, "--") {
 			flag = "--" + flag
@@ -110,6 +122,16 @@ func ParseCreateOptions(text string) (ExplicitCreateOptions, error) {
 				return ExplicitCreateOptions{}, fmt.Errorf("%s requires a value", flag)
 			}
 			i++
+		}
+		if flag == "--version" {
+			canonical, alias, ok := versionSyntax(value)
+			if !ok {
+				return ExplicitCreateOptions{}, fmt.Errorf("--version must be a numeric stream or cloud-default alias")
+			}
+			if err := addVersion(values, canonical, alias); err != nil {
+				return ExplicitCreateOptions{}, err
+			}
+			continue
 		}
 		if seen[flag] && !repeatableCreateFlags[flag] {
 			return ExplicitCreateOptions{}, fmt.Errorf("%s may only be supplied once", flag)
@@ -211,8 +233,11 @@ func first(values ...string) string {
 	return ""
 }
 
-// InferPlatform validates a supported version prefix and returns its platform.
+// InferPlatform validates a supported version family and returns its platform.
 func InferPlatform(version string) (platform string, err error) {
+	if platform, ok := cloudDefaultPlatform(version); ok {
+		return platform, nil
+	}
 	if strings.HasPrefix(version, "4.") {
 		return "openshift", nil
 	}
@@ -220,6 +245,71 @@ func InferPlatform(version string) (platform string, err error) {
 		return "kubernetes", nil
 	}
 	return "", fmt.Errorf("cannot infer platform from version %q", version)
+}
+
+func versionSyntax(value string) (canonical string, alias bool, ok bool) {
+	if canonical, ok := CanonicalCloudDefault(value); ok {
+		return canonical, true, true
+	}
+	return value, false, numericVersion.MatchString(value)
+}
+
+// CanonicalCloudDefault normalizes a user-facing cloud-default alias.
+func CanonicalCloudDefault(value string) (string, bool) {
+	switch value {
+	case "default_openshift", "openshift", "roks":
+		return "default_openshift", true
+	case "default_kubernetes", "kubernetes", "k8s", "iks":
+		return "default_kubernetes", true
+	default:
+		return "", false
+	}
+}
+
+// IsCloudDefault reports whether version requests cloud default resolution.
+func IsCloudDefault(version string) bool {
+	_, ok := cloudDefaultPlatform(version)
+	return ok
+}
+
+func cloudDefaultPlatform(version string) (string, bool) {
+	switch version {
+	case "default_openshift":
+		return "openshift", true
+	case "default_kubernetes":
+		return "kubernetes", true
+	default:
+		return "", false
+	}
+}
+
+func addVersion(values map[string][]string, value string, alias bool) error {
+	current := one(values, "--version")
+	if current == "" {
+		values["--version"] = []string{value}
+		return nil
+	}
+	if current == value {
+		return fmt.Errorf("conflicting explicit version assignments")
+	}
+	currentAlias := IsCloudDefault(current)
+	if alias && currentAlias {
+		return fmt.Errorf("contradictory cloud-default aliases")
+	}
+	if alias || currentAlias {
+		aliasValue, numericValue := value, current
+		if !alias {
+			aliasValue, numericValue = current, value
+		}
+		platform, _ := InferPlatform(aliasValue)
+		numericPlatform, err := InferPlatform(numericValue)
+		if err != nil || numericPlatform != platform {
+			return fmt.Errorf("cloud-default alias is incompatible with explicit version")
+		}
+		values["--version"] = []string{numericValue}
+		return nil
+	}
+	return fmt.Errorf("conflicting explicit version assignments")
 }
 
 func one(values map[string][]string, flag string) string {

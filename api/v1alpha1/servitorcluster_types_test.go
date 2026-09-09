@@ -176,6 +176,13 @@ func TestCRDPrunesRemovedPlatformAndStrictTypedValidationRejectsIt(t *testing.T)
 	if err := k8sruntime.DefaultUnstructuredConverter.FromUnstructuredWithValidation(object, &strict, true); err != nil {
 		t.Fatalf("pruned CR did not decode: %v", err)
 	}
+	object["spec"].(map[string]any)["userOptions"].(map[string]any)["version"] = "default_openshift"
+	if err := k8sruntime.DefaultUnstructuredConverter.FromUnstructuredWithValidation(object, &strict, true); err != nil {
+		t.Fatalf("cloud-default alias did not decode through the CR schema: %v", err)
+	}
+	if strict.Spec.UserOptions.Version != "default_openshift" {
+		t.Fatalf("cloud-default alias was not preserved: %+v", strict.Spec.UserOptions)
+	}
 }
 
 func TestExistingResolvedNameAndRecoveryContextRoundTrip(t *testing.T) {

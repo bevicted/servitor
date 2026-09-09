@@ -221,7 +221,6 @@ func TestParseCreateRejectsEveryProhibitedOrAmbiguousInput(t *testing.T) {
 		name, text string
 	}{
 		{"state ID positional input", "create slack-user --version 4.22"},
-		{"positional version", "create 4.22"},
 		{"unknown flag", "create --version 4.22 --unknown value"},
 		{"config", "create --version 4.22 --config /secret"},
 		{"owner", "create --version 4.22 --owner user"},
@@ -244,6 +243,30 @@ func TestParseCreateRejectsEveryProhibitedOrAmbiguousInput(t *testing.T) {
 			}
 			if strings.Contains(err.Error(), "secret") {
 				t.Fatalf("error exposed value: %v", err)
+			}
+		})
+	}
+}
+
+func TestParseCreateRecognizesCloudDefaultAliasesAndCompatibleNumericStreams(t *testing.T) {
+	for _, test := range []struct {
+		text, want string
+	}{
+		{"create default_openshift", "default_openshift"}, {"create openshift", "default_openshift"}, {"create roks", "default_openshift"},
+		{"create default_kubernetes", "default_kubernetes"}, {"create kubernetes", "default_kubernetes"}, {"create k8s", "default_kubernetes"}, {"create iks", "default_kubernetes"},
+		{"create roks 4.17", "4.17"}, {"create 4.17 roks", "4.17"}, {"create iks --version 1.34", "1.34"},
+	} {
+		t.Run(test.text, func(t *testing.T) {
+			options, err := ParseCreateOptions(test.text)
+			if err != nil || one(options.values, "--version") != test.want {
+				t.Fatalf("ParseCreateOptions(%q) = %#v, %v; want version %q", test.text, options.Values(), err, test.want)
+			}
+		})
+	}
+	for _, text := range []string{"create roks 1.34", "create iks 4.17", "create roks iks", "create 4.17 4.18", "create --version=4.17 --version=4.18"} {
+		t.Run(text, func(t *testing.T) {
+			if _, err := ParseCreateOptions(text); err == nil {
+				t.Fatalf("ParseCreateOptions(%q) unexpectedly succeeded", text)
 			}
 		})
 	}

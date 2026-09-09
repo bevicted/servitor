@@ -222,6 +222,9 @@ func (c Config) Validate() error {
 	if c.COS.UseLockfile {
 		return errors.New("config: cos.use_lockfile is unsupported by the pinned Terraform runtime")
 	}
+	if command.IsCloudDefault(c.Defaults.Version) {
+		return errors.New("config: defaults.version must be a numeric stream, not a cloud-default alias")
+	}
 	if _, err := command.InferPlatform(c.Defaults.Version); err != nil {
 		return fmt.Errorf("config: defaults.version is invalid: %w", err)
 	}

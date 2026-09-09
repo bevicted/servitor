@@ -101,7 +101,7 @@ func TestRunPlanUsesInitializedWorkspaceAndSanitizesOversizedPlan(t *testing.T) 
 		t.Fatal(err)
 	}
 	planningConfig, apiKey := planningValidationFixture(t, directory)
-	options := servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Target: "target", Provider: "vpc-gen2", Version: "4.22", ResourceGroup: "New Group"}, Platform: "openshift"}
+	options := servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Target: "target", Provider: "vpc-gen2", Version: "default_openshift", ResourceGroup: "New Group"}, Platform: "openshift"}
 	if err := runPlan(context.Background(), "uid", "plan-a", options, backendFile, resultFile, reportFile, ict, terraform, planningConfig, apiKey); err != nil {
 		t.Fatal(err)
 	}
@@ -251,6 +251,29 @@ targets:
 	}
 	if _, err := os.Stat(ictTrace); !os.IsNotExist(err) {
 		t.Fatalf("service failure invoked ICT: %v", err)
+	}
+}
+
+func TestSupportedPlanVersionRequiresOneApplicableCloudDefault(t *testing.T) {
+	versions := []inventory.Version{
+		{Name: "4.16_openshift", Platform: "openshift", Default: false, Supported: true},
+		{Name: "4.17_openshift", Platform: "openshift", Default: true, Supported: true},
+		{Name: "1.34", Platform: "kubernetes", Default: true, Supported: true},
+	}
+	for _, requested := range []string{"default_openshift", "4.17", "4.17.9"} {
+		version, platform, ok := supportedPlanVersion(versions, requested)
+		if !ok || version != "4.17_openshift" || platform != "openshift" {
+			t.Fatalf("supportedPlanVersion(%q) = %q, %q, %v", requested, version, platform, ok)
+		}
+	}
+	for _, versions := range [][]inventory.Version{
+		nil,
+		{{Name: "4.17_openshift", Platform: "openshift", Default: true, Supported: true}, {Name: "4.18_openshift", Platform: "openshift", Default: true, Supported: true}},
+		{{Name: "4.17_openshift", Platform: "openshift", Default: true, Supported: false}},
+	} {
+		if _, _, ok := supportedPlanVersion(versions, "default_openshift"); ok {
+			t.Fatalf("supportedPlanVersion(%#v, cloud default) unexpectedly succeeded", versions)
+		}
 	}
 }
 

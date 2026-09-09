@@ -103,6 +103,9 @@ func main() {
 }
 
 func controllerConfig(operator config.Config) (controller.Config, error) {
+	if command.IsCloudDefault(operator.Defaults.Version) {
+		return controller.Config{}, fmt.Errorf("resolve controller startup defaults: configured default must be numeric")
+	}
 	if _, err := command.InferPlatform(operator.Defaults.Version); err != nil {
 		return controller.Config{}, fmt.Errorf("resolve controller startup defaults: %w", err)
 	}

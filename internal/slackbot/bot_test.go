@@ -271,17 +271,27 @@ func TestCreateRejectsPlatformAndHelpDoesNotAdvertiseIt(t *testing.T) {
 	}
 }
 
-func TestCreateHelpShowsAssignmentsWithoutUnsupportedShorthand(t *testing.T) {
+func TestCreateHelpDistinguishesDefaultsAliasesStreamsAndProvider(t *testing.T) {
 	help := strings.Join(createHelp(command.CreateDefaults{}), "\n")
-	for _, wanted := range []string{"key=value", "--key=value", "--key value", "target=synthetic-target", "resource-group \"Platform Team\""} {
+	for _, wanted := range []string{"Configured defaults", "--provider", "key=value", "--key=value", "--key value", "target=synthetic-target", "resource-group \"Platform Team\"", "roks", "iks", "k8s", "default_openshift", "default_kubernetes", "4.17"} {
 		if !containsText(help, wanted) {
 			t.Fatalf("create help missing %q: %s", wanted, help)
 		}
 	}
-	for _, unsupported := range []string{"roks", "iks", "k8s", "default_openshift", "default_kubernetes"} {
-		if containsText(help, unsupported) {
-			t.Fatalf("create help advertises unsupported shorthand %q: %s", unsupported, help)
-		}
+}
+
+func TestCreateRejectsIncompatibleAliasVersionWithoutAllocation(t *testing.T) {
+	bot, responses := botForTest(t)
+	event := Envelope{ID: "alias-conflict", Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "<@BOT> create roks 1.34", Timestamp: "123"}}
+	if err := bot.Handle(context.Background(), event); err != nil {
+		t.Fatal(err)
+	}
+	if len(responses.responses) != 1 || !containsText(responses.responses[0].Text, "incompatible") {
+		t.Fatalf("responses=%+v", responses.responses)
+	}
+	cluster := &servitorv1alpha1.ServitorCluster{}
+	if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: ownerClusterName("U1")}, cluster); err == nil {
+		t.Fatal("incompatible alias/version recorded an allocation")
 	}
 }
 

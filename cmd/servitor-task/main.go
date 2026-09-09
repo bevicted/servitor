@@ -317,6 +317,9 @@ func validatePlanOptions(ctx context.Context, configPath, apiKey string, options
 	if !ok {
 		return options, &servitorv1alpha1.PlanRejection{ReasonCode: "version_not_supported", OptionKey: "version"}, nil
 	}
+	if options.Provider == "satellite" && platform != "openshift" {
+		return options, &servitorv1alpha1.PlanRejection{ReasonCode: "provider_not_supported", OptionKey: "provider"}, nil
+	}
 	options.Version = version
 	options.Platform = platform
 	if options.ResourceGroup != "" && !containsOption(catalog.ResourceGroups, options.ResourceGroup) {
@@ -352,6 +355,19 @@ func supportedPlanVersion(versions []inventory.Version, requested string) (strin
 	if err != nil {
 		return "", "", false
 	}
+	if command.IsCloudDefault(requested) {
+		var defaultVersion string
+		for _, version := range versions {
+			if version.Supported && version.Platform == platform && version.Default {
+				if defaultVersion != "" {
+					return "", "", false
+				}
+				defaultVersion = version.Name
+			}
+		}
+		return defaultVersion, platform, defaultVersion != ""
+	}
+	requested = streamVersion(requested)
 	for _, version := range versions {
 		stream := strings.TrimSuffix(version.Name, "_openshift")
 		if version.Supported && version.Platform == platform && (version.Name == requested || stream == requested) {
@@ -359,6 +375,15 @@ func supportedPlanVersion(versions []inventory.Version, requested string) (strin
 		}
 	}
 	return "", "", false
+}
+
+func streamVersion(version string) string {
+	platformSuffix := strings.TrimSuffix(version, "_openshift")
+	parts := strings.Split(platformSuffix, ".")
+	if len(parts) == 3 {
+		platformSuffix = strings.Join(parts[:2], ".")
+	}
+	return platformSuffix
 }
 
 func containsOption(options []string, selected string) bool {

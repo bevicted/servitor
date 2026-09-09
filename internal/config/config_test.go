@@ -35,6 +35,16 @@ func TestValidateFailsClosedForRequiredDeploymentInputs(t *testing.T) {
 	}
 }
 
+func TestValidateRejectsCloudDefaultVersionAliases(t *testing.T) {
+	for _, alias := range []string{"default_openshift", "default_kubernetes"} {
+		configuration := validConfig()
+		configuration.Defaults.Version = alias
+		if err := configuration.Validate(); err == nil {
+			t.Fatalf("Validate accepted configured cloud-default alias %q", alias)
+		}
+	}
+}
+
 func TestLoadAppliesInventoryRefreshDefaults(t *testing.T) {
 	directory := t.TempDir()
 	path := filepath.Join(directory, "config.yaml")

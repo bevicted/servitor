@@ -75,7 +75,7 @@ spec:
                       {
                         type: string,
                         maxLength: 32,
-                        pattern: '^[0-9]+\.[0-9]+(\.[0-9]+)?(_openshift)?$',
+                        pattern: '(^[0-9]+\.[0-9]+(\.[0-9]+)?(_openshift)?$)|(^default_(openshift|kubernetes)$)',
                       }
                     resourceGroup: { type: string, maxLength: 128 }
                     zone:
@@ -185,7 +185,12 @@ spec:
                     provider:
                       { type: string, enum: [vpc-gen2, classic, satellite] }
                     platform: { type: string, enum: [kubernetes, openshift] }
-                    version: { type: string, maxLength: 32 }
+                    version:
+                      {
+                        type: string,
+                        maxLength: 32,
+                        pattern: '(^[0-9]+\.[0-9]+(\.[0-9]+)?(_openshift)?$)|(^default_(openshift|kubernetes)$)',
+                      }
                     resourceGroup: { type: string, maxLength: 128 }
                     zone: { type: string, maxLength: 64 }
                     flavor: { type: string, maxLength: 64 }
