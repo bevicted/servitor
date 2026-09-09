@@ -1,15 +1,19 @@
 # syntax=docker/dockerfile:1
 ARG GO_VERSION=1.24.0
-FROM golang:${GO_VERSION}-bookworm AS build
+ARG BUILDPLATFORM
+FROM --platform=${BUILDPLATFORM} golang:${GO_VERSION}-bookworm AS build
+ARG TARGETOS
+ARG TARGETARCH
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY api ./api
 COPY cmd ./cmd
 COPY internal ./internal
-RUN CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/servitor ./cmd/servitor
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags='-s -w' -o /out/servitor ./cmd/servitor
 
 FROM gcr.io/distroless/base-debian12:nonroot
 COPY --from=build /out/servitor /usr/local/bin/servitor
+WORKDIR /tmp
 USER 65532:0
 ENTRYPOINT ["/usr/local/bin/servitor"]
