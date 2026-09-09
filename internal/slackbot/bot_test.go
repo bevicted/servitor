@@ -92,6 +92,30 @@ func TestCreateDoesNotProceedWhenAcceptanceDeliveryFails(t *testing.T) {
 	}
 }
 
+func TestReviewDecisionIsAcknowledgedImmediately(t *testing.T) {
+	for _, test := range []struct{ command, approval, response string }{
+		{"yes", "approved", "Plan approved.\nCreating... This may take 30m-90m."},
+		{"no", "rejected", "Plan rejected.\nCleaning up..."},
+	} {
+		t.Run(test.command, func(t *testing.T) {
+			cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: ownerClusterName("U1"), Namespace: "servitor"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 14400}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseAwaitingApproval, LifecycleSnapshot: &servitorv1alpha1.LifecycleSnapshot{InitialLeaseSeconds: 14400}}}
+			bot, responses := botForTest(t, cluster)
+			if err := bot.Handle(context.Background(), Envelope{ID: test.command, Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: test.command, Timestamp: "reply", ThreadTimestamp: "root"}}); err != nil {
+				t.Fatal(err)
+			}
+			if len(responses.responses) != 1 || responses.responses[0].Text != test.response {
+				t.Fatalf("responses=%+v", responses.responses)
+			}
+			if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: cluster.Name}, cluster); err != nil {
+				t.Fatal(err)
+			}
+			if cluster.Spec.Lifecycle.Approval != test.approval {
+				t.Fatalf("approval=%q, want %q", cluster.Spec.Lifecycle.Approval, test.approval)
+			}
+		})
+	}
+}
+
 func TestThreadOwnerMutatesOnlySpecIntent(t *testing.T) {
 	expiry := metav1.NewTime(time.Date(2026, 9, 8, 4, 0, 0, 0, time.UTC))
 	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: ownerClusterName("U1"), Namespace: "servitor"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 14400}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseAwaitingApproval, LifecycleSnapshot: &servitorv1alpha1.LifecycleSnapshot{InitialLeaseSeconds: 14400}}}

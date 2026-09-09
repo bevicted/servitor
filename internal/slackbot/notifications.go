@@ -88,8 +88,6 @@ func statusNotices(cluster *servitorv1alpha1.ServitorCluster) []statusNotice {
 	switch phase {
 	case servitorv1alpha1.PhaseAwaitingApproval:
 		texts = reviewNoticeTexts(cluster.Status.ResolvedOptions, cluster.Status.Review)
-	case servitorv1alpha1.PhaseApplying:
-		texts = []string{"Applying the approved configuration..."}
 	case servitorv1alpha1.PhaseReady:
 		expiry := time.Time{}
 		if cluster.Status.LeaseExpiresAt != nil {
@@ -97,7 +95,9 @@ func statusNotices(cluster *servitorv1alpha1.ServitorCluster) []statusNotice {
 		}
 		texts = readyNoticeTexts(cluster.Status.Ready, expiry, time.Now().UTC())
 	case servitorv1alpha1.PhaseCleanupPending:
-		texts = []string{"Cleaning up..."}
+		if cluster.Status.Cleanup == nil || cluster.Status.Cleanup.Reason != servitorv1alpha1.CleanupReasonRejected {
+			texts = []string{"Cleaning up..."}
+		}
 	case servitorv1alpha1.PhaseCleanupComplete:
 		texts = []string{"Cleanup complete."}
 	case servitorv1alpha1.PhaseUnresolved:

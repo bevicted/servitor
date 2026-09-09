@@ -38,12 +38,21 @@ func TestStatusNotifierDeliversTransitionOnceAcrossRestart(t *testing.T) {
 	}
 }
 
-func TestStatusNoticesSuppressDuplicatePlanningAndDescribeUnresolvedOperation(t *testing.T) {
+func TestStatusNoticesSuppressCommandProgressDuplicatesAndDescribeUnresolvedOperation(t *testing.T) {
 	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "slack-owner", Namespace: "servitor", UID: "uid"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhasePlanning}}
+	for _, phase := range []string{servitorv1alpha1.PhasePlanning, servitorv1alpha1.PhaseApplying} {
+		cluster.Status.Phase = phase
+		if notices := statusNotices(cluster); len(notices) != 0 {
+			t.Fatalf("%s notices = %+v, want none", phase, notices)
+		}
+	}
+	cluster.Status.Phase = servitorv1alpha1.PhaseCleanupPending
+	cluster.Status.Cleanup = &servitorv1alpha1.CleanupStatus{Reason: servitorv1alpha1.CleanupReasonRejected}
 	if notices := statusNotices(cluster); len(notices) != 0 {
-		t.Fatalf("planning notices = %+v, want none", notices)
+		t.Fatalf("rejected cleanup notices = %+v, want none", notices)
 	}
 	cluster.Status.Phase = servitorv1alpha1.PhaseUnresolved
+	cluster.Status.Cleanup = nil
 	if notices := statusNotices(cluster); len(notices) != 1 || notices[0].text != "The operation is unresolved. An administrator must inspect the allocation CR status and private cluster logs." {
 		t.Fatalf("unresolved notices = %+v", notices)
 	}

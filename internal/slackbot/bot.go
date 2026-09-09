@@ -221,7 +221,13 @@ func (b Bot) confirm(ctx context.Context, message Message, thread string) {
 		return nil
 	}); err != nil {
 		b.logf("record review decision: %v", err)
+		return
 	}
+	response := "Plan approved.\nCreating... This may take 30m-90m."
+	if approval == "rejected" {
+		response = "Plan rejected.\nCleaning up..."
+	}
+	b.respond(ctx, message.Channel, thread, response)
 }
 
 func (b Bot) cleanup(ctx context.Context, message Message, thread string, acknowledge bool) {
