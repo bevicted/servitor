@@ -403,3 +403,20 @@ func TestLeaderRunnableStopsOnlySlackIntakeOnLeadershipLoss(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestStatusNoticesExplainRejectedExtensionOutcomes(t *testing.T) {
+	now := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
+	requested := metav1.NewTime(now.Add(time.Hour))
+	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "slack-owner", Namespace: "servitor", UID: "uid"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseCleanupPending}}
+	for outcome, want := range map[servitorv1alpha1.ExtensionOutcome]string{
+		servitorv1alpha1.ExtensionOutcomeNotReady: "Lease extension was not applied because the cluster is not ready. Extend is available when your cluster is ready.",
+		servitorv1alpha1.ExtensionOutcomeExpired:  "Lease extension was not applied because the lease expired. Cleanup will begin.",
+		servitorv1alpha1.ExtensionOutcomeInvalid:  "Lease extension was not applied because the requested duration is invalid. Use extend [N[h]] when your cluster is ready.",
+	} {
+		cluster.Status.LeaseExtension = &servitorv1alpha1.LeaseExtensionStatus{RequestedExpiry: requested, Outcome: outcome}
+		notices := statusNoticesAt(cluster, now)
+		if len(notices) != 1 || notices[0].text != want || notices[0].id != extensionNoticeID("uid", cluster.Status.LeaseExtension) {
+			t.Fatalf("outcome %q notices=%+v", outcome, notices)
+		}
+	}
+}

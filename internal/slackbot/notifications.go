@@ -153,8 +153,10 @@ func statusNoticesAt(cluster *servitorv1alpha1.ServitorCluster, now time.Time) [
 	if cleanup := cluster.Status.Cleanup; cleanup != nil && cleanup.NextRetryAt != nil && phase == servitorv1alpha1.PhaseCleanupPending {
 		notices = append(notices, statusNotice{id: fmt.Sprintf("cleanup-retry:%s:%d", uid, cleanup.RetryCount), text: fmt.Sprintf("Cleanup retry %d is scheduled for %s.", cleanup.RetryCount, cleanup.NextRetryAt.Time.UTC().Format("2006-01-02 15:04:05 UTC"))})
 	}
-	if extension := cluster.Status.LeaseExtension; extension != nil && extension.Outcome == servitorv1alpha1.ExtensionOutcomeApplied && extension.PreviousExpiry != nil && extension.NewExpiry != nil {
-		notices = append(notices, statusNotice{id: "extension:" + uid + ":" + extension.RequestedExpiry.UTC().Format(time.RFC3339Nano), text: extensionNoticeText(extension, time.Now().UTC())})
+	if extension := cluster.Status.LeaseExtension; extension != nil {
+		if text := extensionOutcomeText(extension, now); text != "" {
+			notices = append(notices, statusNotice{id: extensionNoticeID(uid, extension), text: text})
+		}
 	}
 	return notices
 }
@@ -334,6 +336,28 @@ func actionTotals(rows [][]string) (create, change, destroy int) {
 		}
 	}
 	return create, change, destroy
+}
+
+func extensionNoticeID(uid string, extension *servitorv1alpha1.LeaseExtensionStatus) string {
+	return "extension:" + uid + ":" + extension.RequestedExpiry.UTC().Format(time.RFC3339Nano)
+}
+
+func extensionOutcomeText(extension *servitorv1alpha1.LeaseExtensionStatus, now time.Time) string {
+	switch extension.Outcome {
+	case servitorv1alpha1.ExtensionOutcomeApplied:
+		if extension.PreviousExpiry == nil || extension.NewExpiry == nil {
+			return ""
+		}
+		return extensionNoticeText(extension, now)
+	case servitorv1alpha1.ExtensionOutcomeNotReady:
+		return "Lease extension was not applied because the cluster is not ready. Extend is available when your cluster is ready."
+	case servitorv1alpha1.ExtensionOutcomeExpired:
+		return "Lease extension was not applied because the lease expired. Cleanup will begin."
+	case servitorv1alpha1.ExtensionOutcomeInvalid:
+		return "Lease extension was not applied because the requested duration is invalid. Use extend [N[h]] when your cluster is ready."
+	default:
+		return ""
+	}
 }
 
 func extensionNoticeText(extension *servitorv1alpha1.LeaseExtensionStatus, now time.Time) string {

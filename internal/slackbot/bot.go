@@ -139,6 +139,7 @@ func (b Bot) Handle(ctx context.Context, envelope Envelope) error {
 	case "destroy":
 		b.cleanup(ctx, message, thread, false)
 	case "extend":
+		message.Text = text
 		b.extend(ctx, message, thread, false, reply)
 	default:
 		reply(unknownText())
@@ -294,18 +295,44 @@ func (b Bot) recordReviewDecision(ctx context.Context, name string, message Mess
 }
 
 func (b Bot) cleanup(ctx context.Context, message Message, thread string, acknowledge bool) {
+	requireThread := message.ThreadTimestamp != ""
 	cluster, err := b.ownerCluster(ctx, message.User)
-	if err != nil || !ownsThread(cluster, message, thread, message.ThreadTimestamp != "") {
+	if err != nil {
+		if acknowledge && !requireThread {
+			b.respond(ctx, message.Channel, thread, lifecycleLookupText(err))
+		}
 		return
 	}
-	if err := b.updateIntent(ctx, cluster.Name, func(current *servitorv1alpha1.ServitorCluster) error {
-		if !ownsThread(current, message, thread, message.ThreadTimestamp != "") {
-			return nil
+	if !ownsThread(cluster, message, thread, requireThread) {
+		return
+	}
+	stateText := ""
+	updated, err := b.updateIntent(ctx, cluster.Name, func(current *servitorv1alpha1.ServitorCluster) (bool, error) {
+		if !ownsThread(current, message, thread, requireThread) {
+			return false, nil
+		}
+		if text := cleanupUnavailableText(current); text != "" {
+			stateText = text
+			return false, nil
 		}
 		current.Spec.Lifecycle.CleanupRequested = true
-		return nil
-	}); err != nil {
+		return true, nil
+	})
+	if err != nil {
 		b.logf("request cleanup: %v", err)
+		if acknowledge {
+			if apierrors.IsNotFound(err) {
+				b.respond(ctx, message.Channel, thread, lifecycleLookupText(err))
+			} else {
+				b.respond(ctx, message.Channel, thread, rejectedText("Unable to record the cleanup request. No cleanup was started."))
+			}
+		}
+		return
+	}
+	if !updated {
+		if acknowledge && stateText != "" {
+			b.respond(ctx, message.Channel, thread, stateText)
+		}
 		return
 	}
 	if acknowledge {
@@ -314,33 +341,105 @@ func (b Bot) cleanup(ctx context.Context, message Message, thread string, acknow
 }
 
 func (b Bot) extend(ctx context.Context, message Message, thread string, requireThread bool, respond func(string)) {
+	cluster, err := b.ownerCluster(ctx, message.User)
+	if err != nil {
+		if !requireThread {
+			respond(lifecycleLookupText(err))
+		}
+		return
+	}
+	if !ownsThread(cluster, message, thread, requireThread) {
+		return
+	}
 	increment, err := command.ParseExtend(message.Text)
 	if err != nil {
 		respond(rejectedText(err.Error()))
 		return
 	}
-	cluster, err := b.ownerCluster(ctx, message.User)
-	if err != nil || !ownsThread(cluster, message, thread, requireThread) || cluster.Status.Phase != servitorv1alpha1.PhaseReady || cluster.Status.LeaseExpiresAt == nil || cluster.Status.LifecycleSnapshot == nil {
+	if text := extensionUnavailableText(cluster, b.now()); text != "" {
+		respond(text)
 		return
 	}
-	target, err := command.ExtensionTarget(cluster.Status.LeaseExpiresAt.Time, increment, time.Duration(cluster.Status.LifecycleSnapshot.InitialLeaseSeconds)*time.Second)
-	if err != nil {
-		respond(rejectedText(err.Error()))
-		return
-	}
-	if err := b.updateIntent(ctx, cluster.Name, func(current *servitorv1alpha1.ServitorCluster) error {
-		if !ownsThread(current, message, thread, requireThread) || current.Status.Phase != servitorv1alpha1.PhaseReady || current.Status.LeaseExpiresAt == nil {
-			return nil
+	stateText := ""
+	updated, err := b.updateIntent(ctx, cluster.Name, func(current *servitorv1alpha1.ServitorCluster) (bool, error) {
+		if !ownsThread(current, message, thread, requireThread) {
+			return false, nil
+		}
+		if text := extensionUnavailableText(current, b.now()); text != "" {
+			stateText = text
+			return false, nil
 		}
 		if staleExtensionEvent(current.Spec.Lifecycle.ExtensionEventTimestamp, message.Timestamp) {
-			return nil
+			stateText = "This extension was already recorded. Wait for the controller outcome."
+			return false, nil
+		}
+		target, err := command.ExtensionTarget(current.Status.LeaseExpiresAt.Time, increment, time.Duration(current.Status.LifecycleSnapshot.InitialLeaseSeconds)*time.Second)
+		if err != nil {
+			return false, err
 		}
 		current.Spec.Lifecycle.RequestedExpiry = &metav1.Time{Time: target}
 		current.Spec.Lifecycle.ExtensionEventTimestamp = message.Timestamp
-		return nil
-	}); err != nil {
+		return true, nil
+	})
+	if err != nil {
 		b.logf("request lease extension: %v", err)
-		respond(rejectedText("Unable to record the lease extension."))
+		if apierrors.IsNotFound(err) {
+			respond(lifecycleLookupText(err))
+		} else {
+			respond(rejectedText("Unable to record the lease extension."))
+		}
+		return
+	}
+	if !updated && stateText != "" {
+		respond(stateText)
+	}
+}
+
+func lifecycleLookupText(err error) string {
+	if apierrors.IsNotFound(err) {
+		return "You have no allocation. Use @servitor create to start one."
+	}
+	return rejectedText("Unable to check your allocation state. Try again.")
+}
+
+func cleanupUnavailableText(cluster *servitorv1alpha1.ServitorCluster) string {
+	switch {
+	case cluster.Spec.Lifecycle.CleanupRequested || cluster.Status.Cleanup != nil || cluster.Status.Phase == servitorv1alpha1.PhaseCleanupPending:
+		return "Cleanup is already in progress. No further action is needed."
+	case cluster.Status.Phase == servitorv1alpha1.PhaseCleanupComplete:
+		return "Cleanup is complete. Use @servitor create to start a new allocation."
+	case cluster.Status.Phase == servitorv1alpha1.PhaseUnresolved:
+		return "Cleanup is unresolved. An administrator must inspect the allocation CR status and private cluster logs."
+	default:
+		return ""
+	}
+}
+
+func extensionUnavailableText(cluster *servitorv1alpha1.ServitorCluster, now time.Time) string {
+	if cluster.Spec.Lifecycle.CleanupRequested || cluster.Status.Cleanup != nil || cluster.Status.Phase == servitorv1alpha1.PhaseCleanupPending {
+		return "Cleanup is in progress. The lease cannot be extended."
+	}
+	switch cluster.Status.Phase {
+	case servitorv1alpha1.PhasePending, servitorv1alpha1.PhasePlanning:
+		return "Planning is in progress. Extend is available when your cluster is ready."
+	case servitorv1alpha1.PhaseAwaitingApproval:
+		return "This plan is awaiting review. Reply yes or no in this thread."
+	case servitorv1alpha1.PhaseApplying:
+		return "Your cluster is being created. Extend is available when your cluster is ready."
+	case servitorv1alpha1.PhaseCleanupComplete:
+		return "Cleanup is complete. Use @servitor create to start a new allocation."
+	case servitorv1alpha1.PhaseUnresolved:
+		return "This allocation is unresolved. An administrator must inspect the allocation CR status and private cluster logs."
+	case servitorv1alpha1.PhaseReady:
+		if cluster.Status.LeaseExpiresAt == nil || cluster.Status.LifecycleSnapshot == nil {
+			return "The ready lease state is unavailable. Try again when status is updated."
+		}
+		if !now.Before(cluster.Status.LeaseExpiresAt.Time) {
+			return "Your lease has expired. Cleanup will begin; use @servitor create after cleanup completes."
+		}
+		return ""
+	default:
+		return "This allocation is not ready to extend. Extend is available when your cluster is ready."
 	}
 }
 
@@ -367,17 +466,28 @@ func (b Bot) ownerCluster(ctx context.Context, owner string) (*servitorv1alpha1.
 	}
 	return cluster, nil
 }
-func (b Bot) updateIntent(ctx context.Context, name string, mutate func(*servitorv1alpha1.ServitorCluster) error) error {
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+func (b Bot) updateIntent(ctx context.Context, name string, mutate func(*servitorv1alpha1.ServitorCluster) (bool, error)) (bool, error) {
+	updated := false
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		current := &servitorv1alpha1.ServitorCluster{}
 		if err := b.Client.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: name}, current); err != nil {
 			return err
 		}
-		if err := mutate(current); err != nil {
+		changed, err := mutate(current)
+		if err != nil {
 			return err
 		}
-		return b.Client.Update(ctx, current)
+		if !changed {
+			updated = false
+			return nil
+		}
+		if err := b.Client.Update(ctx, current); err != nil {
+			return err
+		}
+		updated = true
+		return nil
 	})
+	return updated, err
 }
 func ownsThread(cluster *servitorv1alpha1.ServitorCluster, message Message, thread string, requireThread bool) bool {
 	if cluster == nil || cluster.Spec.Slack.OwnerID != message.User || cluster.Spec.Slack.ChannelID != message.Channel {
@@ -588,9 +698,9 @@ func (b Bot) respondHelp(text string, respond func(string)) {
 	case "create":
 		messages = createHelp(b.Defaults)
 	case "done":
-		messages = []string{"`done` releases your resources. Use it in your lifecycle thread, or as `@servitor done` in the configured channel."}
+		messages = []string{"`done` releases your resources. Use it in your lifecycle thread, or as `@servitor done` in the configured channel. It is unavailable after cleanup completes; repeated requests report cleanup in progress."}
 	case "extend":
-		messages = []string{"`extend [N[h]]` extends your ready lease by the configured duration or by 1 through 24 whole hours. Use it in your lifecycle thread or as `@servitor extend` in the configured channel."}
+		messages = []string{"`extend [N[h]]` extends your ready lease by the configured duration or by 1 through 24 whole hours. Use it in your lifecycle thread or as `@servitor extend` in the configured channel. It is available only while the lease is ready, not during planning, cleanup, or after expiry."}
 	case "list":
 		messages = []string{"`list` shows available cluster state. Use it in a DM or as `@servitor list` in the configured channel."}
 	default:

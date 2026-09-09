@@ -302,7 +302,7 @@ func TestHandleCommandProgressAndPersistenceOrdering(t *testing.T) {
 		if err := bot.Handle(context.Background(), Envelope{Message: message("<@BOT> done", "done")}); err != nil {
 			t.Fatal(err)
 		}
-		if want := []string{"kubernetes update"}; !reflect.DeepEqual(recorder.events, want) {
+		if want := []string{"kubernetes update", "reply: Command rejected.\n\nUnable to record the cleanup request. No cleanup was started."}; !reflect.DeepEqual(recorder.events, want) {
 			t.Fatalf("cleanup events=%q, want %q", recorder.events, want)
 		}
 		current = &servitorv1alpha1.ServitorCluster{}
@@ -712,6 +712,30 @@ func TestHelpDoesNotExposeMaintainerControls(t *testing.T) {
 		}
 	}
 }
+func TestLifecycleHelpExplainsAvailableStates(t *testing.T) {
+	bot, responses := botForTest(t)
+	for _, topic := range []struct {
+		command string
+		wanted  []string
+	}{
+		{command: "help done", wanted: []string{"cleanup completes", "cleanup in progress"}},
+		{command: "help extend", wanted: []string{"only while the lease is ready", "planning, cleanup, or after expiry"}},
+	} {
+		responses.responses = nil
+		if err := bot.Handle(context.Background(), Envelope{ID: topic.command, Message: Message{Channel: "D1", ChannelType: "im", User: "U1", Text: topic.command}}); err != nil {
+			t.Fatal(err)
+		}
+		if len(responses.responses) != 1 {
+			t.Fatalf("%s responses=%+v", topic.command, responses.responses)
+		}
+		for _, wanted := range topic.wanted {
+			if !containsText(responses.responses[0].Text, wanted) {
+				t.Fatalf("%s help missing %q: %s", topic.command, wanted, responses.responses[0].Text)
+			}
+		}
+	}
+}
+
 func TestCreateMatchesPublishedInventoryBareValues(t *testing.T) {
 	bot, responses := botWithPublishedInventory(t, false)
 	event := Envelope{ID: "mixed-bare", Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "<@BOT> create bx2.4x16 Platform\\ Team target-a vpc-gen2 us-south-1 --version=4.22", Timestamp: "123"}}
@@ -821,6 +845,170 @@ func botWithPublishedInventory(t *testing.T, expired bool) (Bot, *memoryResponde
 }
 
 func ptrTime(value time.Time) *metav1.Time { result := metav1.NewTime(value); return &result }
+
+func TestLifecycleCommandsExplainStateAndRecordOnlyAcceptedIntent(t *testing.T) {
+	now := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
+	expiry := metav1.NewTime(now.Add(time.Hour))
+	cluster := func(phase string) *servitorv1alpha1.ServitorCluster {
+		return &servitorv1alpha1.ServitorCluster{
+			ObjectMeta: metav1.ObjectMeta{Name: ownerClusterName("U1"), Namespace: "servitor"},
+			Spec:       servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 3600}},
+			Status:     servitorv1alpha1.ServitorClusterStatus{Phase: phase, LeaseExpiresAt: expiry.DeepCopy(), LifecycleSnapshot: &servitorv1alpha1.LifecycleSnapshot{InitialLeaseSeconds: 3600}},
+		}
+	}
+	message := func(text string) Envelope {
+		return Envelope{ID: text, Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "<@BOT> " + text, Timestamp: "100.000001"}}
+	}
+
+	for _, test := range []struct {
+		name     string
+		phase    string
+		command  string
+		prepare  func(*servitorv1alpha1.ServitorCluster)
+		response string
+		mutated  bool
+	}{
+		{name: "planning extension", phase: servitorv1alpha1.PhasePlanning, command: "extend 1h", response: "Planning is in progress. Extend is available when your cluster is ready."},
+		{name: "cleanup extension", phase: servitorv1alpha1.PhaseCleanupPending, command: "extend 1h", response: "Cleanup is in progress. The lease cannot be extended."},
+		{name: "repeated cleanup", phase: servitorv1alpha1.PhaseCleanupPending, command: "done", response: "Cleanup is already in progress. No further action is needed."},
+		{name: "completed cleanup", phase: servitorv1alpha1.PhaseCleanupComplete, command: "done", response: "Cleanup is complete. Use @servitor create to start a new allocation."},
+		{name: "expired extension", phase: servitorv1alpha1.PhaseReady, command: "extend 1h", prepare: func(cluster *servitorv1alpha1.ServitorCluster) {
+			expired := metav1.NewTime(now)
+			cluster.Status.LeaseExpiresAt = &expired
+		}, response: "Your lease has expired. Cleanup will begin; use @servitor create after cleanup completes."},
+		{name: "ready extension", phase: servitorv1alpha1.PhaseReady, command: "extend 1h", mutated: true},
+		{name: "planning cleanup", phase: servitorv1alpha1.PhasePlanning, command: "done", response: "Cleaning up...", mutated: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			allocation := cluster(test.phase)
+			if test.prepare != nil {
+				test.prepare(allocation)
+			}
+			bot, responses := botForTest(t, allocation)
+			bot.Clock = func() time.Time { return now }
+			if err := bot.Handle(context.Background(), message(test.command)); err != nil {
+				t.Fatal(err)
+			}
+			if len(responses.responses) != 0 {
+				if len(responses.responses) != 1 || responses.responses[0].Text != test.response {
+					t.Fatalf("responses=%+v, want %q", responses.responses, test.response)
+				}
+			} else if test.response != "" {
+				t.Fatalf("responses=%+v, want %q", responses.responses, test.response)
+			}
+			stored := &servitorv1alpha1.ServitorCluster{}
+			if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: allocation.Name}, stored); err != nil {
+				t.Fatal(err)
+			}
+			if test.mutated != (stored.Spec.Lifecycle.CleanupRequested || stored.Spec.Lifecycle.RequestedExpiry != nil) {
+				t.Fatalf("intent=%+v, mutated=%t", stored.Spec.Lifecycle, test.mutated)
+			}
+		})
+	}
+
+	t.Run("no allocation", func(t *testing.T) {
+		bot, responses := botForTest(t)
+		if err := bot.Handle(context.Background(), message("done")); err != nil {
+			t.Fatal(err)
+		}
+		if len(responses.responses) != 1 || responses.responses[0].Text != "You have no allocation. Use @servitor create to start one." {
+			t.Fatalf("responses=%+v", responses.responses)
+		}
+	})
+}
+
+func TestLifecycleCommandsKeepForeignAndWrongThreadRequestsSilent(t *testing.T) {
+	expiry := metav1.NewTime(time.Date(2026, 9, 8, 1, 0, 0, 0, time.UTC))
+	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: ownerClusterName("U1"), Namespace: "servitor"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 3600}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseReady, LeaseExpiresAt: &expiry, LifecycleSnapshot: &servitorv1alpha1.LifecycleSnapshot{InitialLeaseSeconds: 3600}}}
+	bot, responses := botForTest(t, cluster)
+	for _, event := range []Envelope{
+		{ID: "foreign", Message: Message{Channel: "C1", ChannelType: "channel", User: "U2", Text: "extend nonsense", Timestamp: "100.000001", ThreadTimestamp: "root"}},
+		{ID: "wrong-thread", Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "done", Timestamp: "100.000002", ThreadTimestamp: "other"}},
+	} {
+		if err := bot.Handle(context.Background(), event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(responses.responses) != 0 {
+		t.Fatalf("responses=%+v", responses.responses)
+	}
+	stored := &servitorv1alpha1.ServitorCluster{}
+	if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: cluster.Name}, stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.Spec.Lifecycle.CleanupRequested || stored.Spec.Lifecycle.RequestedExpiry != nil {
+		t.Fatalf("foreign or wrong-thread request changed intent: %+v", stored.Spec.Lifecycle)
+	}
+}
+
+func TestExtensionFeedbackAfterPersistenceFailureAndConflict(t *testing.T) {
+	now := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
+	expiry := metav1.NewTime(now.Add(time.Hour))
+	cluster := func() *servitorv1alpha1.ServitorCluster {
+		return &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: ownerClusterName("U1"), Namespace: "servitor"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 3600}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseReady, LeaseExpiresAt: expiry.DeepCopy(), LifecycleSnapshot: &servitorv1alpha1.LifecycleSnapshot{InitialLeaseSeconds: 3600}}}
+	}
+	event := Envelope{ID: "extend", Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "<@BOT> extend 1h", Timestamp: "100.000001"}}
+	t.Run("persistence failure", func(t *testing.T) {
+		recorder := &progressRecorder{}
+		bot := progressBotForTest(t, recorder, false, true, cluster())
+		bot.Clock = func() time.Time { return now }
+		if err := bot.Handle(context.Background(), event); err != nil {
+			t.Fatal(err)
+		}
+		want := []string{"kubernetes update", "reply: Command rejected.\n\nUnable to record the lease extension."}
+		if !reflect.DeepEqual(recorder.events, want) {
+			t.Fatalf("events=%q, want %q", recorder.events, want)
+		}
+		stored := &servitorv1alpha1.ServitorCluster{}
+		if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: ownerClusterName("U1")}, stored); err != nil {
+			t.Fatal(err)
+		}
+		if stored.Spec.Lifecycle.RequestedExpiry != nil {
+			t.Fatalf("failed persistence recorded extension: %+v", stored.Spec.Lifecycle)
+		}
+	})
+	t.Run("conflict changes phase", func(t *testing.T) {
+		allocation := cluster()
+		scheme := runtime.NewScheme()
+		if err := corev1.AddToScheme(scheme); err != nil {
+			t.Fatal(err)
+		}
+		if err := servitorv1alpha1.AddToScheme(scheme); err != nil {
+			t.Fatal(err)
+		}
+		conflicted := false
+		kube := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(allocation).WithInterceptorFuncs(interceptor.Funcs{Update: func(ctx context.Context, underlying client.WithWatch, object client.Object, options ...client.UpdateOption) error {
+			if !conflicted {
+				conflicted = true
+				current := &servitorv1alpha1.ServitorCluster{}
+				if err := underlying.Get(ctx, types.NamespacedName{Namespace: "servitor", Name: allocation.Name}, current); err != nil {
+					return err
+				}
+				current.Status.Phase = servitorv1alpha1.PhaseCleanupPending
+				if err := underlying.Update(ctx, current); err != nil {
+					return err
+				}
+				return apierrors.NewConflict(schema.GroupResource{Group: "servitor.bevicted.github.io", Resource: "servitorclusters"}, current.Name, errors.New("lease expired"))
+			}
+			return underlying.Update(ctx, object, options...)
+		}}).Build()
+		responses := &memoryResponder{}
+		bot := Bot{ChannelID: "C1", SelfUserID: "BOT", Namespace: "servitor", Client: kube, Events: state.NewEventStore(kube, "servitor"), Responder: responses, Clock: func() time.Time { return now }}
+		if err := bot.Handle(context.Background(), event); err != nil {
+			t.Fatal(err)
+		}
+		if len(responses.responses) != 1 || responses.responses[0].Text != "Cleanup is in progress. The lease cannot be extended." {
+			t.Fatalf("responses=%+v", responses.responses)
+		}
+		stored := &servitorv1alpha1.ServitorCluster{}
+		if err := kube.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: allocation.Name}, stored); err != nil {
+			t.Fatal(err)
+		}
+		if stored.Spec.Lifecycle.RequestedExpiry != nil {
+			t.Fatalf("conflict retry recorded extension after cleanup won: %+v", stored.Spec.Lifecycle)
+		}
+	})
+}
 
 func containsText(text, part string) bool {
 	for i := 0; i+len(part) <= len(text); i++ {
