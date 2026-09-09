@@ -59,6 +59,36 @@ func TestBareValuesRequireOneExactRoleAndCurrentInventory(t *testing.T) {
 	}
 }
 
+func TestBareSatelliteProfileMatchesSelectedRegion(t *testing.T) {
+	catalog := matchCatalog
+	catalog.SatelliteProfile = []inventory.Profile{{Region: "us-south", Name: "south-profile"}, {Region: "us-east", Name: "east-profile"}}
+	for _, test := range []struct {
+		text    string
+		profile string
+		wantErr string
+	}{
+		{"create provider=satellite satellite-zone=us-south-1 south-profile", "south-profile", ""},
+		{"create provider=satellite satellite-zone=us-south-1 east-profile", "", "unknown shorthand"},
+	} {
+		t.Run(test.text, func(t *testing.T) {
+			options, err := ParseCreateOptions(test.text)
+			if err != nil {
+				t.Fatal(err)
+			}
+			matched, err := MatchBareCreateOptions(options, matchDefaults, catalog)
+			if test.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+					t.Fatalf("match error = %v, want %q", err, test.wantErr)
+				}
+				return
+			}
+			if err != nil || one(matched.Values(), "--satellite-host-profile") != test.profile {
+				t.Fatalf("matched = %#v, err = %v", matched.Values(), err)
+			}
+		})
+	}
+}
+
 func TestBareReservedAliasesRequireExplicitKey(t *testing.T) {
 	options, err := ParseCreateOptions("create roks")
 	if err != nil || one(options.values, "--version") != "default_openshift" || len(options.BareValues()) != 0 {

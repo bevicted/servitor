@@ -2,6 +2,7 @@ package command
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/bevicted/servitor/internal/inventory"
 )
@@ -74,6 +75,7 @@ func MatchBareCreateOptions(options ExplicitCreateOptions, defaults CreateDefaul
 	}
 
 	zone, datacenter := one(values, "--zone"), one(values, "--datacenter")
+	satelliteRegion := selectedSatelliteRegion(values["--satellite-zone"])
 	for _, value := range options.bare {
 		switch provider {
 		case "vpc-gen2":
@@ -97,7 +99,7 @@ func MatchBareCreateOptions(options ExplicitCreateOptions, defaults CreateDefaul
 	}
 
 	for _, value := range options.bare {
-		roles := matchingRoles(catalog, provider, zone, datacenter, value)
+		roles := matchingRoles(catalog, provider, zone, datacenter, satelliteRegion, value)
 		if len(roles) == 0 {
 			return ExplicitCreateOptions{}, fmt.Errorf("unknown shorthand value; use an explicit key such as resource-group=value")
 		}
@@ -113,7 +115,7 @@ func MatchBareCreateOptions(options ExplicitCreateOptions, defaults CreateDefaul
 	return ExplicitCreateOptions{values: values}, nil
 }
 
-func matchingRoles(catalog inventory.Catalog, provider, zone, datacenter, value string) []string {
+func matchingRoles(catalog inventory.Catalog, provider, zone, datacenter, satelliteRegion, value string) []string {
 	roles := make([]string, 0, 3)
 	for _, group := range catalog.ResourceGroups {
 		if group == value {
@@ -149,12 +151,28 @@ func matchingRoles(catalog inventory.Catalog, provider, zone, datacenter, value 
 		}
 	case "satellite":
 		for _, profile := range catalog.SatelliteProfile {
-			if profile.Name == value {
+			if profile.Region == satelliteRegion && profile.Name == value {
 				roles = append(roles, "--satellite-host-profile")
 			}
 		}
 	}
 	return roles
+}
+
+func selectedSatelliteRegion(zones []string) string {
+	region := ""
+	for _, zone := range zones {
+		index := strings.LastIndex(zone, "-")
+		if index <= 0 {
+			return ""
+		}
+		current := zone[:index]
+		if region != "" && region != current {
+			return ""
+		}
+		region = current
+	}
+	return region
 }
 
 func hasLocation(locations []inventory.Location, value string) bool {

@@ -47,11 +47,13 @@ type InventoryState struct {
 	Target                string                 `json:"target"`
 	Revision              string                 `json:"revision"`
 	ActiveRunID           string                 `json:"activeRunID,omitempty"`
+	RunAttempt            uint64                 `json:"runAttempt,omitempty"`
 	RunDeadlineAt         *metav1.Time           `json:"runDeadlineAt,omitempty"`
 	NextAttemptAt         *metav1.Time           `json:"nextAttemptAt,omitempty"`
 	PublishedAt           *metav1.Time           `json:"publishedAt,omitempty"`
 	Catalog               *inventory.Catalog     `json:"catalog,omitempty"`
 	Disposition           InventoryDisposition   `json:"disposition"`
+	Removed               bool                   `json:"removed,omitempty"`
 	ManualRefreshRequests []ManualRefreshRequest `json:"manualRefreshRequests,omitempty"`
 }
 
@@ -175,6 +177,24 @@ func (s *InventoryStore) RequestManualRefresh(ctx context.Context, target string
 	return state, alreadyRunning, duplicate, err
 }
 
+// FailManualRefreshRegistration completes a partially registered request so a
+// later target write cannot leave its requester waiting forever.
+func (s *InventoryStore) FailManualRefreshRegistration(ctx context.Context, target, id string, registeredTargets []string) error {
+	_, err := s.Update(ctx, target, func(current *InventoryState) error {
+		for index := range current.ManualRefreshRequests {
+			request := &current.ManualRefreshRequests[index]
+			if request.ID != id {
+				continue
+			}
+			request.Targets = append([]string(nil), registeredTargets...)
+			request.Outcome = ManualRefreshFailed
+			return nil
+		}
+		return errors.New("manual refresh request is missing")
+	})
+	return err
+}
+
 // BindManualRefreshes associates queued requests with the run the controller
 // selected through its ordinary per-target scheduling path.
 func BindManualRefreshes(state *InventoryState, runID string) {
@@ -195,6 +215,26 @@ func CompleteManualRefreshes(state *InventoryState, runID, outcome string) {
 			request.Outcome = outcome
 		}
 	}
+}
+
+// FailManualRefreshes resolves unfinished requests when their target is removed.
+func FailManualRefreshes(state *InventoryState) {
+	for index := range state.ManualRefreshRequests {
+		request := &state.ManualRefreshRequests[index]
+		if request.Outcome == "" {
+			request.Outcome = ManualRefreshFailed
+		}
+	}
+}
+
+// HasUndeliveredManualRefreshes reports whether a safe completion reply remains due.
+func HasUndeliveredManualRefreshes(state InventoryState) bool {
+	for _, request := range state.ManualRefreshRequests {
+		if request.DeliveredAt == nil {
+			return true
+		}
+	}
+	return false
 }
 
 // MarkManualRefreshDelivered records a completion reply that Slack accepted.
@@ -242,6 +282,29 @@ func (s *InventoryStore) List(ctx context.Context) ([]InventoryState, error) {
 func (s *InventoryStore) Delete(ctx context.Context, target string) error {
 	cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: s.Name(target), Namespace: s.Namespace}}
 	return client.IgnoreNotFound(s.Client.Delete(ctx, cm))
+}
+
+// DeleteRemovedIfDelivered cleans up removed-target state after all completion
+// replies persisted in it have reached Slack.
+func (s *InventoryStore) DeleteRemovedIfDelivered(ctx context.Context, target string) error {
+	if s.Client == nil || s.Namespace == "" || target == "" {
+		return errors.New("inventory state store is not configured")
+	}
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		key := types.NamespacedName{Namespace: s.Namespace, Name: s.Name(target)}
+		cm := &corev1.ConfigMap{}
+		if err := s.Client.Get(ctx, key, cm); err != nil {
+			return client.IgnoreNotFound(err)
+		}
+		current, err := decodeInventoryState(cm.Data[inventoryStateKey])
+		if err != nil || current.Target != target {
+			return errors.New("stored inventory state is invalid")
+		}
+		if !current.Removed || HasUndeliveredManualRefreshes(current) {
+			return nil
+		}
+		return client.IgnoreNotFound(s.Client.Delete(ctx, cm))
+	})
 }
 
 // Snapshot reports whether a target snapshot can safely drive inventory matching.

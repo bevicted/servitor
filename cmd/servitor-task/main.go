@@ -343,7 +343,7 @@ func validatePlanOptions(ctx context.Context, configPath, apiKey string, options
 			return options, &servitorv1alpha1.PlanRejection{ReasonCode: "option_not_available", OptionKey: "machine-type"}, nil
 		}
 	case "satellite":
-		if options.SatelliteHostProfile != "" && !hasSatelliteProfile(catalog.SatelliteProfile, options.SatelliteHostProfile) {
+		if options.SatelliteHostProfile != "" && !hasSatelliteProfile(catalog.SatelliteProfile, options.SatelliteZones, options.SatelliteHostProfile) {
 			return options, &servitorv1alpha1.PlanRejection{ReasonCode: "option_not_available", OptionKey: "satellite-host-profile"}, nil
 		}
 	}
@@ -404,13 +404,30 @@ func planLocation(locations []inventory.Location, selected string) (inventory.Lo
 	return inventory.Location{}, false
 }
 
-func hasSatelliteProfile(profiles []inventory.Profile, selected string) bool {
+func hasSatelliteProfile(profiles []inventory.Profile, zones []string, selected string) bool {
+	region := selectedSatelliteRegion(zones)
 	for _, profile := range profiles {
-		if profile.Name == selected {
+		if profile.Region == region && profile.Name == selected {
 			return true
 		}
 	}
 	return false
+}
+
+func selectedSatelliteRegion(zones []string) string {
+	region := ""
+	for _, zone := range zones {
+		index := strings.LastIndex(zone, "-")
+		if index <= 0 {
+			return ""
+		}
+		current := zone[:index]
+		if region != "" && region != current {
+			return ""
+		}
+		region = current
+	}
+	return region
 }
 
 func runApply(ctx context.Context, uid, operation string, options servitorv1alpha1.ResolvedOptions, backendFile, recoveryFile, resultFile, reportFile, ictPath, terraformPath string) error {

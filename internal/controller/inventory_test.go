@@ -25,6 +25,7 @@ import (
 	duckv1 "knative.dev/pkg/apis/duck/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
 type inventoryLogs struct{ data []byte }
@@ -78,7 +79,7 @@ func TestInventoryRefreshPublishesHourlyAndAdoptsPersistedRun(t *testing.T) {
 		t.Fatal(err)
 	}
 	second, err := store.Get(context.Background(), "target-a")
-	if err != nil || second.ActiveRunID == "" || second.ActiveRunID != firstRunID {
+	if err != nil || second.ActiveRunID == "" || second.ActiveRunID == firstRunID || second.RunAttempt != first.RunAttempt+1 {
 		t.Fatalf("hourly replacement = %+v, %v", second, err)
 	}
 	// A replacement leader observes the durable identity rather than creating another run.
@@ -101,6 +102,55 @@ func TestInventoryRefreshPublishesHourlyAndAdoptsPersistedRun(t *testing.T) {
 	catalog, disposition, err := store.Snapshot(context.Background(), "target-a", second.Revision, now, 24*time.Hour)
 	if err != nil || disposition != state.InventorySucceeded || catalog.ResourceGroups[0] != "Group Two" {
 		t.Fatalf("hourly snapshot = %+v, %s, %v", catalog, disposition, err)
+	}
+}
+
+func TestInventoryRefreshReplacesRunStillDeletingWithNewPersistedAttempt(t *testing.T) {
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	refresher, kube, logs := newInventoryHarness(t, &now, targetConfigYAML("vpc-gen2"))
+	withWatch, ok := kube.(client.WithWatch)
+	if !ok {
+		t.Fatal("inventory harness client does not support watches")
+	}
+	refresher.Client = interceptor.NewClient(withWatch, interceptor.Funcs{Delete: func(_ context.Context, _ client.WithWatch, object client.Object, _ ...client.DeleteOption) error {
+		if _, ok := object.(*tektonv1.PipelineRun); ok {
+			return nil
+		}
+		return kube.Delete(context.Background(), object)
+	}})
+
+	if _, err := refresher.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	store := state.NewInventoryStore(kube, "servitor")
+	first, err := store.Get(context.Background(), "target-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	completeInventoryRun(t, kube, first.ActiveRunID, "first-task")
+	logs.data = inventoryReportBytes(t, "target-a", first.ActiveRunID, first.Revision, "First Group")
+	if _, err := refresher.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	now = now.Add(time.Hour)
+	if _, err := refresher.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.Get(context.Background(), "target-a")
+	if err != nil || second.ActiveRunID == "" || second.ActiveRunID == first.ActiveRunID || second.RunAttempt != first.RunAttempt+1 {
+		t.Fatalf("replacement state = %+v, %v", second, err)
+	}
+	restarted := *refresher
+	if _, err := restarted.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var runs tektonv1.PipelineRunList
+	if err := kube.List(context.Background(), &runs, client.InNamespace("servitor"), client.MatchingLabels{pipeline.InventoryTargetLabel: "target-a"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(runs.Items) != 2 {
+		t.Fatalf("deletion race dispatched duplicate replacement runs: %+v", runs.Items)
 	}
 }
 
@@ -311,6 +361,52 @@ func TestInventoryRefreshRetainsLastGoodAndInvalidatesChangedTarget(t *testing.T
 	}
 	if _, err := store.Get(context.Background(), "target-a"); !apierrors.IsNotFound(err) {
 		t.Fatalf("removed target state remains: %v", err)
+	}
+}
+
+func TestInventoryTargetRemovalFailsActiveManualRefresh(t *testing.T) {
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	refresher, kube, _ := newInventoryHarness(t, &now, targetConfigYAML("vpc-gen2"))
+	if _, err := refresher.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	store := state.NewInventoryStore(kube, "servitor")
+	request := state.ManualRefreshRequest{ID: "removed-target", ChannelID: "D1", OwnerID: "U1", Targets: []string{"target-a"}}
+	if _, active, duplicate, err := store.RequestManualRefresh(context.Background(), "target-a", request); err != nil || !active || duplicate {
+		t.Fatalf("join active refresh = active:%t duplicate:%t err:%v", active, duplicate, err)
+	}
+	beforeRemoval, err := store.Get(context.Background(), "target-a")
+	if err != nil || beforeRemoval.ActiveRunID == "" {
+		t.Fatalf("active manual refresh state = %+v, %v", beforeRemoval, err)
+	}
+
+	config := &corev1.ConfigMap{}
+	if err := kube.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: "servitor-ict-config"}, config); err != nil {
+		t.Fatal(err)
+	}
+	config.Data["config.yaml"] = otherTargetConfigYAML()
+	if err := kube.Update(context.Background(), config); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := refresher.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	removed, err := store.Get(context.Background(), "target-a")
+	if err != nil || !removed.Removed || removed.ActiveRunID != "" || removed.Catalog != nil || removed.PublishedAt != nil || removed.NextAttemptAt != nil || len(removed.ManualRefreshRequests) != 1 || removed.ManualRefreshRequests[0].Outcome != state.ManualRefreshFailed {
+		t.Fatalf("removed target state = %+v, %v", removed, err)
+	}
+	if err := kube.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: beforeRemoval.ActiveRunID}, &tektonv1.PipelineRun{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("removed target run remains: %v", err)
+	}
+
+	restarted := *refresher
+	if _, err := restarted.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	afterRestart, err := store.Get(context.Background(), "target-a")
+	if err != nil || afterRestart.ActiveRunID != "" || afterRestart.Catalog != nil || len(afterRestart.ManualRefreshRequests) != 1 || afterRestart.ManualRefreshRequests[0].Outcome != state.ManualRefreshFailed {
+		t.Fatalf("restart changed removed target state = %+v, %v", afterRestart, err)
 	}
 }
 

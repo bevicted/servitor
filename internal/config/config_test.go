@@ -61,6 +61,14 @@ func TestValidateRejectsCloudDefaultVersionAliases(t *testing.T) {
 	}
 }
 
+func TestValidateRejectsMalformedNumericDefaultVersion(t *testing.T) {
+	configuration := validConfig()
+	configuration.Defaults.Version = "4.invalid"
+	if err := configuration.Validate(); err == nil {
+		t.Fatal("Validate accepted malformed numeric default version")
+	}
+}
+
 func TestLoadAppliesInventoryRefreshDefaults(t *testing.T) {
 	directory := t.TempDir()
 	path := filepath.Join(directory, "config.yaml")

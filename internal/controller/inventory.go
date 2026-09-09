@@ -69,10 +69,7 @@ func (r *InventoryReconciler) Sync(ctx context.Context) (ctrl.Result, error) {
 	}
 	for _, stored := range states {
 		if _, found := configured.Targets[stored.Target]; !found {
-			if err := r.deleteInventoryRun(ctx, stored.Target, stored.ActiveRunID); err != nil {
-				return ctrl.Result{}, err
-			}
-			if err := store.Delete(ctx, stored.Target); err != nil {
+			if err := r.removeInventoryTarget(ctx, store, stored.Target); err != nil {
 				return ctrl.Result{}, err
 			}
 		}
@@ -103,14 +100,46 @@ func (r *InventoryReconciler) Sync(ctx context.Context) (ctrl.Result, error) {
 	return ctrl.Result{RequeueAfter: wait}, nil
 }
 
+func (r *InventoryReconciler) removeInventoryTarget(ctx context.Context, store *state.InventoryStore, target string) error {
+	var activeRunID string
+	var pending bool
+	_, err := store.Update(ctx, target, func(current *state.InventoryState) error {
+		activeRunID = current.ActiveRunID
+		current.Revision = ""
+		current.ActiveRunID = ""
+		current.RunDeadlineAt = nil
+		current.NextAttemptAt = nil
+		current.PublishedAt = nil
+		current.Catalog = nil
+		current.Disposition = state.InventoryInvalidated
+		current.Removed = true
+		state.FailManualRefreshes(current)
+		pending = state.HasUndeliveredManualRefreshes(*current)
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if activeRunID != "" {
+		if err := r.deleteInventoryRun(ctx, target, activeRunID); err != nil {
+			return err
+		}
+	}
+	if pending {
+		return nil
+	}
+	return store.Delete(ctx, target)
+}
+
 func (r *InventoryReconciler) refreshTarget(ctx context.Context, store *state.InventoryStore, target, revision string, now time.Time) (*time.Time, error) {
 	var obsolete string
 	current, err := store.Update(ctx, target, func(current *state.InventoryState) error {
-		if current.Revision == revision {
+		if current.Revision == revision && !current.Removed {
 			return nil
 		}
 		obsolete = current.ActiveRunID
 		current.Revision = revision
+		current.Removed = false
 		current.ActiveRunID = ""
 		for index := range current.ManualRefreshRequests {
 			request := &current.ManualRefreshRequests[index]
@@ -140,7 +169,7 @@ func (r *InventoryReconciler) refreshTarget(ctx context.Context, store *state.In
 		return &current.NextAttemptAt.Time, nil
 	}
 
-	runID := pipeline.DeterministicInventoryRunName(target, revision)
+	var runID string
 	current, err = store.Update(ctx, target, func(current *state.InventoryState) error {
 		if current.Revision != revision {
 			return errStaleInventoryRun
@@ -148,6 +177,8 @@ func (r *InventoryReconciler) refreshTarget(ctx context.Context, store *state.In
 		if current.ActiveRunID != "" {
 			return nil
 		}
+		current.RunAttempt++
+		runID = pipeline.DeterministicInventoryRunName(target, revision, current.RunAttempt)
 		current.ActiveRunID = runID
 		state.BindManualRefreshes(current, runID)
 		current.RunDeadlineAt = ptrTime(now.Add(pipeline.InventoryRunTimeout))

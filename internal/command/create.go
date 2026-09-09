@@ -253,6 +253,9 @@ func InferPlatform(version string) (platform string, err error) {
 	if platform, ok := cloudDefaultPlatform(version); ok {
 		return platform, nil
 	}
+	if !numericVersion.MatchString(version) {
+		return "", fmt.Errorf("cannot infer platform from version %q", version)
+	}
 	if strings.HasPrefix(version, "4.") {
 		return "openshift", nil
 	}

@@ -134,6 +134,9 @@ func (n *InventoryRefreshNotifier) markDelivered(ctx context.Context, store *sta
 		if err := store.MarkManualRefreshDelivered(ctx, target, request.ID, n.now()); err != nil {
 			return err
 		}
+		if err := store.DeleteRemovedIfDelivered(ctx, target); err != nil {
+			return err
+		}
 	}
 	return nil
 }

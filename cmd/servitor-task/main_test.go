@@ -68,6 +68,55 @@ type planningSlackResponder struct{}
 
 func (planningSlackResponder) Reply(context.Context, slackbot.Response) error { return nil }
 
+func TestValidatePlanOptionsScopesSatelliteProfileToSelectedRegion(t *testing.T) {
+	var profileRequests []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/iam/identity/token":
+			_, _ = w.Write([]byte(`{"access_token":"synthetic-token"}`))
+		case "/iam/identity/userinfo":
+			_, _ = w.Write([]byte(`{"account_id":"account-1"}`))
+		case "/rm/v2/resource_groups":
+			_, _ = w.Write([]byte(`{"resources":[{"name":"Group","state":"ACTIVE"}]}`))
+		case "/containers/v1/versions":
+			_, _ = w.Write([]byte(`{"openshift":[{"major":4,"minor":22,"default":true}]}`))
+		case "/vpc/us-south/instance/profiles":
+			profileRequests = append(profileRequests, r.URL.Path)
+			_, _ = w.Write([]byte(`{"profiles":[{"name":"south-profile"}]}`))
+		case "/vpc/us-east/instance/profiles":
+			profileRequests = append(profileRequests, r.URL.Path)
+			_, _ = w.Write([]byte(`{"profiles":[{"name":"east-profile"}]}`))
+		default:
+			t.Fatalf("unexpected regional planning request: %s", r.URL.RequestURI())
+		}
+	}))
+	defer server.Close()
+
+	configPath := filepath.Join(t.TempDir(), "satellite-config.yaml")
+	config := `version: 1
+targets:
+  target:
+    providers: [satellite]
+    regions: [us-south, us-east]
+    endpoints:
+      IAM: ` + server.URL + `/iam
+      ResourceManagement: ` + server.URL + `/rm
+      ContainerService: ` + server.URL + `/containers
+      VPC: ` + server.URL + `/vpc/{region}
+`
+	if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	options := servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Target: "target", Provider: "satellite", Version: "4.22", SatelliteZones: []string{"us-south-1", "us-south-2", "us-south-3"}, SatelliteHostProfile: "east-profile"}}
+	_, rejection, err := validatePlanOptions(context.Background(), configPath, "synthetic-key", options)
+	if err != nil || rejection == nil || rejection.OptionKey != "satellite-host-profile" {
+		t.Fatalf("cross-region profile validation = %+v, err=%v", rejection, err)
+	}
+	if got, want := profileRequests, []string{"/vpc/us-south/instance/profiles", "/vpc/us-east/instance/profiles"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("regional profile trace = %v, want %v", got, want)
+	}
+}
+
 func TestKeyedCreateWithoutCatalogReachesFreshPlanningPreflight(t *testing.T) {
 	directory := t.TempDir()
 	planningConfig, apiKey := planningValidationFixture(t, directory)

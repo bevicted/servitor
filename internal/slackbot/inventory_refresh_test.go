@@ -8,7 +8,14 @@ import (
 
 	servitorv1alpha1 "github.com/bevicted/servitor/api/v1alpha1"
 	"github.com/bevicted/servitor/internal/state"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
 func TestMaintainerInventoryRefreshIsDMOnlyAndDoesNotAllocate(t *testing.T) {
@@ -141,6 +148,160 @@ func TestInventoryRefreshNotifierReportsPartialAndRetriesFailedDelivery(t *testi
 	}
 	if got := responses.responses; !reflect.DeepEqual(got, []Response{{Channel: "D1", Text: "Inventory refresh partially failed. The last successful inventory remains in use where available."}}) {
 		t.Fatalf("partial responses = %+v", got)
+	}
+}
+
+func TestMaintainerRefreshCompletesPartialRegistrationWithoutReplayDispatch(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	config := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "targets", Namespace: "servitor"}, Data: map[string]string{"config.yaml": "version: 1\ntargets:\n  target-a:\n    providers: [vpc-gen2]\n    endpoints:\n      IAM: https://iam.example.invalid\n      ResourceManagement: https://resource-manager.example.invalid\n      ContainerService: https://containers.example.invalid\n  target-b:\n    providers: [vpc-gen2]\n    endpoints:\n      IAM: https://iam.example.invalid\n      ResourceManagement: https://resource-manager.example.invalid\n      ContainerService: https://containers.example.invalid\n"}}
+	blockedName := state.NewInventoryStore(nil, "servitor").Name("target-b")
+	blocked := false
+	kube := fake.NewClientBuilder().WithScheme(scheme).WithObjects(config).WithInterceptorFuncs(interceptor.Funcs{Create: func(ctx context.Context, underlying client.WithWatch, object client.Object, options ...client.CreateOption) error {
+		if configMap, ok := object.(*corev1.ConfigMap); ok && configMap.Name == blockedName && !blocked {
+			blocked = true
+			return errors.New("injected target-b state write failure")
+		}
+		return underlying.Create(ctx, object, options...)
+	}}).Build()
+	responses := &memoryResponder{}
+	bot := Bot{Namespace: "servitor", Client: kube, Events: state.NewEventStore(kube, "servitor"), Responder: responses, InventoryConfigMap: "targets", InventoryConfigKey: "config.yaml", MaintainerIDs: []string{"U-maintainer"}}
+	event := Envelope{ID: "partial-write", Message: Message{Channel: "D1", ChannelType: "im", User: "U-maintainer", Text: "refresh inventory", Timestamp: "1"}}
+	if err := bot.Handle(context.Background(), event); err != nil {
+		t.Fatal(err)
+	}
+	if got := responses.responses; !reflect.DeepEqual(got, []Response{{Channel: "D1", Text: "Inventory refresh is unavailable. Try again later."}}) {
+		t.Fatalf("partial registration response = %+v", got)
+	}
+	store := state.NewInventoryStore(kube, "servitor")
+	registered, err := store.Get(context.Background(), "target-a")
+	if err != nil || len(registered.ManualRefreshRequests) != 1 || !reflect.DeepEqual(registered.ManualRefreshRequests[0].Targets, []string{"target-a"}) || registered.ManualRefreshRequests[0].Outcome != state.ManualRefreshFailed {
+		t.Fatalf("partial registration state = %+v, %v", registered, err)
+	}
+	if _, err := store.Get(context.Background(), "target-b"); !apierrors.IsNotFound(err) {
+		t.Fatalf("failed target retained incomplete request: %v", err)
+	}
+	if err := bot.Handle(context.Background(), event); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(responses.responses); got != 1 {
+		t.Fatalf("replay registered another request: %+v", responses.responses)
+	}
+
+	notifier := &InventoryRefreshNotifier{Client: kube, Namespace: "servitor", Responder: responses, Receipts: state.NewEventStore(kube, "servitor")}
+	if err := notifier.notify(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := responses.responses; !reflect.DeepEqual(got, []Response{{Channel: "D1", Text: "Inventory refresh is unavailable. Try again later."}, {Channel: "D1", Text: "Inventory refresh failed. The last successful inventory remains in use where available."}}) {
+		t.Fatalf("partial registration completion = %+v", got)
+	}
+	delivered, err := store.Get(context.Background(), "target-a")
+	if err != nil || delivered.ManualRefreshRequests[0].DeliveredAt == nil {
+		t.Fatalf("partial registration delivery = %+v, %v", delivered, err)
+	}
+	restarted := *notifier
+	if err := restarted.notify(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(responses.responses); got != 2 {
+		t.Fatalf("restart duplicated partial-registration completion: %+v", responses.responses)
+	}
+}
+
+func TestMaintainerRefreshCrashReplayRegistersMissingTargets(t *testing.T) {
+	bot, responses := botWithPublishedInventory(t, false)
+	bot.MaintainerIDs = []string{"U-maintainer"}
+	config := &corev1.ConfigMap{}
+	if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: bot.Namespace, Name: bot.InventoryConfigMap}, config); err != nil {
+		t.Fatal(err)
+	}
+	config.Data[bot.InventoryConfigKey] += "  target-b:\n    providers: [vpc-gen2]\n    endpoints:\n      IAM: https://iam.example.invalid\n      ResourceManagement: https://resource-manager.example.invalid\n      ContainerService: https://containers.example.invalid\n"
+	if err := bot.Client.Update(context.Background(), config); err != nil {
+		t.Fatal(err)
+	}
+
+	request := state.ManualRefreshRequest{ID: "crash-after-target-a", ChannelID: "D1", OwnerID: "U-maintainer", Targets: []string{"target-a", "target-b"}}
+	store := state.NewInventoryStore(bot.Client, bot.Namespace)
+	if _, active, duplicate, err := store.RequestManualRefresh(context.Background(), "target-a", request); err != nil || active || duplicate {
+		t.Fatalf("persisted pre-crash target = active:%t duplicate:%t err:%v", active, duplicate, err)
+	}
+
+	restarted := bot
+	event := Envelope{ID: request.ID, Message: Message{Channel: "D1", ChannelType: "im", User: "U-maintainer", Text: "refresh inventory", Timestamp: "1"}}
+	if err := restarted.Handle(context.Background(), event); err != nil {
+		t.Fatal(err)
+	}
+	if got := responses.responses; !reflect.DeepEqual(got, []Response{{Channel: "D1", Text: "Inventory refresh already running."}}) {
+		t.Fatalf("crash replay response = %+v", got)
+	}
+	for _, target := range request.Targets {
+		current, err := store.Get(context.Background(), target)
+		if err != nil || len(current.ManualRefreshRequests) != 1 || !reflect.DeepEqual(current.ManualRefreshRequests[0].Targets, request.Targets) {
+			t.Fatalf("crash replay target %s = %+v, %v", target, current, err)
+		}
+		if _, err := store.Update(context.Background(), target, func(current *state.InventoryState) error {
+			current.ManualRefreshRequests[0].Outcome = state.ManualRefreshSucceeded
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	notifier := &InventoryRefreshNotifier{Client: bot.Client, Namespace: bot.Namespace, Responder: responses, Receipts: state.NewEventStore(bot.Client, bot.Namespace)}
+	if err := notifier.notify(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := responses.responses; !reflect.DeepEqual(got, []Response{{Channel: "D1", Text: "Inventory refresh already running."}, {Channel: "D1", Text: "Inventory refresh complete."}}) {
+		t.Fatalf("crash replay completion = %+v", got)
+	}
+}
+
+func TestRemovedTargetRefreshRedeliversAfterRestartAndCleansUp(t *testing.T) {
+	bot, responses := botWithPublishedInventory(t, false)
+	store := state.NewInventoryStore(bot.Client, bot.Namespace)
+	request := state.ManualRefreshRequest{ID: "removed", ChannelID: "D1", OwnerID: "U-maintainer", Targets: []string{"target-a"}, RunID: "inventory-run", Outcome: state.ManualRefreshFailed}
+	if _, err := store.Update(context.Background(), "target-a", func(current *state.InventoryState) error {
+		current.Revision = ""
+		current.ActiveRunID = ""
+		current.RunDeadlineAt = nil
+		current.NextAttemptAt = nil
+		current.PublishedAt = nil
+		current.Catalog = nil
+		current.Disposition = state.InventoryInvalidated
+		current.Removed = true
+		current.ManualRefreshRequests = []state.ManualRefreshRequest{request}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	responses.err = errors.New("Slack unavailable")
+	notifier := &InventoryRefreshNotifier{Client: bot.Client, Namespace: bot.Namespace, Responder: responses, Receipts: state.NewEventStore(bot.Client, bot.Namespace)}
+	if err := notifier.notify(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := store.Get(context.Background(), "target-a")
+	if err != nil || pending.Catalog != nil || !pending.Removed || pending.ManualRefreshRequests[0].DeliveredAt != nil {
+		t.Fatalf("failed delivery retained unsafe state = %+v, %v", pending, err)
+	}
+
+	responses.err = nil
+	restarted := *notifier
+	if err := restarted.notify(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := responses.responses; !reflect.DeepEqual(got, []Response{{Channel: "D1", Text: "Inventory refresh failed. The last successful inventory remains in use where available."}}) {
+		t.Fatalf("redelivered removal response = %+v", got)
+	}
+	if _, err := store.Get(context.Background(), "target-a"); !apierrors.IsNotFound(err) {
+		t.Fatalf("delivered removed target state remains: %v", err)
+	}
+	if err := restarted.notify(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(responses.responses); got != 1 {
+		t.Fatalf("restart duplicated completion: %+v", responses.responses)
 	}
 }
 

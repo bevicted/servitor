@@ -48,6 +48,36 @@ func TestInventoryReportRejectsWrongIdentityExtraDataAndOversize(t *testing.T) {
 	}
 }
 
+func TestInventoryTargetIdentityBoundary(t *testing.T) {
+	target := strings.Repeat("a", 63)
+	run, err := NewInventoryRun("ns", "registry.example.invalid/task@sha256:deadbeef", target, "inventory-a", "revision-a", testTaskConfig)
+	if err != nil || run.Labels[InventoryTargetLabel] != target {
+		t.Fatalf("valid target run = %#v, %v", run, err)
+	}
+	data, err := json.Marshal(InventoryReport{Version: 1, Target: target, RunID: "inventory-a", Revision: "revision-a", Catalog: inventory.Catalog{Version: inventory.CatalogVersion, Target: target, Providers: []string{"vpc-gen2"}, Versions: []inventory.Version{{Name: "4.22_openshift", Platform: "openshift", Default: true, Supported: true}}, ResourceGroups: []string{"Default"}, VPCLocations: []inventory.Location{{Name: "us-south-1", Flavors: []string{"bx2.4x16"}}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DecodeInventoryReport(data, target, "inventory-a", "revision-a"); err != nil {
+		t.Fatalf("valid target report: %v", err)
+	}
+	for _, invalid := range []string{"Target", "target_name", strings.Repeat("a", 64), "-target", "target-"} {
+		if _, err := NewInventoryRun("ns", "registry.example.invalid/task@sha256:deadbeef", invalid, "inventory-a", "revision-a", testTaskConfig); err == nil {
+			t.Fatalf("accepted invalid target identity %q", invalid)
+		}
+	}
+}
+
+func TestDeterministicInventoryRunNameIncludesPersistedAttempt(t *testing.T) {
+	first := DeterministicInventoryRunName("target-a", "revision-a", 1)
+	if again := DeterministicInventoryRunName("target-a", "revision-a", 1); again != first {
+		t.Fatalf("attempt identity is not deterministic: %q != %q", again, first)
+	}
+	if second := DeterministicInventoryRunName("target-a", "revision-a", 2); second == first {
+		t.Fatalf("attempt identity reused terminal run name %q", second)
+	}
+}
+
 func TestNewInventoryRunIsIndependentAndCredentialIsolated(t *testing.T) {
 	run, err := NewInventoryRun("ns", "registry.example.invalid/task@sha256:deadbeef", "target-a", "inventory-a", "revision-a", testTaskConfig)
 	if err != nil {

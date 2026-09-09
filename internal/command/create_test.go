@@ -203,6 +203,18 @@ func TestParseCreateAppliesAndOverridesConfiguredDefaults(t *testing.T) {
 	}
 }
 
+func TestParseCreateRejectsMalformedConfiguredDefaultVersion(t *testing.T) {
+	defaults := testCreateDefaults
+	defaults.Version = "4.invalid"
+	request, err := ParseCreate("create", defaults)
+	if err == nil {
+		t.Fatal("ParseCreate accepted malformed configured default version")
+	}
+	if request.Version != "" || request.Platform != "" || len(request.Args) != 0 {
+		t.Fatalf("request = %+v, want empty request on error", request)
+	}
+}
+
 func TestParseCreateExposesNormalizedPresentationFields(t *testing.T) {
 	request, err := ParseCreate("create --version 1.36 --worker-count 2 --subnet-id subnet --public-gateway-id gateway", testCreateDefaults)
 	if err != nil {

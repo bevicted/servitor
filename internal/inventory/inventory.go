@@ -85,7 +85,7 @@ func LoadConfig(data []byte) (Config, error) {
 		return Config{}, errors.New("inventory configuration is incomplete")
 	}
 	for name, target := range config.Targets {
-		if !safeName(name) || target.validate() != nil {
+		if !safeTargetIdentity(name) || target.validate() != nil {
 			return Config{}, errors.New("inventory configuration is incomplete")
 		}
 	}
@@ -118,20 +118,40 @@ func (t TargetConfig) validate() error {
 			return err
 		}
 	}
-	if seen["satellite"] && (len(t.Regions) == 0 || validBase(t.Endpoints["VPC"]) != nil) {
+	if seen["satellite"] && len(t.Regions) == 0 {
 		return errors.New("satellite target is incomplete")
 	}
+	regions := map[string]bool{}
 	for _, region := range t.Regions {
-		if !safeName(region) {
+		if !safeName(region) || regions[region] {
 			return errors.New("invalid region")
+		}
+		regions[region] = true
+		if seen["satellite"] {
+			if _, err := t.regionalVPCBase(region); err != nil {
+				return errors.New("satellite target is incomplete")
+			}
 		}
 	}
 	return nil
 }
 
+func (t TargetConfig) regionalVPCBase(region string) (string, error) {
+	base := t.Endpoints["VPC"]
+	if strings.Contains(base, "{region}") {
+		base = strings.ReplaceAll(base, "{region}", region)
+	} else if len(t.Regions) != 1 {
+		return "", errors.New("regional VPC endpoint is incomplete")
+	}
+	if err := validBase(base); err != nil {
+		return "", err
+	}
+	return base, nil
+}
+
 func validBase(value string) error {
 	base, err := url.Parse(value)
-	if err != nil || base.Scheme == "" || base.Host == "" || base.User != nil || base.RawQuery != "" || base.Fragment != "" || strings.TrimSpace(value) != value {
+	if err != nil || base.Scheme == "" || base.Host == "" || base.User != nil || base.RawQuery != "" || base.Fragment != "" || strings.TrimSpace(value) != value || strings.ContainsAny(value, "{}") {
 		return errors.New("invalid endpoint")
 	}
 	return nil
@@ -382,6 +402,10 @@ func (d discovery) classicLocations(ctx context.Context, token string) ([]Locati
 func (d discovery) satelliteProfiles(ctx context.Context, token string) ([]Profile, error) {
 	profiles := []Profile{}
 	for _, region := range d.target.Regions {
+		base, err := d.target.regionalVPCBase(region)
+		if err != nil {
+			return nil, errors.New("Satellite host profile discovery failed")
+		}
 		values := url.Values{"version": {vpcAPIVersion}, "generation": {"2"}}
 		for {
 			var response struct {
@@ -392,7 +416,7 @@ func (d discovery) satelliteProfiles(ctx context.Context, token string) ([]Profi
 					Href string `json:"href"`
 				} `json:"next"`
 			}
-			if err := d.request(ctx, "VPC", http.MethodGet, "instance/profiles?"+values.Encode(), nil, token, &response); err != nil {
+			if err := d.requestBase(ctx, base, http.MethodGet, "instance/profiles?"+values.Encode(), nil, token, &response); err != nil {
 				return nil, errors.New("Satellite host profile discovery failed")
 			}
 			for _, profile := range response.Profiles {
@@ -424,7 +448,11 @@ func (d discovery) satelliteProfiles(ctx context.Context, token string) ([]Profi
 }
 
 func (d discovery) request(ctx context.Context, service, method, relative string, form url.Values, token string, output any) error {
-	base, err := url.Parse(d.target.Endpoints[service])
+	return d.requestBase(ctx, d.target.Endpoints[service], method, relative, form, token, output)
+}
+
+func (d discovery) requestBase(ctx context.Context, baseValue, method, relative string, form url.Values, token string, output any) error {
+	base, err := url.Parse(baseValue)
 	if err != nil {
 		return errors.New("invalid configured service endpoint")
 	}
@@ -450,7 +478,11 @@ func (d discovery) request(ctx context.Context, service, method, relative string
 	if token != "" {
 		request.Header.Set("Authorization", "Bearer "+token)
 	}
-	response, err := d.client.Do(request)
+	client := *d.client
+	client.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	response, err := client.Do(request)
 	if err != nil {
 		return errors.New("inventory request failed")
 	}
@@ -525,6 +557,20 @@ func safeName(value string) bool {
 	}
 	for _, char := range value {
 		if !(char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z' || char >= '0' && char <= '9' || char == '-' || char == '_') {
+			return false
+		}
+	}
+	return true
+}
+
+// safeTargetIdentity matches the target form used as a Kubernetes label and
+// PipelineRun/report identity.
+func safeTargetIdentity(value string) bool {
+	if len(value) == 0 || len(value) > 63 {
+		return false
+	}
+	for index, char := range value {
+		if !(char >= 'a' && char <= 'z' || char >= '0' && char <= '9' || char == '-') || (char == '-' && (index == 0 || index == len(value)-1)) {
 			return false
 		}
 	}

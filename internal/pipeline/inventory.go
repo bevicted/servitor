@@ -74,7 +74,7 @@ func ReadInventoryReport(ctx context.Context, reader LogReader, namespace, podNa
 	if err != nil {
 		return InventoryReport{}, fmt.Errorf("%w: inventory report", errReadReportLog)
 	}
-	defer stream.Close()
+	defer func() { _ = stream.Close() }()
 	data, err := io.ReadAll(io.LimitReader(stream, MaxInventoryReportBytes+1))
 	if err != nil {
 		return InventoryReport{}, fmt.Errorf("%w: inventory report", errReadReportLog)
@@ -83,8 +83,10 @@ func ReadInventoryReport(ctx context.Context, reader LogReader, namespace, podNa
 }
 
 // DeterministicInventoryRunName creates an inventory identity distinct from allocation operation names.
-func DeterministicInventoryRunName(target, revision string) string {
-	digest := sha256.Sum256([]byte(target + "\x00" + revision))
+// Attempt is persisted by the controller, so the identity remains stable across
+// restart while never colliding with a terminal run still being deleted.
+func DeterministicInventoryRunName(target, revision string, attempt uint64) string {
+	digest := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%s\x00%d", target, revision, attempt)))
 	return "servitor-inventory-" + hex.EncodeToString(digest[:])[:16]
 }
 
@@ -152,8 +154,8 @@ func safeInventoryID(value string) bool {
 	if len(value) == 0 || len(value) > 63 {
 		return false
 	}
-	for _, char := range value {
-		if !(char >= 'a' && char <= 'z' || char >= '0' && char <= '9' || char == '-') {
+	for index, char := range value {
+		if !(char >= 'a' && char <= 'z' || char >= '0' && char <= '9' || char == '-') || (char == '-' && (index == 0 || index == len(value)-1)) {
 			return false
 		}
 	}

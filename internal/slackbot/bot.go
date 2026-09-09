@@ -210,14 +210,26 @@ func (b Bot) requestInventoryRefresh(ctx context.Context, message Message, event
 	}
 	request := state.ManualRefreshRequest{ID: requestID, ChannelID: message.Channel, OwnerID: message.User, Targets: targets}
 	store := state.NewInventoryStore(b.Client, b.Namespace)
+	registered := make([]string, 0, len(targets))
 	alreadyRunning := false
 	for _, target := range targets {
-		_, active, duplicate, err := store.RequestManualRefresh(ctx, target, request)
+		_, active, _, err := store.RequestManualRefresh(ctx, target, request)
 		if err != nil {
+			for _, registeredTarget := range registered {
+				if failureErr := store.FailManualRefreshRegistration(ctx, registeredTarget, request.ID, registered); failureErr != nil {
+					respond("Inventory refresh is unavailable. Try again later.")
+					return
+				}
+			}
 			respond("Inventory refresh is unavailable. Try again later.")
 			return
 		}
-		alreadyRunning = alreadyRunning || active || duplicate
+		// A process can stop after registering an earlier target and before
+		// registering this one. Continue past duplicate registrations so a
+		// redelivery completes the same durable request without dispatching it
+		// twice.
+		registered = append(registered, target)
+		alreadyRunning = alreadyRunning || active
 	}
 	if alreadyRunning {
 		respond("Inventory refresh already running.")

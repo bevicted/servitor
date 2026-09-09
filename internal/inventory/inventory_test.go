@@ -106,6 +106,93 @@ func TestSatelliteProfilesStopWhenFinalPageOmitsNext(t *testing.T) {
 	}
 }
 
+func TestSatelliteProfilesUseConfiguredRegionalBases(t *testing.T) {
+	var requests []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("version") != vpcAPIVersion || r.URL.Query().Get("generation") != "2" {
+			t.Fatalf("VPC profile request = %s", r.URL.RequestURI())
+		}
+		requests = append(requests, r.URL.RequestURI())
+		switch r.URL.Path {
+		case "/vpc/us-south/instance/profiles":
+			_, _ = w.Write([]byte(`{"profiles":[{"name":"south-profile"}]}`))
+		case "/vpc/us-east/instance/profiles":
+			_, _ = w.Write([]byte(`{"profiles":[{"name":"east-profile"}]}`))
+		default:
+			t.Fatalf("unexpected regional VPC request: %s", r.URL.RequestURI())
+		}
+	}))
+	defer server.Close()
+
+	target := TargetConfig{Providers: []string{"satellite"}, Regions: []string{"us-south", "us-east"}, Endpoints: map[string]string{"IAM": server.URL + "/iam", "ResourceManagement": server.URL + "/rm", "ContainerService": server.URL + "/containers", "VPC": server.URL + "/vpc/{region}"}}
+	if err := target.validate(); err != nil {
+		t.Fatalf("regional VPC template was rejected: %v", err)
+	}
+	profiles, err := (discovery{client: server.Client(), target: target}).satelliteProfiles(context.Background(), "synthetic-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := requests, []string{"/vpc/us-south/instance/profiles?generation=2&version=2026-08-04", "/vpc/us-east/instance/profiles?generation=2&version=2026-08-04"}; strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("regional VPC trace = %v, want %v", got, want)
+	}
+	if got, want := profiles, []Profile{{Region: "us-east", Name: "east-profile"}, {Region: "us-south", Name: "south-profile"}}; len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("regional profiles = %+v, want %+v", got, want)
+	}
+}
+
+func TestAuthenticationRedirectsFailWithoutFollowingAPIKey(t *testing.T) {
+	for _, status := range []int{http.StatusTemporaryRedirect, http.StatusPermanentRedirect} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			redirectTarget := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+				t.Error("redirect target received IAM credentials")
+			}))
+			defer redirectTarget.Close()
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPost || r.URL.Path != "/iam/private/identity/token" {
+					t.Fatalf("IAM request = %s %s", r.Method, r.URL.RequestURI())
+				}
+				body, _ := io.ReadAll(r.Body)
+				if !strings.Contains(string(body), "apikey=synthetic-key") {
+					t.Fatalf("IAM form = %q", body)
+				}
+				w.Header().Set("Location", redirectTarget.URL+"/identity/token")
+				w.WriteHeader(status)
+			}))
+			defer server.Close()
+
+			_, err := Discover(context.Background(), Config{Version: CatalogVersion, Targets: map[string]TargetConfig{"target-a": {Providers: []string{"vpc-gen2"}, Endpoints: map[string]string{"IAM": server.URL + "/iam/private", "ResourceManagement": server.URL + "/rm", "ContainerService": server.URL + "/containers"}}}}, "target-a", "synthetic-key", server.Client())
+			if err == nil || err.Error() != "inventory authentication failed" {
+				t.Fatalf("authentication redirect error = %v", err)
+			}
+		})
+	}
+}
+
+func TestServiceRedirectsFailWithoutFollowingBearerToken(t *testing.T) {
+	for _, status := range []int{http.StatusTemporaryRedirect, http.StatusPermanentRedirect} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			redirectTarget := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+				t.Error("redirect target received service credentials")
+			}))
+			defer redirectTarget.Close()
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/service/private/catalog" || r.Header.Get("Authorization") != "Bearer synthetic-token" {
+					t.Fatalf("service request = %s with authorization %q", r.URL.RequestURI(), r.Header.Get("Authorization"))
+				}
+				w.Header().Set("Location", redirectTarget.URL+"/catalog")
+				w.WriteHeader(status)
+			}))
+			defer server.Close()
+
+			var output struct{}
+			err := (discovery{client: server.Client()}).requestBase(context.Background(), server.URL+"/service/private", http.MethodGet, "catalog", nil, "synthetic-token", &output)
+			if err == nil || err.Error() != "inventory service request failed" {
+				t.Fatalf("service redirect error = %v", err)
+			}
+		})
+	}
+}
+
 func TestDiscoverFailsClosedForMalformedAndOversizedResponses(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -124,6 +211,21 @@ func TestDiscoverFailsClosedForMalformedAndOversizedResponses(t *testing.T) {
 	_, err := Discover(context.Background(), config, "target-a", "synthetic-key", server.Client())
 	if err == nil || strings.Contains(err.Error(), "secret-token") || strings.Contains(err.Error(), server.URL) {
 		t.Fatalf("unsafe oversized response error: %v", err)
+	}
+}
+
+func TestLoadConfigEnforcesPipelineTargetIdentity(t *testing.T) {
+	configFor := func(target string) []byte {
+		return []byte("version: 1\ntargets:\n  \"" + target + "\":\n    providers: [vpc-gen2]\n    endpoints: {IAM: https://iam.example.invalid, ResourceManagement: https://rm.example.invalid, ContainerService: https://containers.example.invalid}\n")
+	}
+	valid := strings.Repeat("a", 63)
+	if _, err := LoadConfig(configFor(valid)); err != nil {
+		t.Fatalf("rejected valid target identity: %v", err)
+	}
+	for _, target := range []string{"Target", "target_name", strings.Repeat("a", 64), "-target", "target-"} {
+		if _, err := LoadConfig(configFor(target)); err == nil {
+			t.Fatalf("accepted target identity %q that cannot label an inventory PipelineRun", target)
+		}
 	}
 }
 
