@@ -1,13 +1,19 @@
 package v1alpha1
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v3"
+	apiextensions "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	structuralschema "k8s.io/apiextensions-apiserver/pkg/apiserver/schema"
+	"k8s.io/apiextensions-apiserver/pkg/apiserver/schema/pruning"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 )
 
 func TestServitorClusterSpecRequiresWholeHourInitialLease(t *testing.T) {
@@ -95,6 +101,74 @@ func yamlMap(t *testing.T, value any) map[string]any {
 		t.Fatalf("YAML value = %#v, want mapping", value)
 	}
 	return mapping
+}
+
+func TestCRDPrunesRemovedNameAndStrictTypedValidationRejectsIt(t *testing.T) {
+	contents, err := os.ReadFile(filepath.Join("..", "..", "config", "crd", "bases", "servitor.bevicted.github.io_servitorclusters.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]any
+	if err := yaml.Unmarshal(contents, &document); err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var crd apiextensionsv1.CustomResourceDefinition
+	if err := json.Unmarshal(encoded, &crd); err != nil {
+		t.Fatal(err)
+	}
+	var schemaProps apiextensions.JSONSchemaProps
+	if err := apiextensionsv1.Convert_v1_JSONSchemaProps_To_apiextensions_JSONSchemaProps(crd.Spec.Versions[0].Schema.OpenAPIV3Schema, &schemaProps, nil); err != nil {
+		t.Fatal(err)
+	}
+	structural, err := structuralschema.NewStructural(&schemaProps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	object := map[string]any{
+		"apiVersion": "servitor.bevicted.github.io/v1alpha1", "kind": "ServitorCluster",
+		"metadata": map[string]any{"name": "example"},
+		"spec": map[string]any{
+			"slack":       map[string]any{"ownerID": "U1", "channelID": "C1", "threadTimestamp": "1.2"},
+			"userOptions": map[string]any{"name": "caller-selected"},
+			"lifecycle":   map[string]any{"initialLeaseSeconds": int64(3600), "retrySeconds": []any{int64(60)}},
+		},
+	}
+	var strict ServitorCluster
+	if err := k8sruntime.DefaultUnstructuredConverter.FromUnstructuredWithValidation(object, &strict, true); err == nil || !strings.Contains(err.Error(), `unknown field "spec.userOptions.name"`) {
+		t.Fatalf("strict direct CR conversion = %v, want removed name field error", err)
+	}
+	unknown := pruning.PruneWithOptions(object, structural, true, structuralschema.UnknownFieldPathOptions{TrackUnknownFieldPaths: true})
+	if !strings.Contains(strings.Join(unknown, ","), "spec.userOptions.name") {
+		t.Fatalf("structural pruning did not report userOptions.name: %v", unknown)
+	}
+	if _, found := object["spec"].(map[string]any)["userOptions"].(map[string]any)["name"]; found {
+		t.Fatal("pruned user name remained in the object")
+	}
+	if err := k8sruntime.DefaultUnstructuredConverter.FromUnstructuredWithValidation(object, &strict, true); err != nil {
+		t.Fatalf("pruned CR did not decode: %v", err)
+	}
+}
+
+func TestExistingResolvedNameAndRecoveryContextRoundTrip(t *testing.T) {
+	cluster := ServitorCluster{Status: ServitorClusterStatus{
+		ResolvedOptions: &ResolvedOptions{ClusterName: "servitor-existing"},
+		Recovery:        &RecoveryMetadata{Values: RecoveryValues{ClusterName: "servitor-existing"}},
+	}}
+	data, err := json.Marshal(cluster)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded ServitorCluster
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Status.ResolvedOptions.ClusterName != "servitor-existing" || decoded.Status.Recovery.Values.ClusterName != "servitor-existing" {
+		t.Fatalf("serialized cleanup identity changed: %+v", decoded.Status)
+	}
 }
 
 func yamlList(t *testing.T, value any) []any {

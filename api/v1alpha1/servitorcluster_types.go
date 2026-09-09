@@ -56,7 +56,6 @@ type UserOptions struct {
 	SatelliteSSHKeyID              string   `json:"satelliteSSHKeyID,omitempty"`
 	SatelliteWorkerInstanceIDs     []string `json:"satelliteWorkerInstanceIDs,omitempty"`
 	SatelliteWorkerOperatingSystem string   `json:"satelliteWorkerOperatingSystem,omitempty"`
-	Name                           string   `json:"name,omitempty"`
 	WorkerCount                    int      `json:"workerCount,omitempty"`
 }
 

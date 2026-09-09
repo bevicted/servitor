@@ -67,6 +67,20 @@ func TestCreateAcknowledgesBeforeCreatingOneDeterministicCluster(t *testing.T) {
 		t.Fatalf("clusters=%d", len(clusters.Items))
 	}
 }
+func TestCreateRejectsCallerSelectedName(t *testing.T) {
+	bot, responses := botForTest(t)
+	if err := bot.Handle(context.Background(), Envelope{ID: "Ev-name", Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "<@BOT> create --version 4.22 --name caller-selected", Timestamp: "123"}}); err != nil {
+		t.Fatal(err)
+	}
+	if len(responses.responses) != 1 || !containsText(responses.responses[0].Text, `unknown create flag "--name"`) {
+		t.Fatalf("responses=%+v", responses.responses)
+	}
+	cluster := &servitorv1alpha1.ServitorCluster{}
+	if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: ownerClusterName("U1")}, cluster); err == nil {
+		t.Fatal("Slack create with name recorded an allocation")
+	}
+}
+
 func TestCreateDoesNotProceedWhenAcceptanceDeliveryFails(t *testing.T) {
 	bot, responses := botForTest(t)
 	event := Envelope{ID: "Ev1", Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "<@BOT> create --version 4.22", Timestamp: "123"}}

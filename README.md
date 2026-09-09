@@ -54,7 +54,7 @@ Lifecycle thread
   extend [N[h]]
 ```
 
-`create` writes explicit safe flags to `spec.userOptions`; the controller overlays startup defaults and records the resolved result. Only the owner in the initiating thread can approve, reject, extend, or request cleanup. `destroy` remains a silent alias for `done`.
+`create` writes explicit safe flags to `spec.userOptions`; the controller overlays startup defaults and records the resolved result. Cluster names are generated internally, so `--name` is not a supported create flag. Only the owner in the initiating thread can approve, reject, extend, or request cleanup. `destroy` remains a silent alias for `done`.
 
 There are no maintainer `status`, `pause`, `unpause`, or `stop` commands, and no replacement command for them. Slack delivery is not exactly once: a controller crash after posting and before recording the receipt can duplicate a notification.
 

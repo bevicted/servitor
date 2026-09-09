@@ -88,6 +88,10 @@ func TestNewApplyRunUsesFrozenPlanningInputs(t *testing.T) {
 	if params["operation-kind"] != "apply" || params["execution-image"] != cluster.Status.ExecutionImage || params["resolved-options"] == "" || params["recovery"] == "" || params["backend"] == "" {
 		t.Fatalf("apply did not use frozen inputs: %#v", params)
 	}
+	var options servitorv1alpha1.ResolvedOptions
+	if err := json.Unmarshal([]byte(params["resolved-options"]), &options); err != nil || options.ClusterName != cluster.Status.ResolvedOptions.ClusterName {
+		t.Fatalf("apply resolved options = %+v, err=%v", options, err)
+	}
 }
 
 func TestNewDestroyRunUsesFrozenContextAndHasNoOwner(t *testing.T) {

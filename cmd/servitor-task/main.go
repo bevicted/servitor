@@ -172,7 +172,7 @@ func run(ctx context.Context, uid, operation, kind, optionsFile, backendFile, re
 }
 
 func runPlan(ctx context.Context, uid, operation string, options servitorv1alpha1.ResolvedOptions, backendFile, resultFile, reportFile, ictPath, terraformPath string) error {
-	args := append([]string{"plan", operation, "--backend-config", backendFile, "--result-file", resultFile}, optionArgs(options)...)
+	args := append([]string{"plan", operation, "--backend-config", backendFile, "--result-file", resultFile, "--prefix", "servitor"}, optionArgs(options)...)
 	if _, err := (command.Runner{MaxOutput: 64 * 1024, Log: os.Stderr}).Run(ctx, ictPath, args...); err != nil {
 		return err
 	}
@@ -344,7 +344,6 @@ func resolvedOptionsFromValues(options servitorv1alpha1.ResolvedOptions, values 
 		SatelliteSSHKeyID:              values.SatelliteSSHKeyID,
 		SatelliteWorkerInstanceIDs:     append([]string(nil), values.SatelliteWorkerInstanceIDs...),
 		SatelliteWorkerOperatingSystem: values.SatelliteWorkerOperatingSystem,
-		Name:                           options.Name,
 		WorkerCount:                    values.WorkerCount,
 	}
 	options.ClusterName = values.ClusterName
@@ -378,7 +377,6 @@ func optionArgs(options servitorv1alpha1.ResolvedOptions) []string {
 	add("--satellite-host-profile", o.SatelliteHostProfile)
 	add("--satellite-ssh-key-id", o.SatelliteSSHKeyID)
 	add("--satellite-worker-operating-system", o.SatelliteWorkerOperatingSystem)
-	add("--name", o.Name)
 	for _, value := range o.SubnetIDs {
 		add("--subnet-id", value)
 	}

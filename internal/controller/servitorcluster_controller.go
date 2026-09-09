@@ -698,9 +698,6 @@ func overlay(dst *servitorv1alpha1.UserOptions, supplied servitorv1alpha1.UserOp
 	if supplied.SatelliteWorkerOperatingSystem != "" {
 		dst.SatelliteWorkerOperatingSystem = supplied.SatelliteWorkerOperatingSystem
 	}
-	if supplied.Name != "" {
-		dst.Name = supplied.Name
-	}
 	if supplied.WorkerCount != 0 {
 		dst.WorkerCount = supplied.WorkerCount
 	}

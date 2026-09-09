@@ -63,7 +63,7 @@ func TestExtensionTargetUsesSnapshotDefaultAndKeepsUTC(t *testing.T) {
 }
 
 func TestParseCreateAcceptsEverySafeFlag(t *testing.T) {
-	request, err := ParseCreate(`create --target test --provider vpc-gen2 --platform openshift --version 4.22 --resource-group "Platform Team" --zone us-south-3 --flavor custom --vpc-id vpc-id --subnet-id subnet-one --subnet-id subnet-two --public-gateway-id gateway-one --public-gateway-id gateway-two --datacenter dal10 --machine-type b3c.4x16 --public-vlan-id public-vlan --private-vlan-id private-vlan --satellite-zone us-south-1 --satellite-zone us-south-2 --satellite-managed-from managed-from --satellite-location-id location-id --satellite-host-image image-id --satellite-host-profile bx2-4x16 --satellite-ssh-key-id ssh-key --satellite-worker-instance-id worker-one --satellite-worker-instance-id worker-two --satellite-worker-operating-system RHCOS --worker-count 3 --name 'team cluster'`, testCreateDefaults)
+	request, err := ParseCreate(`create --target test --provider vpc-gen2 --platform openshift --version 4.22 --resource-group "Platform Team" --zone us-south-3 --flavor custom --vpc-id vpc-id --subnet-id subnet-one --subnet-id subnet-two --public-gateway-id gateway-one --public-gateway-id gateway-two --datacenter dal10 --machine-type b3c.4x16 --public-vlan-id public-vlan --private-vlan-id private-vlan --satellite-zone us-south-1 --satellite-zone us-south-2 --satellite-managed-from managed-from --satellite-location-id location-id --satellite-host-image image-id --satellite-host-profile bx2-4x16 --satellite-ssh-key-id ssh-key --satellite-worker-instance-id worker-one --satellite-worker-instance-id worker-two --satellite-worker-operating-system RHCOS --worker-count 3`, testCreateDefaults)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,7 +75,7 @@ func TestParseCreateAcceptsEverySafeFlag(t *testing.T) {
 		"--satellite-zone", "us-south-1", "--satellite-zone", "us-south-2", "--satellite-managed-from", "managed-from",
 		"--satellite-location-id", "location-id", "--satellite-host-image", "image-id", "--satellite-host-profile", "bx2-4x16",
 		"--satellite-ssh-key-id", "ssh-key", "--satellite-worker-instance-id", "worker-one", "--satellite-worker-instance-id", "worker-two",
-		"--satellite-worker-operating-system", "RHCOS", "--worker-count", "3", "--name", "team cluster",
+		"--satellite-worker-operating-system", "RHCOS", "--worker-count", "3",
 	}
 	if request.Platform != "openshift" || request.Version != "4.22" || !reflect.DeepEqual(request.Args, want) {
 		t.Fatalf("request = %+v\nwant args %#v", request, want)
@@ -122,11 +122,11 @@ func TestParseCreateAppliesAndOverridesConfiguredDefaults(t *testing.T) {
 }
 
 func TestParseCreateExposesNormalizedPresentationFields(t *testing.T) {
-	request, err := ParseCreate("create --version 1.36 --worker-count 2 --subnet-id subnet --public-gateway-id gateway --name team", testCreateDefaults)
+	request, err := ParseCreate("create --version 1.36 --worker-count 2 --subnet-id subnet --public-gateway-id gateway", testCreateDefaults)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if request.Target != "synthetic-target" || request.Platform != "kubernetes" || request.Version != "1.36" || request.Provider != "vpc-gen2" || request.ResourceGroup != "Default" || request.WorkerShape != "bx2.2x8" || request.WorkerCount != "2" || request.Location != "us-south/us-south-1" || request.Name != "team" {
+	if request.Target != "synthetic-target" || request.Platform != "kubernetes" || request.Version != "1.36" || request.Provider != "vpc-gen2" || request.ResourceGroup != "Default" || request.WorkerShape != "bx2.2x8" || request.WorkerCount != "2" || request.Location != "us-south/us-south-1" {
 		t.Fatalf("normalized request = %+v", request)
 	}
 	if !request.ReuseVPC || !request.ReuseSubnet || !request.ReuseGateway || request.VPCID != "synthetic-vpc-id" || !reflect.DeepEqual(request.SubnetIDs, []string{"subnet"}) || !reflect.DeepEqual(request.PublicGatewayIDs, []string{"gateway"}) {
@@ -145,6 +145,7 @@ func TestParseCreateRejectsEveryProhibitedOrAmbiguousInput(t *testing.T) {
 		{"owner", "create --version 4.22 --owner user"},
 		{"prefix", "create --version 4.22 --prefix user"},
 		{"auto approve", "create --version 4.22 --auto-approve true"},
+		{"name", "create --version 4.22 --name caller-selected"},
 		{"confirm stdin", "create --version 4.22 --confirm-stdin true"},
 		{"SSH public key path", "create --version 4.22 --satellite-ssh-public-key /secret"},
 		{"uninferable version", "create --version 5.1"},
@@ -173,7 +174,7 @@ func TestParseCreateRejectsDuplicateAndMissingSingletonValues(t *testing.T) {
 		{"--datacenter", "datacenter"}, {"--machine-type", "machine"}, {"--public-vlan-id", "public"}, {"--private-vlan-id", "private"},
 		{"--satellite-managed-from", "managed"}, {"--satellite-location-id", "location"}, {"--satellite-host-image", "image"},
 		{"--satellite-host-profile", "profile"}, {"--satellite-ssh-key-id", "key"}, {"--satellite-worker-operating-system", "os"},
-		{"--worker-count", "3"}, {"--name", "cluster"},
+		{"--worker-count", "3"},
 	}
 	for _, test := range singletons {
 		t.Run("duplicate "+test.flag, func(t *testing.T) {
@@ -204,14 +205,14 @@ func TestParseCreateRejectsDuplicateAndMissingSingletonValues(t *testing.T) {
 
 func TestParseCreateParsesQuotedAndEscapedValuesAndRejectsShellSyntax(t *testing.T) {
 	tests := []struct {
-		name, text, wantName string
-		wantErr              bool
+		name, text, wantResourceGroup string
+		wantErr                       bool
 	}{
-		{"single quoted", "create --version 4.22 --name 'team cluster'", "team cluster", false},
-		{"double quoted escaped quote", `create --version 4.22 --name "team \"cluster\""`, `team "cluster"`, false},
-		{"escaped whitespace", `create --version 4.22 --name team\ cluster`, "team cluster", false},
-		{"unterminated quote", "create --version 4.22 --name 'team cluster", "", true},
-		{"unterminated escape", `create --version 4.22 --name team\`, "", true},
+		{"single quoted", "create --version 4.22 --resource-group 'Platform Team'", "Platform Team", false},
+		{"double quoted escaped quote", `create --version 4.22 --resource-group "Platform \"Team\""`, `Platform "Team"`, false},
+		{"escaped whitespace", `create --version 4.22 --resource-group Platform\ Team`, "Platform Team", false},
+		{"unterminated quote", "create --version 4.22 --resource-group 'Platform Team", "", true},
+		{"unterminated escape", `create --version 4.22 --resource-group Platform\`, "", true},
 		{"semicolon", "create --version 4.22; destroy", "", true},
 		{"pipe", "create --version 4.22 | destroy", "", true},
 		{"ampersand", "create --version 4.22 & destroy", "", true},
@@ -222,7 +223,7 @@ func TestParseCreateParsesQuotedAndEscapedValuesAndRejectsShellSyntax(t *testing
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			request, err := ParseCreate(test.text, testCreateDefaults)
+			options, err := ParseCreateOptions(test.text)
 			if test.wantErr {
 				if err == nil {
 					t.Fatal("error = nil")
@@ -232,8 +233,8 @@ func TestParseCreateParsesQuotedAndEscapedValuesAndRejectsShellSyntax(t *testing
 			if err != nil {
 				t.Fatal(err)
 			}
-			if got := request.Args[len(request.Args)-1]; got != test.wantName {
-				t.Fatalf("name = %q, want %q", got, test.wantName)
+			if got := one(options.values, "--resource-group"); got != test.wantResourceGroup {
+				t.Fatalf("resource group = %q, want %q", got, test.wantResourceGroup)
 			}
 		})
 	}

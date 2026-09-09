@@ -125,12 +125,6 @@ spec:
                       }
                     satelliteWorkerOperatingSystem:
                       { type: string, maxLength: 64 }
-                    name:
-                      {
-                        type: string,
-                        maxLength: 64,
-                        pattern: "^[a-z][a-z0-9-]*$",
-                      }
                     workerCount: { type: integer, minimum: 1, maximum: 100 }
                 lifecycle:
                   type: object
@@ -208,7 +202,6 @@ spec:
                     satelliteSSHKeyID: { type: string, maxLength: 128 }
                     satelliteWorkerOperatingSystem:
                       { type: string, maxLength: 64 }
-                    name: { type: string, maxLength: 64 }
                     workerCount: { type: integer, minimum: 1, maximum: 100 }
                     clusterName: { type: string, maxLength: 128 }
                     region: { type: string, maxLength: 64 }

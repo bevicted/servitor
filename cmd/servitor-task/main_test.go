@@ -50,9 +50,10 @@ func TestRunPlanUsesInitializedWorkspaceAndSanitizesOversizedPlan(t *testing.T) 
 	t.Setenv("PLAN_RESULT", planResultFile)
 	t.Setenv("PLAN_SHOW", planShowFile)
 	t.Setenv("TRACE_FILE", filepath.Join(directory, "terraform.args"))
+	t.Setenv("ICT_TRACE_FILE", filepath.Join(directory, "ict.args"))
 	t.Setenv("WORKSPACE", workspace)
 	ict := filepath.Join(directory, "ict")
-	if err := os.WriteFile(ict, []byte("#!/bin/sh\n[ \"$1\" = plan ] && [ \"$2\" = plan-a ] || exit 2\ncp \"$PLAN_RESULT\" \"$6\"\n"), 0o700); err != nil {
+	if err := os.WriteFile(ict, []byte("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$ICT_TRACE_FILE\"\n[ \"$1\" = plan ] && [ \"$2\" = plan-a ] || exit 2\ncp \"$PLAN_RESULT\" \"$6\"\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	terraform := filepath.Join(directory, "terraform")
@@ -70,6 +71,13 @@ func TestRunPlanUsesInitializedWorkspaceAndSanitizesOversizedPlan(t *testing.T) 
 	wantTrace := "-chdir=" + workspace + "\nshow\n-json\n.cluster/create.tfplan\n"
 	if got := string(trace); got != wantTrace {
 		t.Fatalf("terraform command = %q, want %q", got, wantTrace)
+	}
+	ictTrace, err := os.ReadFile(filepath.Join(directory, "ict.args"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(ictTrace); !strings.Contains(got, "--prefix\nservitor\n") || strings.Contains(got, "--name\n") || strings.Contains(got, "--owner\n") {
+		t.Fatalf("ICT plan arguments = %q, want fixed generated-name prefix without caller name or owner", got)
 	}
 	report, err := os.ReadFile(reportFile)
 	if err != nil {
@@ -99,22 +107,22 @@ func TestResolvedOptionsFromValuesAdoptsAllProviderValues(t *testing.T) {
 		{
 			name:   "vpc",
 			values: servitorv1alpha1.RecoveryValues{ClusterName: "vpc-cluster", ResourceGroupName: "group", Region: "us-south", ClusterMode: "vpc", Platform: "openshift", KubeVersion: "4.22_openshift", WorkerCount: 2, Zone: "us-south-1", Flavor: "bx2.4x16", VPCID: "vpc", SubnetIDs: []string{"subnet"}, PublicGatewayIDs: []string{"gateway"}},
-			want:   servitorv1alpha1.UserOptions{Target: "target", Name: "requested", Provider: "vpc-gen2", Platform: "openshift", Version: "4.22_openshift", ResourceGroup: "group", WorkerCount: 2, Zone: "us-south-1", Flavor: "bx2.4x16", VPCID: "vpc", SubnetIDs: []string{"subnet"}, PublicGatewayIDs: []string{"gateway"}},
+			want:   servitorv1alpha1.UserOptions{Target: "target", Provider: "vpc-gen2", Platform: "openshift", Version: "4.22_openshift", ResourceGroup: "group", WorkerCount: 2, Zone: "us-south-1", Flavor: "bx2.4x16", VPCID: "vpc", SubnetIDs: []string{"subnet"}, PublicGatewayIDs: []string{"gateway"}},
 		},
 		{
 			name:   "classic",
 			values: servitorv1alpha1.RecoveryValues{ClusterName: "classic-cluster", ResourceGroupName: "group", Region: "us-south", ClusterMode: "classic", Platform: "kubernetes", KubeVersion: "1.31", WorkerCount: 3, Datacenter: "dal10", MachineType: "bx2.4x16", PublicVLANID: "123", PrivateVLANID: "456"},
-			want:   servitorv1alpha1.UserOptions{Target: "target", Name: "requested", Provider: "classic", Platform: "kubernetes", Version: "1.31", ResourceGroup: "group", WorkerCount: 3, Datacenter: "dal10", MachineType: "bx2.4x16", PublicVLANID: "123", PrivateVLANID: "456"},
+			want:   servitorv1alpha1.UserOptions{Target: "target", Provider: "classic", Platform: "kubernetes", Version: "1.31", ResourceGroup: "group", WorkerCount: 3, Datacenter: "dal10", MachineType: "bx2.4x16", PublicVLANID: "123", PrivateVLANID: "456"},
 		},
 		{
 			name:   "satellite",
 			values: servitorv1alpha1.RecoveryValues{ClusterName: "satellite-cluster", ResourceGroupName: "group", Region: "us-south", ClusterMode: "satellite", Platform: "openshift", KubeVersion: "4.22_openshift", WorkerCount: 3, VPCID: "vpc", SubnetIDs: []string{"subnet-a", "subnet-b", "subnet-c"}, PublicGatewayIDs: []string{"gateway-a", "gateway-b", "gateway-c"}, SatelliteZones: []string{"us-south-1", "us-south-2", "us-south-3"}, SatelliteManagedFrom: "us-south", SatelliteLocationID: "location", SatelliteHostImage: "image", SatelliteHostProfile: "bx2-4x16", SatelliteSSHKeyID: "key", SatelliteWorkerInstanceIDs: []string{"worker-a", "worker-b", "worker-c"}, SatelliteWorkerOperatingSystem: "RHCOS"},
-			want:   servitorv1alpha1.UserOptions{Target: "target", Name: "requested", Provider: "satellite", Platform: "openshift", Version: "4.22_openshift", ResourceGroup: "group", WorkerCount: 3, VPCID: "vpc", SubnetIDs: []string{"subnet-a", "subnet-b", "subnet-c"}, PublicGatewayIDs: []string{"gateway-a", "gateway-b", "gateway-c"}, SatelliteZones: []string{"us-south-1", "us-south-2", "us-south-3"}, SatelliteManagedFrom: "us-south", SatelliteLocationID: "location", SatelliteHostImage: "image", SatelliteHostProfile: "bx2-4x16", SatelliteSSHKeyID: "key", SatelliteWorkerInstanceIDs: []string{"worker-a", "worker-b", "worker-c"}, SatelliteWorkerOperatingSystem: "RHCOS"},
+			want:   servitorv1alpha1.UserOptions{Target: "target", Provider: "satellite", Platform: "openshift", Version: "4.22_openshift", ResourceGroup: "group", WorkerCount: 3, VPCID: "vpc", SubnetIDs: []string{"subnet-a", "subnet-b", "subnet-c"}, PublicGatewayIDs: []string{"gateway-a", "gateway-b", "gateway-c"}, SatelliteZones: []string{"us-south-1", "us-south-2", "us-south-3"}, SatelliteManagedFrom: "us-south", SatelliteLocationID: "location", SatelliteHostImage: "image", SatelliteHostProfile: "bx2-4x16", SatelliteSSHKeyID: "key", SatelliteWorkerInstanceIDs: []string{"worker-a", "worker-b", "worker-c"}, SatelliteWorkerOperatingSystem: "RHCOS"},
 		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			resolved, err := resolvedOptionsFromValues(servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Target: "target", Name: "requested", VPCID: "stale-vpc", MachineType: "stale-machine"}}, test.values)
+			resolved, err := resolvedOptionsFromValues(servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Target: "target", VPCID: "stale-vpc", MachineType: "stale-machine"}}, test.values)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -173,7 +181,7 @@ func TestRunDestroyUsesFrozenContextAndProducesValidatedReport(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := json.Unmarshal(data, &context); err != nil || context.StateID != "destroy-a" || context.Recovery.TFVarsSHA256 != recovery.TFVarsSHA256 {
+	if err := json.Unmarshal(data, &context); err != nil || context.StateID != "destroy-a" || context.Recovery.TFVarsSHA256 != recovery.TFVarsSHA256 || context.Values.ClusterName != recovery.Values.ClusterName {
 		t.Fatalf("destroy context = %+v, err=%v", context, err)
 	}
 }
