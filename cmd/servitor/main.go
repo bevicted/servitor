@@ -80,6 +80,11 @@ func main() {
 	if err := reconciler.SetupWithManager(manager); err != nil {
 		fail(fmt.Errorf("configure controller: %w", err))
 	}
+	inventorySettings := inventoryControllerConfig(operator)
+	inventoryReconciler := &controller.InventoryReconciler{Client: manager.GetClient(), Logs: reconciler.Logs, Config: inventorySettings}
+	if err := inventoryReconciler.SetupWithManager(manager); err != nil {
+		fail(fmt.Errorf("configure inventory refresh: %w", err))
+	}
 	transport := slackbot.NewSocketMode(secrets.BotToken, secrets.AppToken)
 	bot := slackbot.Bot{
 		ChannelID: operator.Slack.ChannelID, Namespace: operator.Namespace, Client: manager.GetClient(),
@@ -121,6 +126,14 @@ func controllerConfig(operator config.Config) (controller.Config, error) {
 		ReviewTimeout:   operator.Lifecycle.ConfirmationTimeout,
 		OpenShiftFlavor: operator.Defaults.OpenShiftFlavor, KubernetesFlavor: operator.Defaults.KubernetesFlavor,
 	}, nil
+}
+
+func inventoryControllerConfig(operator config.Config) controller.InventoryConfig {
+	return controller.InventoryConfig{
+		Namespace: operator.Namespace, TargetConfigMap: operator.ICT.TargetConfigMap, TargetConfigKey: operator.ICT.TargetConfigKey,
+		ExecutionImage: operator.Images.Execution, TaskConfig: pipeline.TaskConfig{ICTConfigMap: operator.ICT.TargetConfigMap, ICTConfigKey: operator.ICT.TargetConfigKey, IBMSecret: operator.Secrets.IBM},
+		RefreshInterval: operator.InventoryRefreshInterval(), MaximumAge: operator.InventoryMaximumAge(),
+	}
 }
 
 func config2() (*rest.Config, error) { return ctrlconfig.GetConfig() }

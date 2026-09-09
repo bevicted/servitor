@@ -20,6 +20,11 @@ lifecycle:
   confirmation_timeout: 5m
   lease: 4h
   retry_intervals: [1m, 5m, 15m]
+# Private target inventory refreshes initially when missing, then hourly. A
+# last-good snapshot is usable for this bounded age after a transient failure.
+inventory:
+  refresh_interval: 1h
+  maximum_age: 24h
 ict:
   target_config_map: servitor-ict-config
   target_config_key: config.yaml

@@ -75,4 +75,8 @@ func TestNewInventoryRunIsIndependentAndCredentialIsolated(t *testing.T) {
 	if InventoryReportTaskRunName(run) != "inventory-task" {
 		t.Fatal("inventory report task lookup failed")
 	}
+	task := &tektonv1.TaskRun{Status: tektonv1.TaskRunStatus{TaskRunStatusFields: tektonv1.TaskRunStatusFields{Steps: []tektonv1.StepState{{Name: "report", Container: "step-report"}}}}}
+	if InventoryReportContainer(task) != "step-report" {
+		t.Fatal("inventory report container lookup failed")
+	}
 }

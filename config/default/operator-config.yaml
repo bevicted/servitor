@@ -15,6 +15,11 @@ lifecycle:
   confirmation_timeout: 5m
   lease: 4h
   retry_intervals: [1m, 5m, 15m]
+# The leader creates missing target snapshots, refreshes them hourly, and
+# retains only last-good data for at most this usable age.
+inventory:
+  refresh_interval: 1h
+  maximum_age: 24h
 # ICT and Secret resource names are supplied by operator-references.env in this ConfigMap.
 cos:
   endpoint: https://s3.us-south.cloud-object-storage.appdomain.cloud

@@ -19,6 +19,7 @@ import (
 const (
 	MaxInventoryReportBytes = 512 * 1024
 	InventoryPipelineName   = "servitor-inventory"
+	InventoryRunTimeout     = 15 * time.Minute
 	InventoryRunLabel       = "servitor.bevicted.github.io/inventory-run"
 	InventoryTargetLabel    = "servitor.bevicted.github.io/inventory-target"
 	inventoryTaskName       = "inventory"
@@ -59,7 +60,7 @@ func DecodeInventoryReport(data []byte, target, runID, revision string) (Invento
 		return InventoryReport{}, errors.New("inventory report must contain exactly one JSON document")
 	}
 	if err := report.Validate(target, runID, revision); err != nil {
-		return InventoryReport{}, err
+		return InventoryReport{}, fmt.Errorf("validate inventory report: %w", err)
 	}
 	return report, nil
 }
@@ -107,7 +108,7 @@ func NewInventoryRun(namespace, image, target, runID, revision string, taskConfi
 				{Name: "ibm-secret", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: taskConfig.IBMSecret}},
 			},
 			TaskRunTemplate: operationTaskRunTemplate(),
-			Timeouts:        &tektonv1.TimeoutFields{Pipeline: &metav1.Duration{Duration: 15 * time.Minute}, Tasks: &metav1.Duration{Duration: 14 * time.Minute}},
+			Timeouts:        &tektonv1.TimeoutFields{Pipeline: &metav1.Duration{Duration: InventoryRunTimeout}, Tasks: &metav1.Duration{Duration: 14 * time.Minute}},
 		},
 	}, nil
 }
@@ -120,6 +121,16 @@ func InventoryReportTaskRunName(run *tektonv1.PipelineRun) string {
 	for _, child := range run.Status.ChildReferences {
 		if child.Kind == "TaskRun" && child.PipelineTaskName == inventoryTaskName {
 			return child.Name
+		}
+	}
+	return ""
+}
+
+// InventoryReportContainer identifies the credential-free report step.
+func InventoryReportContainer(taskRun *tektonv1.TaskRun) string {
+	for _, step := range taskRun.Status.Steps {
+		if step.Name == "report" && step.Container != "" {
+			return step.Container
 		}
 	}
 	return ""

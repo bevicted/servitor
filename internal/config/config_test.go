@@ -35,6 +35,25 @@ func TestValidateFailsClosedForRequiredDeploymentInputs(t *testing.T) {
 	}
 }
 
+func TestLoadAppliesInventoryRefreshDefaults(t *testing.T) {
+	directory := t.TempDir()
+	path := filepath.Join(directory, "config.yaml")
+	if err := os.WriteFile(path, []byte(validYAML()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	configuration, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if configuration.Inventory.RefreshInterval != DefaultInventoryRefreshInterval || configuration.Inventory.MaximumAge != DefaultInventoryMaximumAge {
+		t.Fatalf("inventory defaults = %+v", configuration.Inventory)
+	}
+	configuration.Inventory = InventoryConfig{RefreshInterval: time.Hour, MaximumAge: 30 * time.Minute}
+	if err := configuration.Validate(); err == nil {
+		t.Fatal("accepted maximum inventory age below refresh interval")
+	}
+}
+
 func TestValidateRejectsUnsafeCOSEndpoints(t *testing.T) {
 	for _, endpoint := range []string{
 		"http://s3.example.invalid",

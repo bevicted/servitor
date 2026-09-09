@@ -27,6 +27,7 @@ type Config struct {
 	Slack     SlackConfig     `yaml:"slack"`
 	Defaults  DefaultsConfig  `yaml:"defaults"`
 	Lifecycle LifecycleConfig `yaml:"lifecycle"`
+	Inventory InventoryConfig `yaml:"inventory"`
 	ICT       ICTConfig       `yaml:"ict"`
 	COS       COSConfig       `yaml:"cos"`
 	Images    ImagesConfig    `yaml:"images"`
@@ -53,6 +54,17 @@ type LifecycleConfig struct {
 	Lease               time.Duration   `yaml:"lease"`
 	RetryIntervals      []time.Duration `yaml:"retry_intervals"`
 }
+
+// InventoryConfig controls leader-owned private discovery scheduling.
+type InventoryConfig struct {
+	RefreshInterval time.Duration `yaml:"refresh_interval"`
+	MaximumAge      time.Duration `yaml:"maximum_age"`
+}
+
+const (
+	DefaultInventoryRefreshInterval = time.Hour
+	DefaultInventoryMaximumAge      = 24 * time.Hour
+)
 
 // ICTConfig names the ConfigMap-mounted ICT target configuration used only by tasks.
 type ICTConfig struct {
@@ -120,6 +132,7 @@ func Load(path string) (Config, error) {
 		return Config{}, fmt.Errorf("config: decode: %w", err)
 	}
 	config.applyWorkloadReferencesFromEnv()
+	config.applyInventoryDefaults()
 	if err := config.Validate(); err != nil {
 		return Config{}, err
 	}
@@ -128,6 +141,15 @@ func Load(path string) (Config, error) {
 
 // applyWorkloadReferencesFromEnv reads resource names from the mounted ConfigMap.
 // These names must remain separate from Secret credential values.
+func (c *Config) applyInventoryDefaults() {
+	if c.Inventory.RefreshInterval == 0 {
+		c.Inventory.RefreshInterval = DefaultInventoryRefreshInterval
+	}
+	if c.Inventory.MaximumAge == 0 {
+		c.Inventory.MaximumAge = DefaultInventoryMaximumAge
+	}
+}
+
 func (c *Config) applyWorkloadReferencesFromEnv() {
 	for _, item := range []struct {
 		value *string
@@ -206,6 +228,16 @@ func (c Config) Validate() error {
 	if c.Lifecycle.ConfirmationTimeout <= 0 {
 		return errors.New("config: lifecycle.confirmation_timeout must be positive")
 	}
+	refreshInterval, maximumAge := c.Inventory.RefreshInterval, c.Inventory.MaximumAge
+	if refreshInterval == 0 {
+		refreshInterval = DefaultInventoryRefreshInterval
+	}
+	if maximumAge == 0 {
+		maximumAge = DefaultInventoryMaximumAge
+	}
+	if refreshInterval <= 0 || maximumAge <= 0 || maximumAge < refreshInterval {
+		return errors.New("config: inventory refresh_interval and maximum_age must be positive, and maximum_age must not be less than refresh_interval")
+	}
 	if c.Lifecycle.Lease < time.Hour || c.Lifecycle.Lease > 24*time.Hour || c.Lifecycle.Lease%time.Hour != 0 {
 		return errors.New("config: lifecycle.lease must be a whole-hour duration from 1h through 24h")
 	}
@@ -218,6 +250,22 @@ func (c Config) Validate() error {
 		}
 	}
 	return nil
+}
+
+// InventoryRefreshInterval returns the configured interval or its safe default.
+func (c Config) InventoryRefreshInterval() time.Duration {
+	if c.Inventory.RefreshInterval > 0 {
+		return c.Inventory.RefreshInterval
+	}
+	return DefaultInventoryRefreshInterval
+}
+
+// InventoryMaximumAge returns the configured maximum usable age or its safe default.
+func (c Config) InventoryMaximumAge() time.Duration {
+	if c.Inventory.MaximumAge > 0 {
+		return c.Inventory.MaximumAge
+	}
+	return DefaultInventoryMaximumAge
 }
 
 func validCOSEndpoint(value string) bool {
