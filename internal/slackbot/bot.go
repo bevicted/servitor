@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log"
-	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -158,6 +157,11 @@ func (b Bot) create(ctx context.Context, message Message, text string, respond f
 		respond(rejectedText(err.Error()))
 		return true
 	}
+	userOptions, err := userOptions(options)
+	if err != nil {
+		respond(rejectedText(err.Error()))
+		return true
+	}
 	if b.Client == nil || b.Namespace == "" {
 		respond(rejectedText("Create is unavailable. Inspect the allocation CR status and private cluster logs."))
 		return true
@@ -187,7 +191,7 @@ func (b Bot) create(ctx context.Context, message Message, text string, respond f
 	now := b.now()
 	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: b.Namespace}, Spec: servitorv1alpha1.ServitorClusterSpec{
 		Slack:       servitorv1alpha1.SlackIdentity{OwnerID: message.User, ChannelID: message.Channel, ThreadTimestamp: message.Timestamp},
-		UserOptions: userOptions(options.Values()),
+		UserOptions: userOptions,
 		Lifecycle:   servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: int64(b.lease() / time.Second), RetrySeconds: seconds(b.RetryIntervals)},
 	}}
 	if err := b.Client.Create(ctx, cluster); err != nil {
@@ -393,15 +397,19 @@ func splitSlackTimestamp(value string) (string, string, bool) {
 	}
 	return whole, strings.TrimRight(fraction, "0"), true
 }
-func userOptions(values map[string][]string) servitorv1alpha1.UserOptions {
+func userOptions(options command.ExplicitCreateOptions) (servitorv1alpha1.UserOptions, error) {
+	values := options.Values()
 	one := func(flag string) string {
 		if len(values[flag]) == 0 {
 			return ""
 		}
 		return values[flag][0]
 	}
-	workerCount, _ := strconv.Atoi(one("--worker-count"))
-	return servitorv1alpha1.UserOptions{Target: one("--target"), Provider: one("--provider"), Version: one("--version"), ResourceGroup: one("--resource-group"), Zone: one("--zone"), Flavor: one("--flavor"), VPCID: one("--vpc-id"), Datacenter: one("--datacenter"), MachineType: one("--machine-type"), PublicVLANID: one("--public-vlan-id"), PrivateVLANID: one("--private-vlan-id"), SubnetIDs: append([]string(nil), values["--subnet-id"]...), PublicGatewayIDs: append([]string(nil), values["--public-gateway-id"]...), SatelliteZones: append([]string(nil), values["--satellite-zone"]...), SatelliteManagedFrom: one("--satellite-managed-from"), SatelliteLocationID: one("--satellite-location-id"), SatelliteHostImage: one("--satellite-host-image"), SatelliteHostProfile: one("--satellite-host-profile"), SatelliteSSHKeyID: one("--satellite-ssh-key-id"), SatelliteWorkerInstanceIDs: append([]string(nil), values["--satellite-worker-instance-id"]...), SatelliteWorkerOperatingSystem: one("--satellite-worker-operating-system"), WorkerCount: workerCount}
+	workerCount, err := options.WorkerCount()
+	if err != nil {
+		return servitorv1alpha1.UserOptions{}, err
+	}
+	return servitorv1alpha1.UserOptions{Target: one("--target"), Provider: one("--provider"), Version: one("--version"), ResourceGroup: one("--resource-group"), Zone: one("--zone"), Flavor: one("--flavor"), VPCID: one("--vpc-id"), Datacenter: one("--datacenter"), MachineType: one("--machine-type"), PublicVLANID: one("--public-vlan-id"), PrivateVLANID: one("--private-vlan-id"), SubnetIDs: append([]string(nil), values["--subnet-id"]...), PublicGatewayIDs: append([]string(nil), values["--public-gateway-id"]...), SatelliteZones: append([]string(nil), values["--satellite-zone"]...), SatelliteManagedFrom: one("--satellite-managed-from"), SatelliteLocationID: one("--satellite-location-id"), SatelliteHostImage: one("--satellite-host-image"), SatelliteHostProfile: one("--satellite-host-profile"), SatelliteSSHKeyID: one("--satellite-ssh-key-id"), SatelliteWorkerInstanceIDs: append([]string(nil), values["--satellite-worker-instance-id"]...), SatelliteWorkerOperatingSystem: one("--satellite-worker-operating-system"), WorkerCount: workerCount}, nil
 }
 func seconds(values []time.Duration) []int64 {
 	result := make([]int64, len(values))
@@ -498,10 +506,10 @@ func firstToken(text string) string {
 func unknownText() string               { return "Command unknown.\n\n" + helpOverview()[0] }
 func rejectedText(reason string) string { return "Command rejected.\n\n" + reason }
 func helpOverview() []string {
-	return []string{"Servitor provisions one temporary IBM Cloud cluster per Slack user.\n\nCommands\n```\nDM\n  help [command]          print help\n  list                    list clusters\n\nConfigured channel\n  @servitor help [command]  print help\n  @servitor create [flags]  provision a new cluster\n  @servitor done            release your resources\n  @servitor extend [N[h]]   extend your lease\n  @servitor list            list clusters\n\nLifecycle thread\n  yes                       approve the cluster plan\n  no                        reject the cluster plan\n  done                      release your resources\n  extend [N[h]]             extend your lease\n```"}
+	return []string{"Servitor provisions one temporary IBM Cloud cluster per Slack user.\n\nCommands\n```\nDM\n  help [command]          print help\n  list                    list clusters\n\nConfigured channel\n  @servitor help [command]  print help\n  @servitor create [safe options]  provision a new cluster\n  @servitor done            release your resources\n  @servitor extend [N[h]]   extend your lease\n  @servitor list            list clusters\n\nLifecycle thread\n  yes                       approve the cluster plan\n  no                        reject the cluster plan\n  done                      release your resources\n  extend [N[h]]             extend your lease\n```"}
 }
 func createHelp(defaults command.CreateDefaults) []string {
-	return []string{"`create` starts planning from the configured channel root. Defaults: version " + safeHelpCell(defaults.Version) + ", target " + safeHelpCell(defaults.Target) + ", provider " + safeHelpCell(defaults.Provider) + ". Cluster names are generated internally.\n\nReview the configuration in its thread, then reply with exact `yes` or `no` within five minutes.", "Safe create flags\n```\nCommon\n  --target --provider --version --resource-group --worker-count\n\nVPC Gen 2\n  --zone --flavor --vpc-id --subnet-id --public-gateway-id\n\nClassic\n  --datacenter --machine-type --public-vlan-id --private-vlan-id\n\nSatellite\n  --satellite-zone --satellite-managed-from --satellite-location-id\n  --satellite-host-image --satellite-host-profile --satellite-ssh-key-id\n  --satellite-worker-instance-id --satellite-worker-operating-system\n```"}
+	return []string{"`create` starts planning from the configured channel root. Defaults: version " + safeHelpCell(defaults.Version) + ", target " + safeHelpCell(defaults.Target) + ", provider " + safeHelpCell(defaults.Provider) + ". Cluster names are generated internally.\n\nUse `key=value`, `--key=value`, or `--key value`; forms can be mixed, for example `create target=synthetic-target --version=4.22 --resource-group \"Platform Team\" worker-count=3`.\n\nReview the configuration in its thread, then reply with exact `yes` or `no` within five minutes.", "Safe create options\n```\nCommon\n  --target --provider --version --resource-group --worker-count\n\nVPC Gen 2\n  --zone --flavor --vpc-id --subnet-id --public-gateway-id\n\nClassic\n  --datacenter --machine-type --public-vlan-id --private-vlan-id\n\nSatellite\n  --satellite-zone --satellite-managed-from --satellite-location-id\n  --satellite-host-image --satellite-host-profile --satellite-ssh-key-id\n  --satellite-worker-instance-id --satellite-worker-operating-system\n```"}
 }
 func safeHelpCell(value string) string {
 	value = strings.Map(func(character rune) rune {

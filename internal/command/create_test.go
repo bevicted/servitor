@@ -82,6 +82,88 @@ func TestParseCreateAcceptsEverySafeFlag(t *testing.T) {
 	}
 }
 
+func TestParseCreateOptionsNormalizesMixedAssignments(t *testing.T) {
+	want := map[string][]string{
+		"--target":         {"synthetic-target"},
+		"--provider":       {"vpc-gen2"},
+		"--version":        {"4.22"},
+		"--resource-group": {`Platform "Team"=Core`},
+		"--worker-count":   {"3"},
+		"--subnet-id":      {"subnet-one", "subnet-two"},
+	}
+	for _, text := range []string{
+		`create target=synthetic-target provider=vpc-gen2 version=4.22 resource-group="Platform \"Team\"=Core" worker-count=3 subnet-id=subnet-one subnet-id=subnet-two`,
+		`create --target=synthetic-target --provider=vpc-gen2 --version=4.22 --resource-group="Platform \"Team\"=Core" --worker-count=3 --subnet-id=subnet-one --subnet-id=subnet-two`,
+		`create --target synthetic-target provider=vpc-gen2 --version 4.22 resource-group="Platform \"Team\"=Core" --worker-count=3 subnet-id=subnet-one --subnet-id subnet-two`,
+	} {
+		options, err := ParseCreateOptions(text)
+		if err != nil {
+			t.Fatalf("ParseCreateOptions(%q): %v", text, err)
+		}
+		if got := options.Values(); !reflect.DeepEqual(got, want) {
+			t.Fatalf("ParseCreateOptions(%q) = %#v\nwant %#v", text, got, want)
+		}
+	}
+}
+
+func TestParseCreateAssignmentsRetainOneQuotedArgvValue(t *testing.T) {
+	request, err := ParseCreate(`create target=synthetic-target resource-group="Platform Team=Core" --version 4.22`, testCreateDefaults)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := 0; index < len(request.Args); index += 2 {
+		if request.Args[index] == "--resource-group" {
+			if request.Args[index+1] != "Platform Team=Core" {
+				t.Fatalf("resource-group argv value = %q", request.Args[index+1])
+			}
+			return
+		}
+	}
+	t.Fatalf("resource-group was not captured in argv: %#v", request.Args)
+}
+
+func TestParseCreateAssignmentErrors(t *testing.T) {
+	tests := []struct {
+		text, want string
+	}{
+		{"create unknown=value", `unknown create flag "--unknown"`},
+		{"create config=value", "--config is not permitted"},
+		{"create target=", "--target requires a value"},
+		{"create target=one --target two", "--target may only be supplied once"},
+	}
+	for _, test := range tests {
+		t.Run(test.text, func(t *testing.T) {
+			if _, err := ParseCreateOptions(test.text); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("ParseCreateOptions(%q) error = %v, want %q", test.text, err, test.want)
+			}
+		})
+	}
+}
+
+func TestParseCreateRejectsInvalidWorkerCount(t *testing.T) {
+	for _, text := range []string{
+		"create worker-count=not-a-number",
+		"create --worker-count 999999999999999999999999999999",
+		"create --worker-count=0",
+		"create worker-count=101",
+	} {
+		t.Run(text, func(t *testing.T) {
+			if _, err := ParseCreateOptions(text); err == nil || err.Error() != "--worker-count must be an integer from 1 through 100" {
+				t.Fatalf("ParseCreateOptions(%q) error = %v", text, err)
+			}
+		})
+	}
+	for _, text := range []string{"create worker-count=1", "create --worker-count 100"} {
+		options, err := ParseCreateOptions(text)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := options.WorkerCount(); err != nil {
+			t.Fatalf("WorkerCount(%q): %v", text, err)
+		}
+	}
+}
+
 func TestParseCreateAppliesAndOverridesConfiguredDefaults(t *testing.T) {
 	tests := []struct {
 		name, text, platform string

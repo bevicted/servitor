@@ -2,6 +2,7 @@ package command
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"unicode"
 )
@@ -65,6 +66,19 @@ func (o ExplicitCreateOptions) Values() map[string][]string {
 	return values
 }
 
+// WorkerCount returns the explicit worker count, or zero when it was omitted.
+func (o ExplicitCreateOptions) WorkerCount() (int, error) {
+	value := one(o.values, "--worker-count")
+	if value == "" {
+		return 0, nil
+	}
+	count, err := strconv.Atoi(value)
+	if err != nil || count < 1 || count > 100 {
+		return 0, fmt.Errorf("--worker-count must be an integer from 1 through 100")
+	}
+	return count, nil
+}
+
 // ParseCreateOptions validates the safe CLI grammar without applying operator defaults.
 func ParseCreateOptions(text string) (ExplicitCreateOptions, error) {
 	words, err := splitWords(text)
@@ -77,6 +91,9 @@ func ParseCreateOptions(text string) (ExplicitCreateOptions, error) {
 	seen, values := map[string]bool{}, map[string][]string{}
 	for i := 1; i < len(words); {
 		flag, value, joined := strings.Cut(words[i], "=")
+		if joined && !strings.HasPrefix(flag, "--") {
+			flag = "--" + flag
+		}
 		if forbiddenCreateFlags[flag] {
 			return ExplicitCreateOptions{}, fmt.Errorf("%s is not permitted", flag)
 		}
@@ -100,7 +117,11 @@ func ParseCreateOptions(text string) (ExplicitCreateOptions, error) {
 		seen[flag] = true
 		values[flag] = append(values[flag], value)
 	}
-	return ExplicitCreateOptions{values: values}, nil
+	options := ExplicitCreateOptions{values: values}
+	if _, err := options.WorkerCount(); err != nil {
+		return ExplicitCreateOptions{}, err
+	}
+	return options, nil
 }
 
 // ParseCreate remains the compatibility helper for callers that immediately resolve defaults.

@@ -43,7 +43,7 @@ DM
 
 Configured channel
   @servitor help [command]
-  @servitor create [safe flags]
+  @servitor create [safe options]
   @servitor done
   @servitor extend [N[h]]
   @servitor list
@@ -54,7 +54,7 @@ Lifecycle thread
   extend [N[h]]
 ```
 
-`create` writes explicit safe flags to `spec.userOptions`; the controller overlays startup defaults and records the resolved result. Platform is derived from the numeric version: `4.*` selects OpenShift and `1.*` selects Kubernetes, so `--platform` is not a supported create flag. Cluster names are generated internally, so `--name` is not a supported create flag. Only the owner in the initiating thread can approve, reject, extend, or request cleanup. `destroy` remains a silent alias for `done`.
+`create` writes explicit safe options to `spec.userOptions`; the controller overlays startup defaults and records the resolved result. Use `key=value`, `--key=value`, or `--key value` in the same request, for example `@servitor create target=synthetic-target --version=4.22 --resource-group "Platform Team" worker-count=3`. Platform is derived from the numeric version: `4.*` selects OpenShift and `1.*` selects Kubernetes, so `--platform` is not a supported create option. Cluster names are generated internally, so `--name` is not a supported create option. Only the owner in the initiating thread can approve, reject, extend, or request cleanup. `destroy` remains a silent alias for `done`.
 
 There are no maintainer `status`, `pause`, `unpause`, or `stop` commands, and no replacement command for them. Slack delivery is not exactly once: a controller crash after posting and before recording the receipt can duplicate a notification.
 

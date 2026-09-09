@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -68,6 +70,55 @@ func TestCreateAcknowledgesBeforeCreatingOneDeterministicCluster(t *testing.T) {
 		t.Fatalf("clusters=%d", len(clusters.Items))
 	}
 }
+func TestHandleCreateNormalizesMixedAssignmentsWithoutDefaults(t *testing.T) {
+	want := servitorv1alpha1.UserOptions{
+		Target: "synthetic-target", Version: "4.22", ResourceGroup: "Platform Team=Core", WorkerCount: 3,
+		SubnetIDs: []string{"subnet-one", "subnet-two"},
+	}
+	for _, text := range []string{
+		`<@BOT> create --target synthetic-target --version 4.22 --resource-group "Platform Team=Core" --worker-count 3 --subnet-id subnet-one --subnet-id subnet-two`,
+		`<@BOT> create target=synthetic-target --version=4.22 resource-group="Platform Team=Core" --worker-count 3 subnet-id=subnet-one --subnet-id subnet-two`,
+	} {
+		t.Run(text, func(t *testing.T) {
+			bot, responses := botForTest(t)
+			bot.Defaults = command.CreateDefaults{Provider: "vpc-gen2", Zone: "operator-zone"}
+			event := Envelope{ID: "mixed", Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: text, Timestamp: "123"}}
+			if err := bot.Handle(context.Background(), event); err != nil {
+				t.Fatal(err)
+			}
+			if len(responses.responses) != 1 || responses.responses[0].Text != "Command accepted.\nPlanning..." {
+				t.Fatalf("responses=%+v", responses.responses)
+			}
+			cluster := &servitorv1alpha1.ServitorCluster{}
+			if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: ownerClusterName("U1")}, cluster); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(cluster.Spec.UserOptions, want) {
+				t.Fatalf("userOptions = %+v\nwant %+v", cluster.Spec.UserOptions, want)
+			}
+		})
+	}
+}
+
+func TestHandleCreateRejectsInvalidWorkerCountWithoutAllocation(t *testing.T) {
+	for _, workerCount := range []string{"not-a-number", "999999999999999999999999999999", "0", "101"} {
+		t.Run(workerCount, func(t *testing.T) {
+			bot, responses := botForTest(t)
+			event := Envelope{ID: "worker-" + workerCount, Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "<@BOT> create worker-count=" + workerCount, Timestamp: "123"}}
+			if err := bot.Handle(context.Background(), event); err != nil {
+				t.Fatal(err)
+			}
+			if len(responses.responses) != 1 || !containsText(responses.responses[0].Text, "--worker-count must be an integer from 1 through 100") {
+				t.Fatalf("responses=%+v", responses.responses)
+			}
+			cluster := &servitorv1alpha1.ServitorCluster{}
+			if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: ownerClusterName("U1")}, cluster); err == nil {
+				t.Fatal("invalid worker count recorded an allocation")
+			}
+		})
+	}
+}
+
 func TestCreateRejectsCallerSelectedName(t *testing.T) {
 	bot, responses := botForTest(t)
 	if err := bot.Handle(context.Background(), Envelope{ID: "Ev-name", Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "<@BOT> create --version 4.22 --name caller-selected", Timestamp: "123"}}); err != nil {
@@ -216,6 +267,20 @@ func TestCreateRejectsPlatformAndHelpDoesNotAdvertiseIt(t *testing.T) {
 	for _, page := range createHelp(command.CreateDefaults{}) {
 		if containsText(page, "--platform") {
 			t.Fatalf("create help advertises platform: %s", page)
+		}
+	}
+}
+
+func TestCreateHelpShowsAssignmentsWithoutUnsupportedShorthand(t *testing.T) {
+	help := strings.Join(createHelp(command.CreateDefaults{}), "\n")
+	for _, wanted := range []string{"key=value", "--key=value", "--key value", "target=synthetic-target", "resource-group \"Platform Team\""} {
+		if !containsText(help, wanted) {
+			t.Fatalf("create help missing %q: %s", wanted, help)
+		}
+	}
+	for _, unsupported := range []string{"roks", "iks", "k8s", "default_openshift", "default_kubernetes"} {
+		if containsText(help, unsupported) {
+			t.Fatalf("create help advertises unsupported shorthand %q: %s", unsupported, help)
 		}
 	}
 }
