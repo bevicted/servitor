@@ -86,8 +86,6 @@ func statusNotices(cluster *servitorv1alpha1.ServitorCluster) []statusNotice {
 	phase := cluster.Status.Phase
 	var texts []string
 	switch phase {
-	case servitorv1alpha1.PhasePlanning:
-		texts = []string{"Planning..."}
 	case servitorv1alpha1.PhaseAwaitingApproval:
 		texts = reviewNoticeTexts(cluster.Status.ResolvedOptions, cluster.Status.Review)
 	case servitorv1alpha1.PhaseApplying:
@@ -103,7 +101,11 @@ func statusNotices(cluster *servitorv1alpha1.ServitorCluster) []statusNotice {
 	case servitorv1alpha1.PhaseCleanupComplete:
 		texts = []string{"Cleanup complete."}
 	case servitorv1alpha1.PhaseUnresolved:
-		texts = []string{"Cleanup is unresolved. An administrator must inspect the allocation CR status and private cluster logs."}
+		if cluster.Status.Cleanup != nil {
+			texts = []string{"Cleanup is unresolved. An administrator must inspect the allocation CR status and private cluster logs."}
+		} else {
+			texts = []string{"The operation is unresolved. An administrator must inspect the allocation CR status and private cluster logs."}
+		}
 	}
 	notices := phaseNotices(uid, phase, texts)
 	if cleanup := cluster.Status.Cleanup; cleanup != nil && cleanup.RetryCount > 0 {

@@ -721,7 +721,8 @@ func overlay(dst *servitorv1alpha1.UserOptions, supplied servitorv1alpha1.UserOp
 type podLogs struct{ client kubernetes.Interface }
 
 func (p podLogs) ReadContainerLog(ctx context.Context, namespace, pod, container string) (io.ReadCloser, error) {
-	return p.client.CoreV1().Pods(namespace).GetLogs(pod, &corev1.PodLogOptions{Container: container}).Stream(ctx)
+	tailLines := int64(1)
+	return p.client.CoreV1().Pods(namespace).GetLogs(pod, &corev1.PodLogOptions{Container: container, TailLines: &tailLines}).Stream(ctx)
 }
 
 // NewPodLogReader adapts the Kubernetes API to the bounded report reader.

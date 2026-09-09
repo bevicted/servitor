@@ -38,6 +38,17 @@ func TestStatusNotifierDeliversTransitionOnceAcrossRestart(t *testing.T) {
 	}
 }
 
+func TestStatusNoticesSuppressDuplicatePlanningAndDescribeUnresolvedOperation(t *testing.T) {
+	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "slack-owner", Namespace: "servitor", UID: "uid"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhasePlanning}}
+	if notices := statusNotices(cluster); len(notices) != 0 {
+		t.Fatalf("planning notices = %+v, want none", notices)
+	}
+	cluster.Status.Phase = servitorv1alpha1.PhaseUnresolved
+	if notices := statusNotices(cluster); len(notices) != 1 || notices[0].text != "The operation is unresolved. An administrator must inspect the allocation CR status and private cluster logs." {
+		t.Fatalf("unresolved notices = %+v", notices)
+	}
+}
+
 func TestStatusNotifierDeliversObservableCleanupCompletion(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := corev1.AddToScheme(scheme); err != nil {
