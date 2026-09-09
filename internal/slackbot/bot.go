@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 	"unicode"
@@ -59,6 +60,7 @@ type Bot struct {
 	Defaults              command.CreateDefaults
 	InventoryConfigMap    string
 	InventoryConfigKey    string
+	MaintainerIDs         []string
 	InventoryMaximumAge   time.Duration
 	Lease                 time.Duration
 	RetryIntervals        []time.Duration
@@ -100,7 +102,7 @@ func (b Bot) Handle(ctx context.Context, envelope Envelope) error {
 		return claim()
 	}
 	if message.ChannelType == "im" {
-		b.handleDM(ctx, message)
+		b.handleDM(ctx, message, envelope.ID)
 		return claim()
 	}
 	if message.Channel != b.ChannelID {
@@ -132,7 +134,7 @@ func (b Bot) Handle(ctx context.Context, envelope Envelope) error {
 	}
 	switch firstToken(text) {
 	case "help":
-		b.respondHelp(text, reply)
+		b.respondHelp(text, reply, false)
 	case "list":
 		b.list(ctx, message.User, reply)
 	case "create":
@@ -152,18 +154,76 @@ func (b Bot) Handle(ctx context.Context, envelope Envelope) error {
 	return claim()
 }
 
-func (b Bot) handleDM(ctx context.Context, message Message) {
+func (b Bot) handleDM(ctx context.Context, message Message, eventID string) {
 	respond := func(text string) { b.respond(ctx, message.Channel, "", text) }
+	maintainer := b.isMaintainer(message.User)
 	switch firstToken(message.Text) {
 	case "help":
-		b.respondHelp(message.Text, respond)
+		b.respondHelp(message.Text, respond, maintainer)
 	case "list":
 		b.list(ctx, message.User, respond)
+	case "refresh":
+		if message.Text != "refresh inventory" || !maintainer {
+			b.respondHelp("help", respond, false)
+			return
+		}
+		b.requestInventoryRefresh(ctx, message, eventID, respond)
 	case "create", "done", "destroy", "extend":
 		respond(rejectedText(channelOnlyText(b.ChannelID)))
 	default:
 		respond(unknownText())
 	}
+}
+
+func (b Bot) isMaintainer(user string) bool {
+	for _, id := range b.MaintainerIDs {
+		if user == id {
+			return true
+		}
+	}
+	return false
+}
+
+func (b Bot) requestInventoryRefresh(ctx context.Context, message Message, eventID string, respond func(string)) {
+	if b.Client == nil || b.Namespace == "" || b.InventoryConfigMap == "" || b.InventoryConfigKey == "" {
+		respond("Inventory refresh is unavailable. Try again later.")
+		return
+	}
+	configMap := &corev1.ConfigMap{}
+	if err := b.Client.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: b.InventoryConfigMap}, configMap); err != nil {
+		respond("Inventory refresh is unavailable. Try again later.")
+		return
+	}
+	configured, err := inventory.LoadConfig([]byte(configMap.Data[b.InventoryConfigKey]))
+	if err != nil || len(configured.Targets) == 0 {
+		respond("Inventory refresh is unavailable. Try again later.")
+		return
+	}
+	targets := make([]string, 0, len(configured.Targets))
+	for target := range configured.Targets {
+		targets = append(targets, target)
+	}
+	slices.Sort(targets)
+	requestID := eventID
+	if requestID == "" {
+		requestID = "dm:" + message.Channel + ":" + message.Timestamp + ":" + message.User
+	}
+	request := state.ManualRefreshRequest{ID: requestID, ChannelID: message.Channel, OwnerID: message.User, Targets: targets}
+	store := state.NewInventoryStore(b.Client, b.Namespace)
+	alreadyRunning := false
+	for _, target := range targets {
+		_, active, duplicate, err := store.RequestManualRefresh(ctx, target, request)
+		if err != nil {
+			respond("Inventory refresh is unavailable. Try again later.")
+			return
+		}
+		alreadyRunning = alreadyRunning || active || duplicate
+	}
+	if alreadyRunning {
+		respond("Inventory refresh already running.")
+		return
+	}
+	respond("Inventory refresh started.")
 }
 
 func (b Bot) create(ctx context.Context, message Message, text string, respond func(string)) bool {
@@ -685,7 +745,7 @@ func (b Bot) respondCleanupCause(ctx context.Context, channel, thread string, cl
 		b.logf("release cleanup cause notice: %v", err)
 	}
 }
-func (b Bot) respondHelp(text string, respond func(string)) {
+func (b Bot) respondHelp(text string, respond func(string), maintainer bool) {
 	words := strings.Fields(text)
 	if len(words) > 2 {
 		respond(unknownText())
@@ -698,7 +758,7 @@ func (b Bot) respondHelp(text string, respond func(string)) {
 	var messages []string
 	switch topic {
 	case "":
-		messages = helpOverview()
+		messages = helpOverview(maintainer)
 	case "create":
 		messages = createHelp(b.Defaults)
 	case "done":
@@ -707,6 +767,13 @@ func (b Bot) respondHelp(text string, respond func(string)) {
 		messages = []string{"`extend [N[h]]` extends your ready lease by the configured duration or by 1 through 24 whole hours. Use it in your lifecycle thread or as `@servitor extend` in the configured channel. It is available only while the lease is ready, not during planning, cleanup, or after expiry."}
 	case "list":
 		messages = []string{"`list` shows available cluster state. `*` marks your allocation; cleanup in progress and cleanup complete are shown separately. Use it in a DM or as `@servitor list` in the configured channel."}
+	case "refresh":
+		if maintainer {
+			messages = []string{"`refresh inventory` starts or joins a private inventory refresh. Use it only in a DM; a safe completion summary follows."}
+		} else {
+			respond(unknownText())
+			return
+		}
 	default:
 		respond(unknownText())
 		return
@@ -778,10 +845,14 @@ func firstToken(text string) string {
 	}
 	return words[0]
 }
-func unknownText() string               { return "Command unknown.\n\n" + helpOverview()[0] }
+func unknownText() string               { return "Command unknown.\n\n" + helpOverview(false)[0] }
 func rejectedText(reason string) string { return "Command rejected.\n\n" + reason }
-func helpOverview() []string {
-	return []string{"Servitor provisions one temporary IBM Cloud cluster per Slack user.\n\nCommands\n```\nDM\n  help [command]          print help\n  list                    list clusters\n\nConfigured channel\n  @servitor help [command]  print help\n  @servitor create [safe options]  provision a new cluster\n  @servitor done            release your resources\n  @servitor extend [N[h]]   extend your lease\n  @servitor list            list clusters\n\nLifecycle thread\n  yes                       approve the cluster plan\n  no                        reject the cluster plan\n  done                      release your resources\n  extend [N[h]]             extend your lease\n```"}
+func helpOverview(maintainer bool) []string {
+	text := "Servitor provisions one temporary IBM Cloud cluster per Slack user.\n\nCommands\n```\nDM\n  help [command]          print help\n  list                    list clusters\n\nConfigured channel\n  @servitor help [command]  print help\n  @servitor create [safe options]  provision a new cluster\n  @servitor done            release your resources\n  @servitor extend [N[h]]   extend your lease\n  @servitor list            list clusters\n\nLifecycle thread\n  yes                       approve the cluster plan\n  no                        reject the cluster plan\n  done                      release your resources\n  extend [N[h]]             extend your lease\n"
+	if maintainer {
+		text += "\nMaintainer DM\n  refresh inventory         refresh private inventory\n"
+	}
+	return []string{text + "```"}
 }
 func createHelp(defaults command.CreateDefaults) []string {
 	return []string{"`create` starts planning from the configured channel root. Configured defaults: version " + safeHelpCell(defaults.Version) + ", target " + safeHelpCell(defaults.Target) + ", provider " + safeHelpCell(defaults.Provider) + ". `--provider` chooses infrastructure; version chooses Kubernetes or OpenShift. Cluster names are generated internally.\n\nUse `key=value`, `--key=value`, or `--key value`; forms can be mixed. A current common-option inventory also recognizes unique bare values, for example `create target=synthetic-target vpc-gen2 us-south-1 bx2.4x16 resource-group=\"Platform Team\"`. Unknown or colliding shorthand must use a key such as `flavor=value`; worker counts and uncommon Satellite values stay keyed. Use `roks` (also `openshift` or `default_openshift`) for the cloud default OpenShift stream, or `iks` (also `kubernetes`, `k8s`, or `default_kubernetes`) for Kubernetes. A compatible numeric stream can refine an alias: `create roks 4.17`. These reserved aliases require a key when used as resource names.\n\nReview the resolved stream and configuration in its thread. The review prompt shows the persisted approval deadline; reply with exact `yes` or `no` before that deadline.", "Safe create options\n```\nCommon\n  --target --provider --version --resource-group --worker-count\n\nVPC Gen 2\n  --zone --flavor --vpc-id --subnet-id --public-gateway-id\n\nClassic\n  --datacenter --machine-type --public-vlan-id --private-vlan-id\n\nSatellite\n  --satellite-zone --satellite-managed-from --satellite-location-id\n  --satellite-host-image --satellite-host-profile --satellite-ssh-key-id\n  --satellite-worker-instance-id --satellite-worker-operating-system\n```"}

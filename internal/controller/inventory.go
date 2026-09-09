@@ -112,6 +112,12 @@ func (r *InventoryReconciler) refreshTarget(ctx context.Context, store *state.In
 		obsolete = current.ActiveRunID
 		current.Revision = revision
 		current.ActiveRunID = ""
+		for index := range current.ManualRefreshRequests {
+			request := &current.ManualRefreshRequests[index]
+			if request.Outcome == "" {
+				request.RunID = ""
+			}
+		}
 		current.RunDeadlineAt = nil
 		current.NextAttemptAt = nil
 		current.PublishedAt = nil
@@ -143,6 +149,7 @@ func (r *InventoryReconciler) refreshTarget(ctx context.Context, store *state.In
 			return nil
 		}
 		current.ActiveRunID = runID
+		state.BindManualRefreshes(current, runID)
 		current.RunDeadlineAt = ptrTime(now.Add(pipeline.InventoryRunTimeout))
 		current.NextAttemptAt = nil
 		current.Disposition = state.InventoryRunning
@@ -221,6 +228,7 @@ func (r *InventoryReconciler) observeInventoryRun(ctx context.Context, store *st
 		if next.Revision != current.Revision || next.ActiveRunID != current.ActiveRunID {
 			return errStaleInventoryRun
 		}
+		state.CompleteManualRefreshes(next, current.ActiveRunID, state.ManualRefreshSucceeded)
 		next.ActiveRunID = ""
 		next.RunDeadlineAt = nil
 		next.Catalog = &report.Catalog
@@ -248,6 +256,7 @@ func (r *InventoryReconciler) failInventoryRun(ctx context.Context, store *state
 		if current.Revision != revision || current.ActiveRunID != runID {
 			return errStaleInventoryRun
 		}
+		state.CompleteManualRefreshes(current, runID, state.ManualRefreshFailed)
 		current.ActiveRunID = ""
 		current.RunDeadlineAt = nil
 		current.NextAttemptAt = ptrTime(nextAttempt)
@@ -310,11 +319,19 @@ func (r *InventoryReconciler) SetupWithManager(manager ctrl.Manager) error {
 			return object.GetNamespace() == r.Config.Namespace && object.GetName() == r.Config.TargetConfigMap
 		}))).
 		Watches(&tektonv1.PipelineRun{}, handler.EnqueueRequestsFromMapFunc(r.mapInventoryRun)).
+		Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(r.mapInventoryState)).
 		Complete(r)
 }
 
 func (r *InventoryReconciler) mapInventoryRun(_ context.Context, object client.Object) []ctrl.Request {
 	if object.GetNamespace() != r.Config.Namespace || object.GetLabels()[pipeline.InventoryRunLabel] == "" || object.GetLabels()[pipeline.InventoryTargetLabel] == "" {
+		return nil
+	}
+	return []ctrl.Request{{NamespacedName: types.NamespacedName{Namespace: r.Config.Namespace, Name: r.Config.TargetConfigMap}}}
+}
+
+func (r *InventoryReconciler) mapInventoryState(_ context.Context, object client.Object) []ctrl.Request {
+	if object.GetNamespace() != r.Config.Namespace || object.GetLabels()["servitor.bevicted.github.io/inventory-state"] != "true" {
 		return nil
 	}
 	return []ctrl.Request{{NamespacedName: types.NamespacedName{Namespace: r.Config.Namespace, Name: r.Config.TargetConfigMap}}}

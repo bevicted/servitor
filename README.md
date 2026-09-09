@@ -48,6 +48,7 @@ Enable Socket Mode with `connections:write`, `chat:write`, and the message-histo
 DM
   help [command]
   list
+  refresh inventory  (configured maintainers only)
 
 Configured channel
   @servitor help [command]
@@ -68,13 +69,15 @@ Lifecycle thread
 
 Ready messages show how to extend or release an allocation: reply with `extend [N[h]]` or `done` in its lifecycle thread, or use `@servitor extend [N[h]]` or `@servitor done` in the configured channel.
 
-There are no maintainer `status`, `pause`, `unpause`, or `stop` commands, and no replacement command for them. Cleanup notices use the persisted initiating reason before completion, including when a notifier first observes a terminal phase. Scheduled destroy retries show their persisted retry number and UTC deadline. Slack delivery is not exactly once: a delivery claim prevents concurrent command/notifier duplicates and is released on a failed reply, but a crash during that non-transactional sequence can still duplicate or suppress a notice. Arbitrary Slack or controller outages can also outlast the observable cleanup grace.
+Optional `slack.maintainer_ids` holds exact Slack user IDs. Only those users can send the exact `refresh inventory` command in a DM; it starts or joins the normal private target refreshes and later receives a safe success, partial-failure, or failure summary. Empty `maintainer_ids` disables the command. The command never reveals target inventories or changes allocations. There are no maintainer `status`, `pause`, `unpause`, or `stop` commands.
+
+Cleanup notices use the persisted initiating reason before completion, including when a notifier first observes a terminal phase. Scheduled destroy retries show their persisted retry number and UTC deadline. Slack delivery is not exactly once: a delivery claim prevents concurrent command/notifier duplicates and is released on a failed reply, but a crash during that non-transactional sequence can still duplicate or suppress a notice. Arbitrary Slack or controller outages can also outlast the observable cleanup grace.
 
 ## Operations and diagnostics
 
 Use opaque Kubernetes references when investigating a lifecycle: the namespaced `ServitorCluster` name/UID, `status.operation.id`, `status.operation.pipelineRunName`, the matching TaskRun, and the report container's private Pod log. Inspect private cluster logs with authorized cluster access. Do not expose or copy credentials, raw Terraform plans or state, task report internals, workspace paths, or host filesystem paths into Slack, CR status, tickets, or source control.
 
-Excluded behavior is intentional: no local compatibility or allocation migration, no local filesystem/process supervision, no PVC or artifact store, no Tekton worker-loss recovery, no management-cluster disaster recovery, no exactly-once Slack guarantee, and no maintainer-command replacement.
+Excluded behavior is intentional: no local compatibility or allocation migration, no local filesystem/process supervision, no PVC or artifact store, no Tekton worker-loss recovery, no management-cluster disaster recovery, no exactly-once Slack guarantee, and no maintainer admission, status, pause, unpause, or stop commands.
 
 ## Sample CR
 

@@ -35,6 +35,22 @@ func TestValidateFailsClosedForRequiredDeploymentInputs(t *testing.T) {
 	}
 }
 
+func TestValidateMaintainerIDsAreOptionalExactValues(t *testing.T) {
+	configuration := validConfig()
+	for _, ids := range [][]string{nil, {}, {"U012AB3CD"}, {"U012AB3CD", "W012AB3CD"}} {
+		configuration.Slack.MaintainerIDs = ids
+		if err := configuration.Validate(); err != nil {
+			t.Fatalf("Validate(%q) error = %v", ids, err)
+		}
+	}
+	for _, ids := range [][]string{{""}, {" U012AB3CD"}, {"U012AB3CD "}, {"U012 AB3CD"}, {"maintainer"}, {"u012AB3CD"}, {"B012AB3CD"}, {"U123"}, {"U012AB3CD", "U012AB3CD"}} {
+		configuration.Slack.MaintainerIDs = ids
+		if err := configuration.Validate(); err == nil {
+			t.Fatalf("Validate(%q) unexpectedly succeeded", ids)
+		}
+	}
+}
+
 func TestValidateRejectsCloudDefaultVersionAliases(t *testing.T) {
 	for _, alias := range []string{"default_openshift", "default_kubernetes"} {
 		configuration := validConfig()
@@ -178,7 +194,7 @@ func validConfig() Config {
 
 func validYAML() string {
 	return `namespace: servitor
-slack: {channel_id: C123}
+slack: {channel_id: C123, maintainer_ids: [U012AB3CD, W012AB3CD]}
 defaults: {version: "4.22", target: production, provider: vpc-gen2, resource_group: Default, zone: us-south-1, vpc_id: vpc, openshift_flavor: bx2.4x16, kubernetes_flavor: bx2.2x8}
 lifecycle: {confirmation_timeout: 5m, lease: 4h, retry_intervals: [1m, 5m, 15m]}
 ict: {target_config_map: servitor-ict-config, target_config_key: config.yaml}

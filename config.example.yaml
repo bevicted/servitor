@@ -5,6 +5,8 @@
 namespace: servitor
 slack:
   channel_id: C_REPLACE_ME
+  # Optional exact Slack user IDs allowed to run `refresh inventory` in a DM.
+  maintainer_ids: []
 defaults:
   version: "4.22"
   target: REPLACE_ME

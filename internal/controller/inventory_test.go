@@ -165,6 +165,41 @@ func TestInventoryRefreshFailsExpiredActiveRun(t *testing.T) {
 	}
 }
 
+func TestInventoryRefreshNoopSyncDoesNotRewriteWatchedState(t *testing.T) {
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	refresher, kube, _ := newInventoryHarness(t, &now, targetConfigYAML("vpc-gen2"))
+	target := inventory.TargetConfig{Providers: []string{"vpc-gen2"}, Endpoints: inventoryEndpoints()}
+	revision, err := inventory.Revision(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := state.NewInventoryStore(kube, "servitor")
+	if _, err := store.Update(context.Background(), "target-a", func(current *state.InventoryState) error {
+		current.Revision = revision
+		current.NextAttemptAt = ptrTime(now.Add(time.Hour))
+		current.Disposition = state.InventoryFailed
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	before := &corev1.ConfigMap{}
+	key := types.NamespacedName{Namespace: "servitor", Name: store.Name("target-a")}
+	if err := kube.Get(context.Background(), key, before); err != nil {
+		t.Fatal(err)
+	}
+	if result, err := refresher.Sync(context.Background()); err != nil || result.RequeueAfter != time.Hour {
+		t.Fatalf("no-op sync = %+v, %v", result, err)
+	}
+	after := &corev1.ConfigMap{}
+	if err := kube.Get(context.Background(), key, after); err != nil {
+		t.Fatal(err)
+	}
+	if after.ResourceVersion != before.ResourceVersion || after.Data["state.json"] != before.Data["state.json"] {
+		t.Fatalf("no-op sync rewrote watched inventory state: before=%s after=%s", before.ResourceVersion, after.ResourceVersion)
+	}
+}
+
 func TestInventoryRefreshHandlesPartialTargetFailureIndependently(t *testing.T) {
 	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
 	refresher, kube, logs := newInventoryHarness(t, &now, multiTargetConfigYAML())
@@ -276,6 +311,82 @@ func TestInventoryRefreshRetainsLastGoodAndInvalidatesChangedTarget(t *testing.T
 	}
 	if _, err := store.Get(context.Background(), "target-a"); !apierrors.IsNotFound(err) {
 		t.Fatalf("removed target state remains: %v", err)
+	}
+}
+
+func TestManualInventoryRefreshUsesNormalSchedulerPath(t *testing.T) {
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	refresher, kube, _ := newInventoryHarness(t, &now, targetConfigYAML("vpc-gen2"))
+	store := state.NewInventoryStore(kube, "servitor")
+	request := state.ManualRefreshRequest{ID: "event-queued", ChannelID: "D1", OwnerID: "U1", Targets: []string{"target-a"}}
+	if _, active, duplicate, err := store.RequestManualRefresh(context.Background(), "target-a", request); err != nil || active || duplicate {
+		t.Fatalf("queue manual refresh = active:%t duplicate:%t err:%v", active, duplicate, err)
+	}
+	if _, err := refresher.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	current, err := store.Get(context.Background(), "target-a")
+	if err != nil || current.ActiveRunID == "" || len(current.ManualRefreshRequests) != 1 || current.ManualRefreshRequests[0].RunID != current.ActiveRunID {
+		t.Fatalf("scheduled manual refresh = %+v, %v", current, err)
+	}
+	var runs tektonv1.PipelineRunList
+	if err := kube.List(context.Background(), &runs, client.InNamespace("servitor")); err != nil || len(runs.Items) != 1 || runs.Items[0].Name != current.ActiveRunID {
+		t.Fatalf("manual refresh run = %+v, %v", runs.Items, err)
+	}
+}
+
+func TestManualInventoryRefreshJoinsScheduledRunAndPersistsOutcomes(t *testing.T) {
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	refresher, kube, logs := newInventoryHarness(t, &now, multiTargetConfigYAML())
+	if _, err := refresher.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	store := state.NewInventoryStore(kube, "servitor")
+	request := state.ManualRefreshRequest{ID: "event-1", ChannelID: "D1", OwnerID: "U1", Targets: []string{"target-a", "target-b"}}
+	for _, target := range request.Targets {
+		if _, active, duplicate, err := store.RequestManualRefresh(context.Background(), target, request); err != nil || !active || duplicate {
+			t.Fatalf("join active %s = active:%t duplicate:%t err:%v", target, active, duplicate, err)
+		}
+		if _, _, duplicate, err := store.RequestManualRefresh(context.Background(), target, request); err != nil || !duplicate {
+			t.Fatalf("replayed %s = duplicate:%t err:%v", target, duplicate, err)
+		}
+	}
+	if _, err := refresher.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var runs tektonv1.PipelineRunList
+	if err := kube.List(context.Background(), &runs, client.InNamespace("servitor")); err != nil || len(runs.Items) != 2 {
+		t.Fatalf("manual join changed scheduler run count: %d, %v", len(runs.Items), err)
+	}
+	first, err := store.Get(context.Background(), "target-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	completeInventoryRun(t, kube, first.ActiveRunID, "manual-success")
+	logs.data = inventoryReportBytes(t, "target-a", first.ActiveRunID, first.Revision, "Last Good")
+	second, err := store.Get(context.Background(), "target-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	failed := &tektonv1.PipelineRun{}
+	if err := kube.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: second.ActiveRunID}, failed); err != nil {
+		t.Fatal(err)
+	}
+	failed.Status.Status.Conditions = duckv1.Conditions{{Type: apis.ConditionSucceeded, Status: corev1.ConditionFalse}}
+	if err := kube.Status().Update(context.Background(), failed); err != nil {
+		t.Fatal(err)
+	}
+	// A replacement reconciler adopts the two stored runs rather than creating
+	// another run, then records the safe terminal status for each request.
+	restarted := *refresher
+	if _, err := restarted.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for target, want := range map[string]string{"target-a": state.ManualRefreshSucceeded, "target-b": state.ManualRefreshFailed} {
+		current, err := store.Get(context.Background(), target)
+		if err != nil || len(current.ManualRefreshRequests) != 1 || current.ManualRefreshRequests[0].Outcome != want {
+			t.Fatalf("manual outcome %s = %+v, %v", target, current.ManualRefreshRequests, err)
+		}
 	}
 }
 

@@ -22,10 +22,11 @@ import (
 )
 
 const (
-	inventoryStatePrefix   = "servitor-inventory-"
-	inventoryStateLabel    = "servitor.bevicted.github.io/inventory-state"
-	inventoryStateKey      = "state.json"
-	maxInventoryStateBytes = 512 * 1024
+	inventoryStatePrefix     = "servitor-inventory-"
+	inventoryStateLabel      = "servitor.bevicted.github.io/inventory-state"
+	inventoryStateKey        = "state.json"
+	maxInventoryStateBytes   = 512 * 1024
+	maxManualRefreshRequests = 512
 )
 
 type InventoryDisposition string
@@ -42,16 +43,36 @@ const (
 
 // InventoryState is the private, target-scoped durable state for discovery.
 type InventoryState struct {
-	Version       int                  `json:"version"`
-	Target        string               `json:"target"`
-	Revision      string               `json:"revision"`
-	ActiveRunID   string               `json:"activeRunID,omitempty"`
-	RunDeadlineAt *metav1.Time         `json:"runDeadlineAt,omitempty"`
-	NextAttemptAt *metav1.Time         `json:"nextAttemptAt,omitempty"`
-	PublishedAt   *metav1.Time         `json:"publishedAt,omitempty"`
-	Catalog       *inventory.Catalog   `json:"catalog,omitempty"`
-	Disposition   InventoryDisposition `json:"disposition"`
+	Version               int                    `json:"version"`
+	Target                string                 `json:"target"`
+	Revision              string                 `json:"revision"`
+	ActiveRunID           string                 `json:"activeRunID,omitempty"`
+	RunDeadlineAt         *metav1.Time           `json:"runDeadlineAt,omitempty"`
+	NextAttemptAt         *metav1.Time           `json:"nextAttemptAt,omitempty"`
+	PublishedAt           *metav1.Time           `json:"publishedAt,omitempty"`
+	Catalog               *inventory.Catalog     `json:"catalog,omitempty"`
+	Disposition           InventoryDisposition   `json:"disposition"`
+	ManualRefreshRequests []ManualRefreshRequest `json:"manualRefreshRequests,omitempty"`
 }
+
+// ManualRefreshRequest records one maintainer DM and its eventual safe reply.
+// A copy is stored for every configured target so it can join that target's
+// automatic refresh without a separate manual execution path.
+type ManualRefreshRequest struct {
+	ID              string       `json:"id"`
+	ChannelID       string       `json:"channelID"`
+	ThreadTimestamp string       `json:"threadTimestamp,omitempty"`
+	OwnerID         string       `json:"ownerID"`
+	Targets         []string     `json:"targets"`
+	RunID           string       `json:"runID,omitempty"`
+	Outcome         string       `json:"outcome,omitempty"`
+	DeliveredAt     *metav1.Time `json:"deliveredAt,omitempty"`
+}
+
+const (
+	ManualRefreshSucceeded = "succeeded"
+	ManualRefreshFailed    = "failed"
+)
 
 // InventoryStore persists inventory state in namespaced ConfigMaps.
 type InventoryStore struct {
@@ -108,7 +129,7 @@ func (s *InventoryStore) Update(ctx context.Context, target string, mutate func(
 				}
 				return err
 			}
-		} else {
+		} else if cm.Data[inventoryStateKey] != string(encoded) {
 			if cm.Data == nil {
 				cm.Data = map[string]string{}
 			}
@@ -124,6 +145,70 @@ func (s *InventoryStore) Update(ctx context.Context, target string, mutate func(
 		return InventoryState{}, fmt.Errorf("update inventory state: %w", err)
 	}
 	return result, nil
+}
+
+// RequestManualRefresh persists a maintainer request before the controller
+// observes it. It joins an active automatic or manual run when one exists.
+func (s *InventoryStore) RequestManualRefresh(ctx context.Context, target string, request ManualRefreshRequest) (state InventoryState, alreadyRunning, duplicate bool, err error) {
+	state, err = s.Update(ctx, target, func(current *InventoryState) error {
+		for _, existing := range current.ManualRefreshRequests {
+			if existing.ID == request.ID {
+				duplicate = true
+				alreadyRunning = true
+				return nil
+			}
+			if existing.Outcome == "" {
+				alreadyRunning = true
+			}
+		}
+		request.RunID = current.ActiveRunID
+		current.ManualRefreshRequests = pruneManualRefreshRequests(append(current.ManualRefreshRequests, request))
+		if current.ActiveRunID != "" {
+			alreadyRunning = true
+			return nil
+		}
+		// A manual request uses the ordinary scheduler path, but it must not wait
+		// for an hourly or failure-backoff deadline.
+		current.NextAttemptAt = nil
+		return nil
+	})
+	return state, alreadyRunning, duplicate, err
+}
+
+// BindManualRefreshes associates queued requests with the run the controller
+// selected through its ordinary per-target scheduling path.
+func BindManualRefreshes(state *InventoryState, runID string) {
+	for index := range state.ManualRefreshRequests {
+		request := &state.ManualRefreshRequests[index]
+		if request.RunID == "" && request.Outcome == "" {
+			request.RunID = runID
+		}
+	}
+}
+
+// CompleteManualRefreshes records a safe terminal outcome for requests that
+// joined runID. The notifier owns delivery acknowledgement separately.
+func CompleteManualRefreshes(state *InventoryState, runID, outcome string) {
+	for index := range state.ManualRefreshRequests {
+		request := &state.ManualRefreshRequests[index]
+		if request.RunID == runID && request.Outcome == "" {
+			request.Outcome = outcome
+		}
+	}
+}
+
+// MarkManualRefreshDelivered records a completion reply that Slack accepted.
+func (s *InventoryStore) MarkManualRefreshDelivered(ctx context.Context, target, id string, deliveredAt time.Time) error {
+	_, err := s.Update(ctx, target, func(current *InventoryState) error {
+		for index := range current.ManualRefreshRequests {
+			request := &current.ManualRefreshRequests[index]
+			if request.ID == id {
+				request.DeliveredAt = ptrInventoryTime(deliveredAt)
+			}
+		}
+		return nil
+	})
+	return err
 }
 
 func (s *InventoryStore) Get(ctx context.Context, target string) (InventoryState, error) {
@@ -198,8 +283,35 @@ func decodeInventoryState(data string) (InventoryState, error) {
 }
 
 func validateInventoryState(state InventoryState, target string) error {
-	if state.Version != 1 || state.Target != target || target == "" || state.Disposition == "" {
+	if state.Version != 1 || state.Target != target || target == "" || state.Disposition == "" || len(state.ManualRefreshRequests) > maxManualRefreshRequests {
 		return errors.New("inventory state is invalid")
 	}
+	seen := make(map[string]struct{}, len(state.ManualRefreshRequests))
+	for _, request := range state.ManualRefreshRequests {
+		if request.ID == "" || request.ChannelID == "" || request.OwnerID == "" || len(request.Targets) == 0 || (request.Outcome != "" && request.Outcome != ManualRefreshSucceeded && request.Outcome != ManualRefreshFailed) {
+			return errors.New("inventory state is invalid")
+		}
+		if _, found := seen[request.ID]; found {
+			return errors.New("inventory state is invalid")
+		}
+		seen[request.ID] = struct{}{}
+	}
 	return nil
+}
+
+func pruneManualRefreshRequests(requests []ManualRefreshRequest) []ManualRefreshRequest {
+	if len(requests) < maxManualRefreshRequests {
+		return requests
+	}
+	for index, request := range requests {
+		if request.DeliveredAt != nil {
+			return append(requests[:index], requests[index+1:]...)
+		}
+	}
+	return requests
+}
+
+func ptrInventoryTime(value time.Time) *metav1.Time {
+	result := metav1.NewTime(value.UTC())
+	return &result
 }

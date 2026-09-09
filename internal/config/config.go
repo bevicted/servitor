@@ -18,7 +18,10 @@ import (
 
 const defaultPath = "/etc/servitor/config/config.yaml"
 
-var dnsLabel = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`)
+var (
+	dnsLabel      = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`)
+	slackMemberID = regexp.MustCompile(`^[UW][A-Z0-9]{8,}$`)
+)
 
 // Config contains only non-secret deployment inputs. Kubernetes Secret names
 // identify credentials; credential values are read by the workloads that need them.
@@ -35,7 +38,8 @@ type Config struct {
 }
 
 type SlackConfig struct {
-	ChannelID string `yaml:"channel_id"`
+	ChannelID     string   `yaml:"channel_id"`
+	MaintainerIDs []string `yaml:"maintainer_ids"`
 }
 
 type DefaultsConfig struct {
@@ -186,6 +190,16 @@ func (c Config) Validate() error {
 	}
 	if c.Slack.ChannelID == "" {
 		return errors.New("config: slack.channel_id is required")
+	}
+	maintainers := make(map[string]struct{}, len(c.Slack.MaintainerIDs))
+	for _, id := range c.Slack.MaintainerIDs {
+		if !slackMemberID.MatchString(id) {
+			return errors.New("config: slack.maintainer_ids contains an invalid ID")
+		}
+		if _, duplicate := maintainers[id]; duplicate {
+			return errors.New("config: slack.maintainer_ids contains a duplicate ID")
+		}
+		maintainers[id] = struct{}{}
 	}
 	for _, field := range []struct{ name, value string }{
 		{"ict.target_config_map", c.ICT.TargetConfigMap},

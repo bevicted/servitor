@@ -19,7 +19,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	ctrlconfig "sigs.k8s.io/controller-runtime/pkg/client/config"
@@ -46,7 +45,7 @@ func main() {
 	if err != nil {
 		fail(err)
 	}
-	restConfig, err := config2()
+	restConfig, err := ctrlconfig.GetConfig()
 	if err != nil {
 		fail(err)
 	}
@@ -89,7 +88,7 @@ func main() {
 	bot := slackbot.Bot{
 		ChannelID: operator.Slack.ChannelID, Namespace: operator.Namespace, Client: manager.GetClient(),
 		Events: state.NewEventStore(manager.GetClient(), operator.Namespace), Defaults: commandDefaults(operator),
-		InventoryConfigMap: operator.ICT.TargetConfigMap, InventoryConfigKey: operator.ICT.TargetConfigKey, InventoryMaximumAge: operator.InventoryMaximumAge(),
+		InventoryConfigMap: operator.ICT.TargetConfigMap, InventoryConfigKey: operator.ICT.TargetConfigKey, InventoryMaximumAge: operator.InventoryMaximumAge(), MaintainerIDs: operator.Slack.MaintainerIDs,
 		Lease: operator.Lifecycle.Lease, RetryIntervals: operator.Lifecycle.RetryIntervals, Responder: transport, Permalinks: transport,
 	}
 	if err := manager.Add(slackbot.NewLeaderRunnable(transport, bot)); err != nil {
@@ -97,6 +96,9 @@ func main() {
 	}
 	if err := manager.Add(&slackbot.StatusNotifier{Client: manager.GetClient(), Namespace: operator.Namespace, Responder: transport, Receipts: state.NewEventStore(manager.GetClient(), operator.Namespace)}); err != nil {
 		fail(fmt.Errorf("configure Slack notifications: %w", err))
+	}
+	if err := manager.Add(&slackbot.InventoryRefreshNotifier{Client: manager.GetClient(), Namespace: operator.Namespace, Responder: transport, Receipts: state.NewEventStore(manager.GetClient(), operator.Namespace)}); err != nil {
+		fail(fmt.Errorf("configure inventory refresh notifications: %w", err))
 	}
 	if err := manager.Start(ctrl.SetupSignalHandler()); err != nil && !errors.Is(err, context.Canceled) {
 		fail(err)
@@ -140,7 +142,6 @@ func inventoryControllerConfig(operator config.Config) controller.InventoryConfi
 	}
 }
 
-func config2() (*rest.Config, error) { return ctrlconfig.GetConfig() }
 func commandDefaults(operator config.Config) command.CreateDefaults {
 	return command.CreateDefaults{Version: operator.Defaults.Version, Target: operator.Defaults.Target, Provider: operator.Defaults.Provider, ResourceGroup: operator.Defaults.ResourceGroup, Zone: operator.Defaults.Zone, VPCID: operator.Defaults.VPCID, OpenShiftFlavor: operator.Defaults.OpenShiftFlavor, KubernetesFlavor: operator.Defaults.KubernetesFlavor}
 }
