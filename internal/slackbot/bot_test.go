@@ -8,6 +8,7 @@ import (
 	"time"
 
 	servitorv1alpha1 "github.com/bevicted/servitor/api/v1alpha1"
+	"github.com/bevicted/servitor/internal/command"
 	"github.com/bevicted/servitor/internal/state"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -201,6 +202,21 @@ func TestStaleExtensionDoesNotRecomputeTargetAfterReceiptEviction(t *testing.T) 
 	}
 	if current.Spec.Lifecycle.RequestedExpiry == nil || !current.Spec.Lifecycle.RequestedExpiry.Equal(firstTarget) {
 		t.Fatalf("stale event changed target to %v, want %v", current.Spec.Lifecycle.RequestedExpiry, firstTarget)
+	}
+}
+
+func TestCreateRejectsPlatformAndHelpDoesNotAdvertiseIt(t *testing.T) {
+	bot, responses := botForTest(t)
+	if err := bot.Handle(context.Background(), Envelope{ID: "platform", Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "<@BOT> create --version 4.22 --platform kubernetes", Timestamp: "123"}}); err != nil {
+		t.Fatal(err)
+	}
+	if len(responses.responses) != 1 || !containsText(responses.responses[0].Text, `unknown create flag "--platform"`) {
+		t.Fatalf("responses=%+v", responses.responses)
+	}
+	for _, page := range createHelp(command.CreateDefaults{}) {
+		if containsText(page, "--platform") {
+			t.Fatalf("create help advertises platform: %s", page)
+		}
 	}
 }
 

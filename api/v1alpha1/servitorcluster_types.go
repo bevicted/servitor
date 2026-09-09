@@ -36,7 +36,6 @@ type SlackIdentity struct {
 type UserOptions struct {
 	Target                         string   `json:"target,omitempty"`
 	Provider                       string   `json:"provider,omitempty"`
-	Platform                       string   `json:"platform,omitempty"`
 	Version                        string   `json:"version,omitempty"`
 	ResourceGroup                  string   `json:"resourceGroup,omitempty"`
 	Zone                           string   `json:"zone,omitempty"`
@@ -81,6 +80,7 @@ type ServitorClusterSpec struct {
 // ResolvedOptions are the once-frozen effective planning inputs.
 type ResolvedOptions struct {
 	UserOptions `json:",inline"`
+	Platform    string `json:"platform,omitempty"`
 	ClusterName string `json:"clusterName,omitempty"`
 	Region      string `json:"region,omitempty"`
 }

@@ -172,6 +172,10 @@ func run(ctx context.Context, uid, operation, kind, optionsFile, backendFile, re
 }
 
 func runPlan(ctx context.Context, uid, operation string, options servitorv1alpha1.ResolvedOptions, backendFile, resultFile, reportFile, ictPath, terraformPath string) error {
+	platform, err := command.InferPlatform(options.Version)
+	if err != nil || options.Platform != platform {
+		return errors.New("resolved platform does not match version")
+	}
 	args := append([]string{"plan", operation, "--backend-config", backendFile, "--result-file", resultFile, "--prefix", "servitor"}, optionArgs(options)...)
 	if _, err := (command.Runner{MaxOutput: 64 * 1024, Log: os.Stderr}).Run(ctx, ictPath, args...); err != nil {
 		return err
@@ -193,6 +197,13 @@ func runPlan(ctx context.Context, uid, operation string, options servitorv1alpha
 	options, err = resolvedOptionsFromValues(options, result.Values)
 	if err != nil {
 		return err
+	}
+	recoveryOptions, err := resolvedOptionsFromValues(options, result.Recovery.Values)
+	if err != nil {
+		return fmt.Errorf("ICT produced invalid recovery values: %w", err)
+	}
+	if recoveryOptions.Version != options.Version || recoveryOptions.Platform != options.Platform {
+		return errors.New("ICT recovery values are inconsistent with planning result")
 	}
 	recovery := servitorv1alpha1.RecoveryMetadata{Version: result.Recovery.Version, Target: result.Recovery.Target, Endpoints: result.Recovery.Endpoints, Values: result.Recovery.Values, SatelliteSSHPublicKeyFingerprint: result.Recovery.SatelliteSSHPublicKeyFingerprint, TFVarsSHA256: result.Recovery.TFVarsSHA256}
 	return writeReport(reportFile, pipeline.Report{Version: 1, ClusterUID: uid, OperationID: operation, ResolvedOptions: options, Recovery: recovery, Review: summaryFromPlan(plan)})
@@ -321,10 +332,13 @@ func resolvedOptionsFromValues(options servitorv1alpha1.ResolvedOptions, values 
 	if provider == "" {
 		return servitorv1alpha1.ResolvedOptions{}, errors.New("ICT produced an unsupported cluster mode")
 	}
+	platform, err := command.InferPlatform(values.KubeVersion)
+	if err != nil || values.Platform != platform {
+		return servitorv1alpha1.ResolvedOptions{}, errors.New("ICT produced a platform inconsistent with its version")
+	}
 	options.UserOptions = servitorv1alpha1.UserOptions{
 		Target:                         options.Target,
 		Provider:                       provider,
-		Platform:                       values.Platform,
 		Version:                        values.KubeVersion,
 		ResourceGroup:                  values.ResourceGroupName,
 		Zone:                           values.Zone,
@@ -346,6 +360,7 @@ func resolvedOptionsFromValues(options servitorv1alpha1.ResolvedOptions, values 
 		SatelliteWorkerOperatingSystem: values.SatelliteWorkerOperatingSystem,
 		WorkerCount:                    values.WorkerCount,
 	}
+	options.Platform = platform
 	options.ClusterName = values.ClusterName
 	options.Region = values.Region
 	return options, nil
@@ -361,7 +376,7 @@ func optionArgs(options servitorv1alpha1.ResolvedOptions) []string {
 	}
 	add("--target", o.Target)
 	add("--provider", o.Provider)
-	add("--platform", o.Platform)
+	add("--platform", options.Platform)
 	add("--version", o.Version)
 	add("--resource-group", o.ResourceGroup)
 	add("--zone", o.Zone)

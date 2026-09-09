@@ -41,7 +41,7 @@ func normalizedLocation(provider, zone, datacenter string, satelliteZones []stri
 }
 
 var createFlags = map[string]bool{
-	"--target": true, "--provider": true, "--platform": true, "--version": true,
+	"--target": true, "--provider": true, "--version": true,
 	"--resource-group": true, "--zone": true, "--flavor": true, "--vpc-id": true,
 	"--subnet-id": true, "--public-gateway-id": true, "--datacenter": true,
 	"--machine-type": true, "--public-vlan-id": true, "--private-vlan-id": true,
@@ -130,16 +130,7 @@ func ResolveCreateOptions(options ExplicitCreateOptions, defaults CreateDefaults
 		return CreateRequest{}, fmt.Errorf("infer create platform: %w", err)
 	}
 	values["--version"] = []string{version}
-	platform := one(values, "--platform")
-	if platform == "" {
-		platform = inferredPlatform
-	}
-	if platform != "openshift" && platform != "kubernetes" {
-		return CreateRequest{}, fmt.Errorf("invalid platform %q", platform)
-	}
-	if platform != inferredPlatform {
-		return CreateRequest{}, fmt.Errorf("platform %q does not match version %q", platform, version)
-	}
+	platform := inferredPlatform
 	values["--platform"] = []string{platform}
 	setDefault := func(flag, value string) {
 		if one(values, flag) == "" {

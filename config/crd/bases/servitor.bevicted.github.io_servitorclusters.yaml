@@ -71,7 +71,6 @@ spec:
                       }
                     provider:
                       { type: string, enum: [vpc-gen2, classic, satellite] }
-                    platform: { type: string, enum: [kubernetes, openshift] }
                     version:
                       {
                         type: string,

@@ -63,7 +63,7 @@ func TestExtensionTargetUsesSnapshotDefaultAndKeepsUTC(t *testing.T) {
 }
 
 func TestParseCreateAcceptsEverySafeFlag(t *testing.T) {
-	request, err := ParseCreate(`create --target test --provider vpc-gen2 --platform openshift --version 4.22 --resource-group "Platform Team" --zone us-south-3 --flavor custom --vpc-id vpc-id --subnet-id subnet-one --subnet-id subnet-two --public-gateway-id gateway-one --public-gateway-id gateway-two --datacenter dal10 --machine-type b3c.4x16 --public-vlan-id public-vlan --private-vlan-id private-vlan --satellite-zone us-south-1 --satellite-zone us-south-2 --satellite-managed-from managed-from --satellite-location-id location-id --satellite-host-image image-id --satellite-host-profile bx2-4x16 --satellite-ssh-key-id ssh-key --satellite-worker-instance-id worker-one --satellite-worker-instance-id worker-two --satellite-worker-operating-system RHCOS --worker-count 3`, testCreateDefaults)
+	request, err := ParseCreate(`create --target test --provider vpc-gen2 --version 4.22 --resource-group "Platform Team" --zone us-south-3 --flavor custom --vpc-id vpc-id --subnet-id subnet-one --subnet-id subnet-two --public-gateway-id gateway-one --public-gateway-id gateway-two --datacenter dal10 --machine-type b3c.4x16 --public-vlan-id public-vlan --private-vlan-id private-vlan --satellite-zone us-south-1 --satellite-zone us-south-2 --satellite-managed-from managed-from --satellite-location-id location-id --satellite-host-image image-id --satellite-host-profile bx2-4x16 --satellite-ssh-key-id ssh-key --satellite-worker-instance-id worker-one --satellite-worker-instance-id worker-two --satellite-worker-operating-system RHCOS --worker-count 3`, testCreateDefaults)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -100,11 +100,11 @@ func TestParseCreateAppliesAndOverridesConfiguredDefaults(t *testing.T) {
 			want: []string{"--target", "synthetic-target", "--provider", "vpc-gen2", "--platform", "kubernetes", "--version", "1.31", "--resource-group", "Default", "--zone", "us-south-1", "--flavor", "bx2.2x8", "--vpc-id", "synthetic-vpc-id"},
 		},
 		{
-			name: "OpenShift overrides", text: "create --version=4.22 --target target --provider classic --platform openshift --resource-group group --zone zone --vpc-id vpc --flavor flavor", platform: "openshift",
+			name: "OpenShift overrides", text: "create --version=4.22 --target target --provider classic --resource-group group --zone zone --vpc-id vpc --flavor flavor", platform: "openshift",
 			want: []string{"--target", "target", "--provider", "classic", "--platform", "openshift", "--version", "4.22", "--resource-group", "group", "--zone", "zone", "--flavor", "flavor", "--vpc-id", "vpc"},
 		},
 		{
-			name: "Kubernetes flavor override", text: "create --version 1.31 --platform kubernetes --flavor kubernetes-flavor", platform: "kubernetes",
+			name: "Kubernetes flavor override", text: "create --version 1.31 --flavor kubernetes-flavor", platform: "kubernetes",
 			want: []string{"--target", "synthetic-target", "--provider", "vpc-gen2", "--platform", "kubernetes", "--version", "1.31", "--resource-group", "Default", "--zone", "us-south-1", "--flavor", "kubernetes-flavor", "--vpc-id", "synthetic-vpc-id"},
 		},
 	}
@@ -149,7 +149,7 @@ func TestParseCreateRejectsEveryProhibitedOrAmbiguousInput(t *testing.T) {
 		{"confirm stdin", "create --version 4.22 --confirm-stdin true"},
 		{"SSH public key path", "create --version 4.22 --satellite-ssh-public-key /secret"},
 		{"uninferable version", "create --version 5.1"},
-		{"mismatched platform", "create --version 4.22 --platform kubernetes"},
+		{"removed platform", "create --version 4.22 --platform kubernetes"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -169,7 +169,7 @@ func TestParseCreateRejectsEveryProhibitedOrAmbiguousInput(t *testing.T) {
 
 func TestParseCreateRejectsDuplicateAndMissingSingletonValues(t *testing.T) {
 	singletons := []struct{ flag, value string }{
-		{"--target", "target"}, {"--provider", "vpc-gen2"}, {"--platform", "openshift"}, {"--version", "4.22"},
+		{"--target", "target"}, {"--provider", "vpc-gen2"}, {"--version", "4.22"},
 		{"--resource-group", "group"}, {"--zone", "zone"}, {"--flavor", "flavor"}, {"--vpc-id", "vpc"},
 		{"--datacenter", "datacenter"}, {"--machine-type", "machine"}, {"--public-vlan-id", "public"}, {"--private-vlan-id", "private"},
 		{"--satellite-managed-from", "managed"}, {"--satellite-location-id", "location"}, {"--satellite-host-image", "image"},

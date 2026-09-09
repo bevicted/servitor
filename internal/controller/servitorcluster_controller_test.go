@@ -59,7 +59,7 @@ func TestReconcilePersistsOneOperationAndAdoptsMatchingReport(t *testing.T) {
 	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "cluster", Namespace: "ns", UID: "cluster-uid", Generation: 1}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "1.2"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 3600, RetrySeconds: []int64{60}, Approval: "approved"}}}
 	client := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&servitorv1alpha1.ServitorCluster{}, &tektonv1.PipelineRun{}, &tektonv1.TaskRun{}).WithObjects(cluster).Build()
 	now := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
-	reconciler := &Reconciler{Client: client, Scheme: scheme, Config: Config{Namespace: "ns", Defaults: servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Target: "target", Provider: "vpc-gen2", Platform: "openshift", Version: "4.22", ResourceGroup: "Default"}}, Backend: servitorv1alpha1.BackendIdentity{Version: 1, Bucket: "ict-state-bucket", Region: "us-south", Endpoint: "https://s3.us-south.example.invalid", SkipCredentialsValidation: true, SkipMetadataAPICheck: true, SkipRegionValidation: true, SkipRequestingAccountID: true, ForcePathStyle: true}, BackendPrefix: "servitor", ExecutionImage: "registry.example/ict@sha256:deadbeef", ReviewTimeout: 5 * time.Minute}, Now: func() time.Time { return now }}
+	reconciler := &Reconciler{Client: client, Scheme: scheme, Config: Config{Namespace: "ns", Defaults: servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Target: "target", Provider: "vpc-gen2", Version: "4.22", ResourceGroup: "Default"}, Platform: "openshift"}, Backend: servitorv1alpha1.BackendIdentity{Version: 1, Bucket: "ict-state-bucket", Region: "us-south", Endpoint: "https://s3.us-south.example.invalid", SkipCredentialsValidation: true, SkipMetadataAPICheck: true, SkipRegionValidation: true, SkipRequestingAccountID: true, ForcePathStyle: true}, BackendPrefix: "servitor", ExecutionImage: "registry.example/ict@sha256:deadbeef", ReviewTimeout: 5 * time.Minute}, Now: func() time.Time { return now }}
 	request := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "ns", Name: "cluster"}}
 	for i := 0; i < 4; i++ {
 		if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
@@ -139,6 +139,28 @@ func TestSnapshotOmitsVPCDefaultForClassic(t *testing.T) {
 
 	if cluster.Status.ResolvedOptions.Provider != "classic" || cluster.Status.ResolvedOptions.VPCID != "" {
 		t.Fatalf("Classic snapshot retained VPC default: %+v", cluster.Status.ResolvedOptions)
+	}
+}
+
+func TestSnapshotDerivesPlatformAndWorkerDefaultsFromVersion(t *testing.T) {
+	for _, test := range []struct {
+		version, platform, flavor string
+	}{
+		{version: "4.22", platform: "openshift", flavor: "bx2.4x16"},
+		{version: "1.31", platform: "kubernetes", flavor: "bx2.2x8"},
+	} {
+		cluster := &servitorv1alpha1.ServitorCluster{Spec: servitorv1alpha1.ServitorClusterSpec{UserOptions: servitorv1alpha1.UserOptions{Provider: "vpc-gen2", Version: test.version}}}
+		reconciler := Reconciler{Config: Config{
+			Defaults:         servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Provider: "vpc-gen2", Version: "4.22"}},
+			OpenShiftFlavor:  "bx2.4x16",
+			KubernetesFlavor: "bx2.2x8",
+		}}
+		if err := reconciler.snapshot(cluster); err != nil {
+			t.Fatal(err)
+		}
+		if cluster.Status.ResolvedOptions.Provider != "vpc-gen2" || cluster.Status.ResolvedOptions.Platform != test.platform || cluster.Status.ResolvedOptions.Flavor != test.flavor {
+			t.Fatalf("snapshot = %+v", cluster.Status.ResolvedOptions)
+		}
 	}
 }
 

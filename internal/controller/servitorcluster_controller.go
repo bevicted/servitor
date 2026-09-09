@@ -555,11 +555,7 @@ func (r *Reconciler) snapshot(cluster *servitorv1alpha1.ServitorCluster) error {
 	if err != nil {
 		return fmt.Errorf("infer platform: %w", err)
 	}
-	if resolved.Platform == "" {
-		resolved.Platform = platform
-	} else if resolved.Platform != platform {
-		return fmt.Errorf("platform %q does not match version %q", resolved.Platform, resolved.Version)
-	}
+	resolved.Platform = platform
 	if resolved.Provider == "vpc-gen2" && resolved.Flavor == "" {
 		if resolved.Platform == "openshift" {
 			resolved.Flavor = r.Config.OpenShiftFlavor
@@ -649,9 +645,6 @@ func overlay(dst *servitorv1alpha1.UserOptions, supplied servitorv1alpha1.UserOp
 	}
 	if supplied.Provider != "" {
 		dst.Provider = supplied.Provider
-	}
-	if supplied.Platform != "" {
-		dst.Platform = supplied.Platform
 	}
 	if supplied.Version != "" {
 		dst.Version = supplied.Version

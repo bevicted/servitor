@@ -29,6 +29,22 @@ func TestServitorClusterSpecRequiresWholeHourInitialLease(t *testing.T) {
 	}
 }
 
+func TestRecoveryValuesSatelliteRequiresOpenShift(t *testing.T) {
+	values := RecoveryValues{
+		ClusterName: "satellite-cluster", ResourceGroupName: "Default", Region: "us-south",
+		ClusterMode: "satellite", Platform: "kubernetes", KubeVersion: "1.31", WorkerCount: 3,
+		SatelliteZones: []string{"us-south-1", "us-south-2", "us-south-3"},
+	}
+	if err := values.validate(); err == nil {
+		t.Fatal("Satellite recovery accepted Kubernetes")
+	}
+	values.Platform = "openshift"
+	values.KubeVersion = "4.22_openshift"
+	if err := values.validate(); err != nil {
+		t.Fatalf("Satellite recovery rejected OpenShift: %v", err)
+	}
+}
+
 func TestServitorClusterDeepCopyPreservesLeaseStatus(t *testing.T) {
 	expiry := metav1.Now()
 	cluster := &ServitorCluster{Status: ServitorClusterStatus{
@@ -103,7 +119,7 @@ func yamlMap(t *testing.T, value any) map[string]any {
 	return mapping
 }
 
-func TestCRDPrunesRemovedNameAndStrictTypedValidationRejectsIt(t *testing.T) {
+func TestCRDPrunesRemovedPlatformAndStrictTypedValidationRejectsIt(t *testing.T) {
 	contents, err := os.ReadFile(filepath.Join("..", "..", "config", "crd", "bases", "servitor.bevicted.github.io_servitorclusters.yaml"))
 	if err != nil {
 		t.Fatal(err)
@@ -133,20 +149,20 @@ func TestCRDPrunesRemovedNameAndStrictTypedValidationRejectsIt(t *testing.T) {
 		"metadata": map[string]any{"name": "example"},
 		"spec": map[string]any{
 			"slack":       map[string]any{"ownerID": "U1", "channelID": "C1", "threadTimestamp": "1.2"},
-			"userOptions": map[string]any{"name": "caller-selected"},
+			"userOptions": map[string]any{"platform": "kubernetes", "version": "4.22"},
 			"lifecycle":   map[string]any{"initialLeaseSeconds": int64(3600), "retrySeconds": []any{int64(60)}},
 		},
 	}
 	var strict ServitorCluster
-	if err := k8sruntime.DefaultUnstructuredConverter.FromUnstructuredWithValidation(object, &strict, true); err == nil || !strings.Contains(err.Error(), `unknown field "spec.userOptions.name"`) {
-		t.Fatalf("strict direct CR conversion = %v, want removed name field error", err)
+	if err := k8sruntime.DefaultUnstructuredConverter.FromUnstructuredWithValidation(object, &strict, true); err == nil || !strings.Contains(err.Error(), `unknown field "spec.userOptions.platform"`) {
+		t.Fatalf("strict direct CR conversion = %v, want removed platform field error", err)
 	}
 	unknown := pruning.PruneWithOptions(object, structural, true, structuralschema.UnknownFieldPathOptions{TrackUnknownFieldPaths: true})
-	if !strings.Contains(strings.Join(unknown, ","), "spec.userOptions.name") {
-		t.Fatalf("structural pruning did not report userOptions.name: %v", unknown)
+	if !strings.Contains(strings.Join(unknown, ","), "spec.userOptions.platform") {
+		t.Fatalf("structural pruning did not report userOptions.platform: %v", unknown)
 	}
-	if _, found := object["spec"].(map[string]any)["userOptions"].(map[string]any)["name"]; found {
-		t.Fatal("pruned user name remained in the object")
+	if _, found := object["spec"].(map[string]any)["userOptions"].(map[string]any)["platform"]; found {
+		t.Fatal("pruned user platform remained in the object")
 	}
 	if err := k8sruntime.DefaultUnstructuredConverter.FromUnstructuredWithValidation(object, &strict, true); err != nil {
 		t.Fatalf("pruned CR did not decode: %v", err)
@@ -155,7 +171,7 @@ func TestCRDPrunesRemovedNameAndStrictTypedValidationRejectsIt(t *testing.T) {
 
 func TestExistingResolvedNameAndRecoveryContextRoundTrip(t *testing.T) {
 	cluster := ServitorCluster{Status: ServitorClusterStatus{
-		ResolvedOptions: &ResolvedOptions{ClusterName: "servitor-existing"},
+		ResolvedOptions: &ResolvedOptions{Platform: "openshift", ClusterName: "servitor-existing"},
 		Recovery:        &RecoveryMetadata{Values: RecoveryValues{ClusterName: "servitor-existing"}},
 	}}
 	data, err := json.Marshal(cluster)
@@ -166,7 +182,7 @@ func TestExistingResolvedNameAndRecoveryContextRoundTrip(t *testing.T) {
 	if err := json.Unmarshal(data, &decoded); err != nil {
 		t.Fatal(err)
 	}
-	if decoded.Status.ResolvedOptions.ClusterName != "servitor-existing" || decoded.Status.Recovery.Values.ClusterName != "servitor-existing" {
+	if decoded.Status.ResolvedOptions.Platform != "openshift" || decoded.Status.ResolvedOptions.ClusterName != "servitor-existing" || decoded.Status.Recovery.Values.ClusterName != "servitor-existing" {
 		t.Fatalf("serialized cleanup identity changed: %+v", decoded.Status)
 	}
 }
