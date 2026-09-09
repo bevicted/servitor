@@ -29,6 +29,9 @@ const maxSlackMessage = 3000
 
 type EventStore interface {
 	Claim(context.Context, string) (bool, error)
+	Delivered(context.Context, string) (bool, error)
+	MarkDelivered(context.Context, string) error
+	Release(context.Context, string) error
 	Seen(context.Context, string) (bool, error)
 }
 type Responder interface {
@@ -250,7 +253,7 @@ func (b Bot) confirm(ctx context.Context, message Message, thread string) {
 	switch outcome {
 	case reviewDecisionRecorded:
 		if approval == "rejected" {
-			b.respond(ctx, message.Channel, thread, "Plan rejected.\nCleaning up...")
+			b.respondCleanupCause(ctx, message.Channel, thread, cluster, servitorv1alpha1.CleanupReasonRejected, "Plan rejected.\nCleaning up...")
 			return
 		}
 		// Only the controller can authorize and dispatch an apply. Recording an
@@ -306,7 +309,7 @@ func (b Bot) cleanup(ctx context.Context, message Message, thread string, acknow
 		return
 	}
 	if acknowledge {
-		b.respond(ctx, message.Channel, thread, "Cleaning up...")
+		b.respondCleanupCause(ctx, message.Channel, thread, cluster, servitorv1alpha1.CleanupReasonExplicit, "Cleaning up...")
 	}
 }
 
@@ -533,12 +536,39 @@ func (b Bot) now() time.Time {
 	}
 	return time.Now().UTC()
 }
-func (b Bot) respond(ctx context.Context, channel, thread, text string) {
+func (b Bot) respond(ctx context.Context, channel, thread, text string) bool {
 	if b.Responder == nil {
-		return
+		return false
 	}
 	if err := b.Responder.Reply(ctx, Response{Channel: channel, ThreadTimestamp: thread, Text: text}); err != nil {
 		b.logf("deliver Slack reply: %v", err)
+		return false
+	}
+	return true
+}
+
+func (b Bot) respondCleanupCause(ctx context.Context, channel, thread string, cluster *servitorv1alpha1.ServitorCluster, reason servitorv1alpha1.CleanupReason, text string) {
+	if b.Events == nil {
+		b.respond(ctx, channel, thread, text)
+		return
+	}
+	id := cleanupCauseNoticeID(clusterNoticeUID(cluster), reason)
+	claimed, err := b.Events.Claim(ctx, id)
+	if err != nil {
+		b.logf("claim cleanup cause notice: %v", err)
+		return
+	}
+	if !claimed {
+		return
+	}
+	if b.respond(ctx, channel, thread, text) {
+		if err := b.Events.MarkDelivered(ctx, id); err != nil {
+			b.logf("mark cleanup cause delivery: %v", err)
+		}
+		return
+	}
+	if err := b.Events.Release(ctx, id); err != nil {
+		b.logf("release cleanup cause notice: %v", err)
 	}
 }
 func (b Bot) respondHelp(text string, respond func(string)) {

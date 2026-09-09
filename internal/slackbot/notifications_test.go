@@ -2,7 +2,10 @@ package slackbot
 
 import (
 	"context"
+	"errors"
+	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -91,8 +94,8 @@ func TestStatusNoticesSuppressCommandProgressDuplicatesAndDescribeUnresolvedOper
 	}
 	cluster.Status.Phase = servitorv1alpha1.PhaseCleanupPending
 	cluster.Status.Cleanup = &servitorv1alpha1.CleanupStatus{Reason: servitorv1alpha1.CleanupReasonRejected}
-	if notices := statusNotices(cluster); len(notices) != 0 {
-		t.Fatalf("rejected cleanup notices = %+v, want none", notices)
+	if notices := statusNotices(cluster); len(notices) != 1 || notices[0].text != "Plan rejected.\nCleaning up..." {
+		t.Fatalf("rejected cleanup notices = %+v", notices)
 	}
 	cluster.Status.Phase = servitorv1alpha1.PhaseUnresolved
 	cluster.Status.Cleanup = nil
@@ -122,15 +125,15 @@ func TestStatusNotifierDeliversObservableCleanupCompletion(t *testing.T) {
 		t.Fatal(err)
 	}
 	completed := metav1.NewTime(time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC))
-	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "slack-owner", Namespace: "servitor", UID: "uid"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseCleanupComplete, Cleanup: &servitorv1alpha1.CleanupStatus{CompletedAt: &completed}}}
+	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "slack-owner", Namespace: "servitor", UID: "uid"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseCleanupComplete, Cleanup: &servitorv1alpha1.CleanupStatus{Reason: servitorv1alpha1.CleanupReasonExplicit, CompletedAt: &completed}}}
 	kube := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(cluster).Build()
 	responses := &memoryResponder{}
 	notifier := &StatusNotifier{Client: kube, Namespace: "servitor", Responder: responses, Receipts: state.NewEventStore(kube, "servitor")}
 	if err := notifier.notify(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if len(responses.responses) != 1 || responses.responses[0].Text != "Cleanup complete." {
-		t.Fatalf("cleanup notification was not delivered: %+v", responses.responses)
+	if len(responses.responses) != 2 || responses.responses[0].Text != "Cleaning up..." || responses.responses[1].Text != "Cleanup complete." {
+		t.Fatalf("cleanup notification was not delivered in order: %+v", responses.responses)
 	}
 }
 
@@ -173,6 +176,189 @@ func TestStatusNoticesIncludePersistedReviewAndReadySummaries(t *testing.T) {
 			t.Fatalf("notice is not bounded and balanced: %q", notice.text)
 		}
 	}
+}
+
+func TestCleanupCauseNoticesSurviveSkippedPhases(t *testing.T) {
+	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "slack-owner", Namespace: "servitor", UID: "uid"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{ChannelID: "C1", ThreadTimestamp: "root"}}}
+	for _, test := range []struct {
+		name      string
+		reason    servitorv1alpha1.CleanupReason
+		rejection *servitorv1alpha1.PlanRejection
+		want      string
+	}{
+		{"rejected", servitorv1alpha1.CleanupReasonRejected, nil, "Plan rejected.\nCleaning up..."},
+		{"expired", servitorv1alpha1.CleanupReasonReviewExpired, nil, "Plan auto rejected due to missed approval deadline.\nCleaning up..."},
+		{"typed planning rejection", servitorv1alpha1.CleanupReasonPlanningFailed, &servitorv1alpha1.PlanRejection{ReasonCode: "version_not_supported", OptionKey: "version"}, "Cannot plan this request: `version` is not supported. Correct `version` and create a new request.\nCleaning up..."},
+		{"planning failure", servitorv1alpha1.CleanupReasonPlanningFailed, nil, "Planning failed. Cleaning up..."},
+		{"apply failure", servitorv1alpha1.CleanupReasonApplyFailed, nil, "Apply failed. Cleaning up..."},
+		{"lease expiry", servitorv1alpha1.CleanupReasonLeaseExpired, nil, "Lease expired. Cleaning up..."},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cluster.Status.Cleanup = &servitorv1alpha1.CleanupStatus{Reason: test.reason}
+			cluster.Status.PlanRejection = test.rejection
+			for _, phase := range []string{servitorv1alpha1.PhaseCleanupPending, servitorv1alpha1.PhaseCleanupComplete, servitorv1alpha1.PhaseUnresolved} {
+				cluster.Status.Phase = phase
+				notices := statusNotices(cluster)
+				if len(notices) == 0 || notices[0].id != cleanupCauseNoticeID("uid", test.reason) || notices[0].text != test.want {
+					t.Fatalf("%s notices = %+v", phase, notices)
+				}
+				if phase == servitorv1alpha1.PhaseCleanupComplete && (len(notices) < 2 || notices[1].text != "Cleanup complete.") {
+					t.Fatalf("completion did not follow cause: %+v", notices)
+				}
+			}
+		})
+	}
+}
+
+func TestCleanupRetryNoticeUsesPersistedScheduleOnlyWhilePending(t *testing.T) {
+	next := metav1.NewTime(time.Date(2026, 9, 8, 1, 2, 3, 0, time.UTC))
+	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "slack-owner", Namespace: "servitor", UID: "uid"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{ChannelID: "C1", ThreadTimestamp: "root"}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseCleanupPending, Cleanup: &servitorv1alpha1.CleanupStatus{Reason: servitorv1alpha1.CleanupReasonApplyFailed, RetryCount: 2, NextRetryAt: &next}}}
+	notices := statusNotices(cluster)
+	if len(notices) != 2 || notices[1].id != "cleanup-retry:uid:2" || notices[1].text != "Cleanup retry 2 is scheduled for 2026-09-08 01:02:03 UTC." {
+		t.Fatalf("retry notices = %+v", notices)
+	}
+	cluster.Status.Phase = servitorv1alpha1.PhaseCleanupComplete
+	cluster.Status.Cleanup.NextRetryAt = nil
+	notices = statusNotices(cluster)
+	if len(notices) != 2 || notices[1].text != "Cleanup complete." {
+		t.Fatalf("resolved notices retained a retry: %+v", notices)
+	}
+}
+
+func TestCleanupCauseFailureWithholdsCompletionAcrossRestart(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := servitorv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	completed := metav1.NewTime(time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC))
+	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "slack-owner", Namespace: "servitor", UID: "uid"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{ChannelID: "C1", ThreadTimestamp: "root"}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseCleanupComplete, Cleanup: &servitorv1alpha1.CleanupStatus{Reason: servitorv1alpha1.CleanupReasonReviewExpired, CompletedAt: &completed}}}
+	kube := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(cluster).Build()
+	responses := &memoryResponder{err: errors.New("Slack unavailable")}
+	notifier := &StatusNotifier{Client: kube, Namespace: "servitor", Responder: responses, Receipts: state.NewEventStore(kube, "servitor")}
+	if err := notifier.notify(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(responses.responses) != 0 {
+		t.Fatalf("completion overtook failed cause: %+v", responses.responses)
+	}
+	responses.err = nil
+	notifier.Receipts = state.NewEventStore(kube, "servitor")
+	if err := notifier.notify(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := []string{responses.responses[0].Text, responses.responses[1].Text}; !reflect.DeepEqual(got, []string{"Plan auto rejected due to missed approval deadline.\nCleaning up...", "Cleanup complete."}) {
+		t.Fatalf("restart transcript = %q", got)
+	}
+	if err := notifier.notify(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(responses.responses) != 2 {
+		t.Fatalf("restart redelivered receipts: %+v", responses.responses)
+	}
+}
+
+func TestCleanupCauseReceiptPreventsNotifierFirstAndConcurrentDuplicates(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		run  func(context.Context, Bot, *StatusNotifier, *servitorv1alpha1.ServitorCluster) error
+	}{
+		{
+			name: "notifier first",
+			run: func(ctx context.Context, bot Bot, notifier *StatusNotifier, cluster *servitorv1alpha1.ServitorCluster) error {
+				if err := notifier.notify(ctx); err != nil {
+					return err
+				}
+				bot.respondCleanupCause(ctx, "C1", "root", cluster, servitorv1alpha1.CleanupReasonRejected, "Plan rejected.\nCleaning up...")
+				return nil
+			},
+		},
+		{
+			name: "concurrent command and notifier",
+			run: func(ctx context.Context, bot Bot, notifier *StatusNotifier, cluster *servitorv1alpha1.ServitorCluster) error {
+				start := make(chan struct{})
+				var group sync.WaitGroup
+				errs := make(chan error, 1)
+				group.Add(2)
+				go func() {
+					defer group.Done()
+					<-start
+					errs <- notifier.notify(ctx)
+				}()
+				go func() {
+					defer group.Done()
+					<-start
+					bot.respondCleanupCause(ctx, "C1", "root", cluster, servitorv1alpha1.CleanupReasonRejected, "Plan rejected.\nCleaning up...")
+				}()
+				close(start)
+				group.Wait()
+				if err := <-errs; err != nil {
+					return err
+				}
+				return notifier.notify(ctx)
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			completed := metav1.NewTime(time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC))
+			cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "slack-owner", Namespace: "servitor", UID: "uid"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{ChannelID: "C1", ThreadTimestamp: "root"}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseCleanupComplete, Cleanup: &servitorv1alpha1.CleanupStatus{Reason: servitorv1alpha1.CleanupReasonRejected, CompletedAt: &completed}}}
+			bot, responses := botForTest(t, cluster)
+			notifier := &StatusNotifier{Client: bot.Client, Namespace: "servitor", Responder: responses, Receipts: state.NewEventStore(bot.Client, "servitor")}
+			if err := test.run(context.Background(), bot, notifier, cluster); err != nil {
+				t.Fatal(err)
+			}
+			if len(responses.responses) != 2 {
+				t.Fatalf("responses = %+v", responses.responses)
+			}
+			if got := []string{responses.responses[0].Text, responses.responses[1].Text}; !reflect.DeepEqual(got, []string{"Plan rejected.\nCleaning up...", "Cleanup complete."}) {
+				t.Fatalf("transcript = %q", got)
+			}
+		})
+	}
+}
+
+func TestCleanupCauseClaimWithholdsCompletionUntilCommandReply(t *testing.T) {
+	completed := metav1.NewTime(time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC))
+	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "slack-owner", Namespace: "servitor", UID: "uid"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{ChannelID: "C1", ThreadTimestamp: "root"}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseCleanupComplete, Cleanup: &servitorv1alpha1.CleanupStatus{Reason: servitorv1alpha1.CleanupReasonRejected, CompletedAt: &completed}}}
+	bot, responses := botForTest(t, cluster)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	bot.Responder = blockingResponder{Responder: responses, started: started, release: release}
+	notifier := &StatusNotifier{Client: bot.Client, Namespace: "servitor", Responder: responses, Receipts: state.NewEventStore(bot.Client, "servitor")}
+	commandDone := make(chan struct{})
+	go func() {
+		bot.respondCleanupCause(context.Background(), "C1", "root", cluster, servitorv1alpha1.CleanupReasonRejected, "Plan rejected.\nCleaning up...")
+		close(commandDone)
+	}()
+	<-started
+	if err := notifier.notify(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(responses.responses) != 0 {
+		t.Fatalf("completion overtook claimed cause: %+v", responses.responses)
+	}
+	close(release)
+	<-commandDone
+	if err := notifier.notify(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := []string{responses.responses[0].Text, responses.responses[1].Text}; !reflect.DeepEqual(got, []string{"Plan rejected.\nCleaning up...", "Cleanup complete."}) {
+		t.Fatalf("transcript = %q", got)
+	}
+}
+
+type blockingResponder struct {
+	Responder Responder
+	started   chan<- struct{}
+	release   <-chan struct{}
+}
+
+func (r blockingResponder) Reply(ctx context.Context, response Response) error {
+	close(r.started)
+	<-r.release
+	return r.Responder.Reply(ctx, response)
 }
 
 func joinNotices(notices []statusNotice) string {

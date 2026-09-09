@@ -42,8 +42,62 @@ func TestEventClaimsPersistAcrossRestartAndRemainBounded(t *testing.T) {
 		t.Fatalf("receipts = %d, want <= %d", len(cm.Data), maxReceipts)
 	}
 }
+func TestEventStoreTracksClaimedDeliveryAcrossRestart(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	kube := fake.NewClientBuilder().WithScheme(scheme).Build()
+	store := NewEventStore(kube, "servitor")
+	if claimed, err := store.Claim(context.Background(), "cleanup-cause"); err != nil || !claimed {
+		t.Fatalf("Claim() = (%v, %v), want (true, nil)", claimed, err)
+	}
+	if delivered, err := store.Delivered(context.Background(), "cleanup-cause"); err != nil || delivered {
+		t.Fatalf("Delivered() before mark = (%v, %v), want (false, nil)", delivered, err)
+	}
+	if err := store.MarkDelivered(context.Background(), "cleanup-cause"); err != nil {
+		t.Fatal(err)
+	}
+	store = NewEventStore(kube, "servitor")
+	if delivered, err := store.Delivered(context.Background(), "cleanup-cause"); err != nil || !delivered {
+		t.Fatalf("Delivered() after restart = (%v, %v), want (true, nil)", delivered, err)
+	}
+}
+
+func TestEventStoreReleaseAllowsFailedDeliveryRetry(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	store := NewEventStore(fake.NewClientBuilder().WithScheme(scheme).Build(), "servitor")
+	claimed, err := store.Claim(context.Background(), "cleanup-cause")
+	if err != nil || !claimed {
+		t.Fatalf("Claim() = (%v, %v), want (true, nil)", claimed, err)
+	}
+	if err := store.Release(context.Background(), "cleanup-cause"); err != nil {
+		t.Fatal(err)
+	}
+	if seen, err := store.Seen(context.Background(), "cleanup-cause"); err != nil || seen {
+		t.Fatalf("Seen() after Release = (%v, %v), want (false, nil)", seen, err)
+	}
+	claimed, err = store.Claim(context.Background(), "cleanup-cause")
+	if err != nil || !claimed {
+		t.Fatalf("Claim() after Release = (%v, %v), want (true, nil)", claimed, err)
+	}
+}
+
 func TestEventStoreRejectsEmptyID(t *testing.T) {
-	if _, err := NewEventStore(fake.NewClientBuilder().Build(), "servitor").Claim(context.Background(), ""); err == nil {
+	store := NewEventStore(fake.NewClientBuilder().Build(), "servitor")
+	if _, err := store.Claim(context.Background(), ""); err == nil {
 		t.Fatal("Claim(empty) error = nil")
+	}
+	if _, err := store.Delivered(context.Background(), ""); err == nil {
+		t.Fatal("Delivered(empty) error = nil")
+	}
+	if err := store.MarkDelivered(context.Background(), ""); err == nil {
+		t.Fatal("MarkDelivered(empty) error = nil")
+	}
+	if err := store.Release(context.Background(), ""); err == nil {
+		t.Fatal("Release(empty) error = nil")
 	}
 }

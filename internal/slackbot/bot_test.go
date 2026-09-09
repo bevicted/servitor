@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 	"github.com/bevicted/servitor/internal/controller"
 	"github.com/bevicted/servitor/internal/inventory"
 	"github.com/bevicted/servitor/internal/state"
+	tektonv1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -27,11 +29,14 @@ import (
 )
 
 type memoryResponder struct {
+	mu        sync.Mutex
 	responses []Response
 	err       error
 }
 
 func (r *memoryResponder) Reply(_ context.Context, response Response) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if r.err != nil {
 		return r.err
 	}
@@ -436,11 +441,12 @@ func TestReviewDecisionControllerInterleavingsDoNotClaimExpiredApply(t *testing.
 	for _, test := range []struct {
 		name         string
 		deadline     time.Time
+		complete     bool
 		wantPhase    string
 		wantResponse []string
 	}{
 		{name: "timely approval reaches controller apply", deadline: now.Add(time.Minute), wantPhase: servitorv1alpha1.PhaseApplying, wantResponse: []string{"Plan approved."}},
-		{name: "expired approval reaches cleanup", deadline: now, wantPhase: servitorv1alpha1.PhaseCleanupPending, wantResponse: []string{"The review deadline has passed. No decision was recorded; cleanup will begin.", "Cleaning up..."}},
+		{name: "expired approval reaches terminal cleanup", deadline: now, complete: true, wantPhase: servitorv1alpha1.PhaseCleanupComplete, wantResponse: []string{"The review deadline has passed. No decision was recorded; cleanup will begin.", "Plan auto rejected due to missed approval deadline.\nCleaning up...", "Cleanup complete."}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			deadline := metav1.NewTime(test.deadline)
@@ -450,6 +456,9 @@ func TestReviewDecisionControllerInterleavingsDoNotClaimExpiredApply(t *testing.
 				t.Fatal(err)
 			}
 			if err := servitorv1alpha1.AddToScheme(scheme); err != nil {
+				t.Fatal(err)
+			}
+			if err := tektonv1.AddToScheme(scheme); err != nil {
 				t.Fatal(err)
 			}
 			kube := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&servitorv1alpha1.ServitorCluster{}).WithRuntimeObjects(cluster).Build()
@@ -471,8 +480,16 @@ func TestReviewDecisionControllerInterleavingsDoNotClaimExpiredApply(t *testing.
 				}
 			}
 			reconciler := &controller.Reconciler{Client: bot.Client, Config: controller.Config{Namespace: "servitor"}, Now: func() time.Time { return now }}
-			if _, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "servitor", Name: cluster.Name}}); err != nil {
+			request := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "servitor", Name: cluster.Name}}
+			if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
 				t.Fatal(err)
+			}
+			if test.complete {
+				// Deliberately skip notifier polling while cleanup advances to its
+				// observable terminal phase.
+				if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
+					t.Fatal(err)
+				}
 			}
 			if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: cluster.Name}, stored); err != nil {
 				t.Fatal(err)
@@ -495,6 +512,75 @@ func TestReviewDecisionControllerInterleavingsDoNotClaimExpiredApply(t *testing.
 				t.Fatalf("transcript=%q, want %q", transcript, test.wantResponse)
 			}
 		})
+	}
+}
+
+func TestRejectedCommandReceiptSuppressesNotifierCauseDuplicate(t *testing.T) {
+	now := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
+	deadline := metav1.NewTime(now.Add(time.Hour))
+	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: ownerClusterName("U1"), Namespace: "servitor", UID: "uid"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseAwaitingApproval, ReviewDeadline: &deadline}}
+	bot, responses := botForTest(t, cluster)
+	if err := bot.Handle(context.Background(), Envelope{ID: "reject", Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "no", Timestamp: "reply", ThreadTimestamp: "root"}}); err != nil {
+		t.Fatal(err)
+	}
+	current := &servitorv1alpha1.ServitorCluster{}
+	name := types.NamespacedName{Namespace: "servitor", Name: cluster.Name}
+	if err := bot.Client.Get(context.Background(), name, current); err != nil {
+		t.Fatal(err)
+	}
+	completed := metav1.NewTime(now)
+	current.Status.Phase = servitorv1alpha1.PhaseCleanupComplete
+	current.Status.Cleanup = &servitorv1alpha1.CleanupStatus{Reason: servitorv1alpha1.CleanupReasonRejected, CompletedAt: &completed}
+	if err := bot.Client.Update(context.Background(), current); err != nil {
+		t.Fatal(err)
+	}
+	notifier := &StatusNotifier{Client: bot.Client, Namespace: "servitor", Responder: responses, Receipts: state.NewEventStore(bot.Client, "servitor")}
+	if err := notifier.notify(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var transcript []string
+	for _, response := range responses.responses {
+		transcript = append(transcript, response.Text)
+	}
+	if want := []string{"Plan rejected.\nCleaning up...", "Cleanup complete."}; !reflect.DeepEqual(transcript, want) {
+		t.Fatalf("transcript=%q, want %q", transcript, want)
+	}
+}
+
+func TestFailedCommandCauseReplyRemainsRetryable(t *testing.T) {
+	now := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
+	deadline := metav1.NewTime(now.Add(time.Hour))
+	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: ownerClusterName("U1"), Namespace: "servitor", UID: "uid"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseAwaitingApproval, ReviewDeadline: &deadline}}
+	bot, responses := botForTest(t, cluster)
+	responses.err = errors.New("Slack unavailable")
+	if err := bot.Handle(context.Background(), Envelope{ID: "reject", Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "no", Timestamp: "reply", ThreadTimestamp: "root"}}); err != nil {
+		t.Fatal(err)
+	}
+	causeID := cleanupCauseNoticeID(clusterNoticeUID(cluster), servitorv1alpha1.CleanupReasonRejected)
+	if seen, err := bot.Events.Seen(context.Background(), causeID); err != nil || seen {
+		t.Fatalf("failed command cause receipt = (%v, %v), want (false, nil)", seen, err)
+	}
+	current := &servitorv1alpha1.ServitorCluster{}
+	name := types.NamespacedName{Namespace: "servitor", Name: cluster.Name}
+	if err := bot.Client.Get(context.Background(), name, current); err != nil {
+		t.Fatal(err)
+	}
+	completed := metav1.NewTime(now)
+	current.Status.Phase = servitorv1alpha1.PhaseCleanupComplete
+	current.Status.Cleanup = &servitorv1alpha1.CleanupStatus{Reason: servitorv1alpha1.CleanupReasonRejected, CompletedAt: &completed}
+	if err := bot.Client.Update(context.Background(), current); err != nil {
+		t.Fatal(err)
+	}
+	responses.err = nil
+	notifier := &StatusNotifier{Client: bot.Client, Namespace: "servitor", Responder: responses, Receipts: state.NewEventStore(bot.Client, "servitor")}
+	if err := notifier.notify(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(responses.responses) != 2 {
+		t.Fatalf("retry responses = %+v", responses.responses)
+	}
+	if got := []string{responses.responses[0].Text, responses.responses[1].Text}; !reflect.DeepEqual(got, []string{"Plan rejected.\nCleaning up...", "Cleanup complete."}) {
+		t.Fatalf("retry transcript = %q", got)
 	}
 }
 

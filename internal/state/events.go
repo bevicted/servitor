@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -21,6 +22,8 @@ import (
 const (
 	defaultReceiptConfigMap = "servitor-slack-receipts"
 	maxReceipts             = 1024
+	receiptClaimedPrefix    = "claimed:"
+	receiptDeliveredPrefix  = "delivered:"
 )
 
 // EventStore records Slack event IDs in a bounded namespaced ConfigMap. It is
@@ -55,7 +58,7 @@ func (s *EventStore) Claim(ctx context.Context, id string) (bool, error) {
 		cm := &corev1.ConfigMap{}
 		err := s.Client.Get(ctx, types.NamespacedName{Namespace: s.Namespace, Name: s.name()}, cm)
 		if apierrors.IsNotFound(err) {
-			cm = &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: s.name(), Namespace: s.Namespace}, Data: map[string]string{key: s.now().Format(time.RFC3339Nano)}}
+			cm = &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: s.name(), Namespace: s.Namespace}, Data: map[string]string{key: receiptClaimedPrefix + s.now().Format(time.RFC3339Nano)}}
 			if err := s.Client.Create(ctx, cm); err != nil {
 				if apierrors.IsAlreadyExists(err) {
 					return apierrors.NewConflict(schema.GroupResource{Resource: "configmaps"}, s.name(), err)
@@ -76,7 +79,7 @@ func (s *EventStore) Claim(ctx context.Context, id string) (bool, error) {
 			cm.Data = make(map[string]string)
 		}
 		pruneReceipts(cm.Data, maxReceipts-1)
-		cm.Data[key] = s.now().Format(time.RFC3339Nano)
+		cm.Data[key] = receiptClaimedPrefix + s.now().Format(time.RFC3339Nano)
 		if err := s.Client.Update(ctx, cm); err != nil {
 			return err
 		}
@@ -87,6 +90,84 @@ func (s *EventStore) Claim(ctx context.Context, id string) (bool, error) {
 		return false, fmt.Errorf("claim event: %w", err)
 	}
 	return claimed, nil
+}
+
+// MarkDelivered records that a claimed notification reply was accepted by Slack.
+func (s *EventStore) MarkDelivered(ctx context.Context, id string) error {
+	if id == "" {
+		return fmt.Errorf("mark event delivery: empty ID")
+	}
+	if s.Client == nil || s.Namespace == "" {
+		return fmt.Errorf("mark event delivery: Kubernetes receipt store is not configured")
+	}
+	key := receiptKey(id)
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		cm := &corev1.ConfigMap{}
+		if err := s.Client.Get(ctx, types.NamespacedName{Namespace: s.Namespace, Name: s.name()}, cm); err != nil {
+			return err
+		}
+		if cm.Data[key] == "" {
+			return fmt.Errorf("receipt %q is not claimed", id)
+		}
+		cm.Data[key] = receiptDeliveredPrefix + s.now().Format(time.RFC3339Nano)
+		return s.Client.Update(ctx, cm)
+	})
+	if err != nil {
+		return fmt.Errorf("mark event delivery: %w", err)
+	}
+	return nil
+}
+
+// Delivered reports whether a receipt is known to have been delivered. Legacy
+// receipt timestamps predate delivery states and therefore remain delivered.
+func (s *EventStore) Delivered(ctx context.Context, id string) (bool, error) {
+	if id == "" {
+		return false, fmt.Errorf("read delivered receipt: empty ID")
+	}
+	if s.Client == nil || s.Namespace == "" {
+		return false, fmt.Errorf("read delivered receipt: Kubernetes receipt store is not configured")
+	}
+	cm := &corev1.ConfigMap{}
+	err := s.Client.Get(ctx, types.NamespacedName{Namespace: s.Namespace, Name: s.name()}, cm)
+	if apierrors.IsNotFound(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("read delivered receipt: %w", err)
+	}
+	value := cm.Data[receiptKey(id)]
+	return value != "" && !strings.HasPrefix(value, receiptClaimedPrefix), nil
+}
+
+// Release removes a receipt when its claimed delivery did not succeed, allowing
+// a later notification pass to retry it.
+func (s *EventStore) Release(ctx context.Context, id string) error {
+	if id == "" {
+		return fmt.Errorf("release event: empty ID")
+	}
+	if s.Client == nil || s.Namespace == "" {
+		return fmt.Errorf("release event: Kubernetes receipt store is not configured")
+	}
+	key := receiptKey(id)
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		cm := &corev1.ConfigMap{}
+		err := s.Client.Get(ctx, types.NamespacedName{Namespace: s.Namespace, Name: s.name()}, cm)
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if cm.Data[key] == "" {
+			return nil
+		}
+		delete(cm.Data, key)
+		return s.Client.Update(ctx, cm)
+	})
+	if err != nil {
+		return fmt.Errorf("release event: %w", err)
+	}
+	return nil
 }
 
 // Seen reports whether an identifier was recorded. It supports best-effort
@@ -132,7 +213,7 @@ func pruneReceipts(receipts map[string]string, keep int) {
 	}
 	entries := make([]entry, 0, len(receipts))
 	for key, value := range receipts {
-		at, err := time.Parse(time.RFC3339Nano, value)
+		at, err := time.Parse(time.RFC3339Nano, strings.TrimPrefix(strings.TrimPrefix(value, receiptClaimedPrefix), receiptDeliveredPrefix))
 		if err != nil {
 			at = time.Time{}
 		}

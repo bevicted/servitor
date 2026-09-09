@@ -16,8 +16,8 @@ import (
 )
 
 // StatusNotifier turns controller-owned status transitions into sanitized Slack
-// notices. A receipt is written after delivery, so a crash may duplicate a
-// notice but never suppresses an unsent one or changes cloud intent.
+// notices. A receipt is claimed before delivery and released when delivery
+// fails; Slack delivery remains non-transactional across a process crash.
 type StatusNotifier struct {
 	Client    client.Client
 	Namespace string
@@ -57,20 +57,37 @@ func (n *StatusNotifier) notify(ctx context.Context) error {
 	for i := range clusters.Items {
 		cluster := &clusters.Items[i]
 		for _, notice := range statusNoticesAt(cluster, n.now()) {
-			seen, err := n.Receipts.Seen(ctx, notice.id)
-			if err != nil {
-				return err
-			}
-			if seen {
-				continue
-			}
 			if notice.reviewDeadline != nil && !n.now().Before(notice.reviewDeadline.Time) {
 				continue
 			}
-			if err := n.Responder.Reply(ctx, Response{Channel: cluster.Spec.Slack.ChannelID, ThreadTimestamp: cluster.Spec.Slack.ThreadTimestamp, Text: notice.text}); err != nil {
-				continue
+			claimed, err := n.Receipts.Claim(ctx, notice.id)
+			if err != nil {
+				return err
 			}
-			if _, err := n.Receipts.Claim(ctx, notice.id); err != nil {
+			if !claimed {
+				if !notice.cleanupCause {
+					continue
+				}
+				delivered, err := n.Receipts.Delivered(ctx, notice.id)
+				if err != nil {
+					return err
+				}
+				if delivered {
+					continue
+				}
+				// A command may have claimed the cause before replying. Do not let
+				// a later completion overtake that reply.
+				break
+			}
+			if err := n.Responder.Reply(ctx, Response{Channel: cluster.Spec.Slack.ChannelID, ThreadTimestamp: cluster.Spec.Slack.ThreadTimestamp, Text: notice.text}); err != nil {
+				if releaseErr := n.Receipts.Release(ctx, notice.id); releaseErr != nil {
+					return releaseErr
+				}
+				// Later notices may describe completion. Do not let one overtake a
+				// failed cleanup cause delivery in the same thread.
+				break
+			}
+			if err := n.Receipts.MarkDelivered(ctx, notice.id); err != nil {
 				return err
 			}
 		}
@@ -81,6 +98,7 @@ func (n *StatusNotifier) notify(ctx context.Context) error {
 type statusNotice struct {
 	id             string
 	text           string
+	cleanupCause   bool
 	reviewDeadline *metav1.Time
 }
 
@@ -99,10 +117,7 @@ func statusNoticesAt(cluster *servitorv1alpha1.ServitorCluster, now time.Time) [
 	if cluster.Spec.Slack.ChannelID == "" || cluster.Spec.Slack.ThreadTimestamp == "" {
 		return nil
 	}
-	uid := string(cluster.UID)
-	if uid == "" {
-		uid = cluster.Namespace + "/" + cluster.Name
-	}
+	uid := clusterNoticeUID(cluster)
 	phase := cluster.Status.Phase
 	var texts []string
 	switch phase {
@@ -116,16 +131,6 @@ func statusNoticesAt(cluster *servitorv1alpha1.ServitorCluster, now time.Time) [
 			expiry = cluster.Status.LeaseExpiresAt.Time
 		}
 		texts = readyNoticeTexts(cluster.Status.Ready, expiry, time.Now().UTC())
-	case servitorv1alpha1.PhaseCleanupPending:
-		if cluster.Status.PlanRejection != nil {
-			texts = []string{planRejectionText(*cluster.Status.PlanRejection) + "\nCleaning up..."}
-		} else if cluster.Status.Cleanup == nil || cluster.Status.Cleanup.Reason != servitorv1alpha1.CleanupReasonRejected {
-			if cluster.Status.Cleanup != nil && cluster.Status.Cleanup.Reason == servitorv1alpha1.CleanupReasonPlanningFailed {
-				texts = []string{"Planning failed. Cleaning up..."}
-			} else {
-				texts = []string{"Cleaning up..."}
-			}
-		}
 	case servitorv1alpha1.PhaseCleanupComplete:
 		texts = []string{"Cleanup complete."}
 	case servitorv1alpha1.PhaseUnresolved:
@@ -135,19 +140,54 @@ func statusNoticesAt(cluster *servitorv1alpha1.ServitorCluster, now time.Time) [
 			texts = []string{"The operation is unresolved. An administrator must inspect the allocation CR status and private cluster logs."}
 		}
 	}
-	notices := phaseNotices(uid, phase, texts)
+	notices := make([]statusNotice, 0, len(texts)+2)
+	if cleanup := cluster.Status.Cleanup; cleanup != nil {
+		notices = append(notices, statusNotice{id: cleanupCauseNoticeID(uid, cleanup.Reason), text: cleanupCauseText(cleanup.Reason, cluster.Status.PlanRejection), cleanupCause: true})
+	}
+	notices = append(notices, phaseNotices(uid, phase, texts)...)
 	if phase == servitorv1alpha1.PhaseAwaitingApproval && cluster.Status.ReviewDeadline != nil {
 		for index := range notices {
 			notices[index].reviewDeadline = cluster.Status.ReviewDeadline
 		}
 	}
-	if cleanup := cluster.Status.Cleanup; cleanup != nil && cleanup.RetryCount > 0 {
-		notices = append(notices, statusNotice{id: fmt.Sprintf("cleanup-retry:%s:%d", uid, cleanup.RetryCount), text: fmt.Sprintf("Cleanup retry %d is scheduled.", cleanup.RetryCount)})
+	if cleanup := cluster.Status.Cleanup; cleanup != nil && cleanup.NextRetryAt != nil && phase == servitorv1alpha1.PhaseCleanupPending {
+		notices = append(notices, statusNotice{id: fmt.Sprintf("cleanup-retry:%s:%d", uid, cleanup.RetryCount), text: fmt.Sprintf("Cleanup retry %d is scheduled for %s.", cleanup.RetryCount, cleanup.NextRetryAt.Time.UTC().Format("2006-01-02 15:04:05 UTC"))})
 	}
 	if extension := cluster.Status.LeaseExtension; extension != nil && extension.Outcome == servitorv1alpha1.ExtensionOutcomeApplied && extension.PreviousExpiry != nil && extension.NewExpiry != nil {
 		notices = append(notices, statusNotice{id: "extension:" + uid + ":" + extension.RequestedExpiry.UTC().Format(time.RFC3339Nano), text: extensionNoticeText(extension, time.Now().UTC())})
 	}
 	return notices
+}
+
+func clusterNoticeUID(cluster *servitorv1alpha1.ServitorCluster) string {
+	if cluster.UID != "" {
+		return string(cluster.UID)
+	}
+	return cluster.Namespace + "/" + cluster.Name
+}
+
+func cleanupCauseNoticeID(uid string, reason servitorv1alpha1.CleanupReason) string {
+	return fmt.Sprintf("cleanup-cause:%s:%s", uid, reason)
+}
+
+func cleanupCauseText(reason servitorv1alpha1.CleanupReason, rejection *servitorv1alpha1.PlanRejection) string {
+	if rejection != nil {
+		return planRejectionText(*rejection) + "\nCleaning up..."
+	}
+	switch reason {
+	case servitorv1alpha1.CleanupReasonRejected:
+		return "Plan rejected.\nCleaning up..."
+	case servitorv1alpha1.CleanupReasonReviewExpired:
+		return "Plan auto rejected due to missed approval deadline.\nCleaning up..."
+	case servitorv1alpha1.CleanupReasonPlanningFailed:
+		return "Planning failed. Cleaning up..."
+	case servitorv1alpha1.CleanupReasonApplyFailed:
+		return "Apply failed. Cleaning up..."
+	case servitorv1alpha1.CleanupReasonLeaseExpired:
+		return "Lease expired. Cleaning up..."
+	default:
+		return "Cleaning up..."
+	}
 }
 
 func planRejectionText(rejection servitorv1alpha1.PlanRejection) string {
