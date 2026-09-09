@@ -1,8 +1,13 @@
 package v1alpha1
 
 import (
+	"encoding/hex"
 	"fmt"
+	"net/url"
+	"regexp"
+	"sort"
 	"strings"
+	"unicode"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -55,12 +60,11 @@ type UserOptions struct {
 	WorkerCount                    int      `json:"workerCount,omitempty"`
 }
 
-// LifecyclePolicy is snapshotted when the CR is created.
+// LifecyclePolicy contains immutable allocation policy and mutable user intent.
 type LifecyclePolicy struct {
-	ConfirmationDeadline *metav1.Time `json:"confirmationDeadline,omitempty"`
-	InitialLeaseSeconds  int64        `json:"initialLeaseSeconds"`
-	RetrySeconds         []int64      `json:"retrySeconds"`
-	Approval             string       `json:"approval,omitempty"`
+	InitialLeaseSeconds int64   `json:"initialLeaseSeconds"`
+	RetrySeconds        []int64 `json:"retrySeconds"`
+	Approval            string  `json:"approval,omitempty"`
 	// RequestedExpiry is an absolute extension target. Its value is stable across
 	// Slack redelivery, controller restarts, and optimistic-concurrency retries.
 	RequestedExpiry         *metav1.Time `json:"requestedExpiry,omitempty"`
@@ -80,6 +84,12 @@ type ResolvedOptions struct {
 	UserOptions `json:",inline"`
 	ClusterName string `json:"clusterName,omitempty"`
 	Region      string `json:"region,omitempty"`
+}
+
+// LifecycleSnapshot is the immutable policy used throughout an allocation.
+type LifecycleSnapshot struct {
+	InitialLeaseSeconds int64   `json:"initialLeaseSeconds"`
+	RetrySeconds        []int64 `json:"retrySeconds"`
 }
 
 // BackendIdentity identifies remote Terraform state without credentials.
@@ -105,6 +115,160 @@ type RecoveryMetadata struct {
 	Values                           RecoveryValues    `json:"values"`
 	SatelliteSSHPublicKeyFingerprint string            `json:"satelliteSSHPublicKeyFingerprint,omitempty"`
 	TFVarsSHA256                     string            `json:"tfvarsSHA256,omitempty"`
+}
+
+var (
+	recoveryTargetPattern      = regexp.MustCompile(`^[a-z][a-z0-9-]{0,127}$`)
+	recoveryRegionPattern      = regexp.MustCompile(`^[a-z]+(?:-[a-z]+)+$`)
+	recoveryVersionPattern     = regexp.MustCompile(`^[0-9]+\.[0-9]+(?:_openshift)?$`)
+	recoveryClusterNamePattern = regexp.MustCompile(`^[a-z][a-z0-9-]{0,43}$`)
+	recoveryZonePattern        = regexp.MustCompile(`^[a-z]+(?:-[a-z]+)+-[0-9]+$`)
+	recoveryFlavorPattern      = regexp.MustCompile(`^[a-z][a-z0-9.-]*[0-9]x[0-9]+$`)
+	recoveryVLANPattern        = regexp.MustCompile(`^[0-9]+$`)
+	recoveryFingerprintPattern = regexp.MustCompile(`^SHA256:[A-Za-z0-9_-]{43}$`)
+)
+
+var recoveryEndpointKeys = map[string]bool{
+	"IAM": true, "ContainerService": true, "GlobalTagging": true, "ResourceManagement": true,
+	"ResourceController": true, "VPC": true, "Satellite": true, "SatelliteConfig": true,
+}
+
+// Validate verifies that recovery data is bounded, canonical, and contains no
+// credential-like content before it is persisted in status.
+func (r RecoveryMetadata) Validate() error {
+	if r.Version != 1 || !recoveryTargetPattern.MatchString(r.Target) || !validRecoveryDigest(r.TFVarsSHA256) {
+		return fmt.Errorf("recovery metadata is incomplete or non-canonical")
+	}
+	if r.SatelliteSSHPublicKeyFingerprint != "" && !recoveryFingerprintPattern.MatchString(r.SatelliteSSHPublicKeyFingerprint) {
+		return fmt.Errorf("recovery metadata has an invalid SSH fingerprint")
+	}
+	if len(r.Endpoints) > len(recoveryEndpointKeys) {
+		return fmt.Errorf("recovery metadata has too many endpoints")
+	}
+	for key, endpoint := range r.Endpoints {
+		if !recoveryEndpointKeys[key] || !validRecoveryEndpoint(endpoint) {
+			return fmt.Errorf("recovery metadata has an invalid endpoint")
+		}
+	}
+	for _, key := range []string{"IAM", "ContainerService", "GlobalTagging", "ResourceManagement", "ResourceController"} {
+		if r.Endpoints[key] == "" {
+			return fmt.Errorf("recovery metadata has incomplete endpoints")
+		}
+	}
+	if r.Values.ClusterMode == "vpc" || r.Values.ClusterMode == "satellite" {
+		if r.Endpoints["VPC"] == "" {
+			return fmt.Errorf("recovery metadata has incomplete endpoints")
+		}
+	}
+	if r.Values.ClusterMode == "satellite" && (r.Endpoints["Satellite"] == "" || r.Endpoints["SatelliteConfig"] == "") {
+		return fmt.Errorf("recovery metadata has incomplete endpoints")
+	}
+	return r.Values.validate()
+}
+
+func validRecoveryDigest(value string) bool {
+	if len(value) != 64 || strings.ToLower(value) != value {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
+}
+
+func validRecoveryEndpoint(value string) bool {
+	if len(value) == 0 || len(value) > 512 || strings.TrimSpace(value) != value {
+		return false
+	}
+	parsed, err := url.ParseRequestURI(value)
+	return err == nil && parsed.String() == value && parsed.Scheme == "https" && parsed.Host != "" && parsed.User == nil && parsed.RawQuery == "" && parsed.Fragment == "" && !recoveryEndpointContainsCredentialMarker(parsed)
+}
+
+func recoveryEndpointContainsCredentialMarker(endpoint *url.URL) bool {
+	for _, component := range []string{endpoint.Scheme, endpoint.Opaque, endpoint.Host, endpoint.Path, endpoint.RawPath, endpoint.RawQuery, endpoint.Fragment, endpoint.RawFragment} {
+		if containsCredentialMarker(component) {
+			return true
+		}
+	}
+	return endpoint.User != nil && containsCredentialMarker(endpoint.User.String())
+}
+
+func (v RecoveryValues) validate() error {
+	if !recoveryClusterNamePattern.MatchString(v.ClusterName) || !recoveryRegionPattern.MatchString(v.Region) || !recoveryVersionPattern.MatchString(v.KubeVersion) || v.WorkerCount < 1 || v.WorkerCount > 100 || (v.Platform != "kubernetes" && v.Platform != "openshift") || !validRecoveryText(v.ResourceGroupName, 128, true) {
+		return fmt.Errorf("recovery metadata has invalid values")
+	}
+	for _, value := range []struct {
+		value string
+		limit int
+	}{
+		{v.Zone, 64}, {v.Flavor, 64}, {v.VPCID, 128}, {v.Datacenter, 32}, {v.MachineType, 64}, {v.PublicVLANID, 64}, {v.PrivateVLANID, 64}, {v.SatelliteManagedFrom, 128}, {v.SatelliteLocationID, 128}, {v.SatelliteHostImage, 256}, {v.SatelliteHostProfile, 64}, {v.SatelliteSSHKeyID, 128}, {v.SatelliteWorkerOperatingSystem, 64},
+	} {
+		if !validRecoveryText(value.value, value.limit, false) {
+			return fmt.Errorf("recovery metadata has unsafe values")
+		}
+	}
+	if !validRecoveryTextSlice(v.SubnetIDs, 8, 128, true) || !validRecoveryTextSlice(v.PublicGatewayIDs, 8, 128, true) || !validRecoveryTextSlice(v.SatelliteZones, 3, 64, false) || !validRecoveryTextSlice(v.SatelliteWorkerInstanceIDs, 32, 128, true) {
+		return fmt.Errorf("recovery metadata has invalid value lists")
+	}
+	switch v.ClusterMode {
+	case "vpc":
+		if !recoveryZonePattern.MatchString(v.Zone) || strings.TrimSuffix(v.Zone, v.Zone[strings.LastIndex(v.Zone, "-"):]) != v.Region || !recoveryFlavorPattern.MatchString(v.Flavor) || v.SatelliteManagedFrom != "" || v.SatelliteLocationID != "" || len(v.SatelliteZones) != 0 || len(v.SatelliteWorkerInstanceIDs) != 0 {
+			return fmt.Errorf("recovery metadata has invalid VPC values")
+		}
+	case "classic":
+		if !regexp.MustCompile(`^[a-z]+[0-9]+$`).MatchString(v.Datacenter) || !recoveryFlavorPattern.MatchString(v.MachineType) || !recoveryVLANPattern.MatchString(v.PublicVLANID) || !recoveryVLANPattern.MatchString(v.PrivateVLANID) || v.VPCID != "" || len(v.SubnetIDs) != 0 || len(v.PublicGatewayIDs) != 0 || len(v.SatelliteZones) != 0 || v.SatelliteManagedFrom != "" || v.SatelliteLocationID != "" || len(v.SatelliteWorkerInstanceIDs) != 0 {
+			return fmt.Errorf("recovery metadata has invalid Classic values")
+		}
+	case "satellite":
+		if v.Platform != "openshift" || len(v.SatelliteZones) != 3 || !sameRecoveryRegion(v.SatelliteZones, v.Region) || (v.WorkerCount != 1 && v.WorkerCount != 3) || v.Zone != "" || v.Flavor != "" || v.Datacenter != "" || v.MachineType != "" || v.PublicVLANID != "" || v.PrivateVLANID != "" {
+			return fmt.Errorf("recovery metadata has invalid Satellite values")
+		}
+	default:
+		return fmt.Errorf("recovery metadata has an invalid cluster mode")
+	}
+	return nil
+}
+
+func validRecoveryText(value string, limit int, required bool) bool {
+	if value == "" {
+		return !required
+	}
+	if len(value) > limit || strings.TrimSpace(value) != value || containsCredentialMarker(value) {
+		return false
+	}
+	return !strings.ContainsFunc(value, func(character rune) bool { return unicode.IsControl(character) })
+}
+
+func validRecoveryTextSlice(values []string, limit, itemLimit int, sorted bool) bool {
+	if len(values) > limit {
+		return false
+	}
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		if !validRecoveryText(value, itemLimit, true) {
+			return false
+		}
+		if _, duplicate := seen[value]; duplicate {
+			return false
+		}
+		seen[value] = struct{}{}
+	}
+	if sorted && !sort.StringsAreSorted(values) {
+		return false
+	}
+	return true
+}
+
+func sameRecoveryRegion(zones []string, region string) bool {
+	for _, zone := range zones {
+		if !recoveryZonePattern.MatchString(zone) || strings.TrimSuffix(zone, zone[strings.LastIndex(zone, "-"):]) != region {
+			return false
+		}
+	}
+	return true
+}
+
+func containsCredentialMarker(value string) bool {
+	lower := strings.ToLower(value)
+	return strings.Contains(lower, "password") || strings.Contains(lower, "secret") || strings.Contains(lower, "api_key") || strings.Contains(lower, "apikey") || strings.Contains(lower, "access_key") || strings.Contains(lower, "authorization") || strings.Contains(lower, "bearer ") || strings.Contains(lower, "token=")
 }
 
 // RecoveryValues are ICT's normalized non-secret Terraform inputs. They let a
@@ -211,15 +375,16 @@ type LeaseExtensionStatus struct {
 
 // ServitorClusterStatus is written exclusively by the controller.
 type ServitorClusterStatus struct {
-	Phase           string              `json:"phase,omitempty"`
-	Conditions      []metav1.Condition  `json:"conditions,omitempty"`
-	ResolvedOptions *ResolvedOptions    `json:"resolvedOptions,omitempty"`
-	Backend         *BackendIdentity    `json:"backend,omitempty"`
-	ExecutionImage  string              `json:"executionImage,omitempty"`
-	Operation       *OperationReference `json:"operation,omitempty"`
-	Review          *ReviewSummary      `json:"review,omitempty"`
-	Recovery        *RecoveryMetadata   `json:"recovery,omitempty"`
-	ReviewDeadline  *metav1.Time        `json:"reviewDeadline,omitempty"`
+	Phase             string              `json:"phase,omitempty"`
+	Conditions        []metav1.Condition  `json:"conditions,omitempty"`
+	ResolvedOptions   *ResolvedOptions    `json:"resolvedOptions,omitempty"`
+	LifecycleSnapshot *LifecycleSnapshot  `json:"lifecycleSnapshot,omitempty"`
+	Backend           *BackendIdentity    `json:"backend,omitempty"`
+	ExecutionImage    string              `json:"executionImage,omitempty"`
+	Operation         *OperationReference `json:"operation,omitempty"`
+	Review            *ReviewSummary      `json:"review,omitempty"`
+	Recovery          *RecoveryMetadata   `json:"recovery,omitempty"`
+	ReviewDeadline    *metav1.Time        `json:"reviewDeadline,omitempty"`
 	// ReviewGeneration and ReviewApproval record the spec state that entered AwaitingApproval.
 	// An approval must be written in a later generation.
 	ReviewGeneration int64                 `json:"reviewGeneration,omitempty"`
@@ -324,9 +489,6 @@ func (in *ServitorClusterSpec) DeepCopy() *ServitorClusterSpec {
 	out.UserOptions.SatelliteZones = append([]string(nil), in.UserOptions.SatelliteZones...)
 	out.UserOptions.SatelliteWorkerInstanceIDs = append([]string(nil), in.UserOptions.SatelliteWorkerInstanceIDs...)
 	out.Lifecycle.RetrySeconds = append([]int64(nil), in.Lifecycle.RetrySeconds...)
-	if in.Lifecycle.ConfirmationDeadline != nil {
-		out.Lifecycle.ConfirmationDeadline = in.Lifecycle.ConfirmationDeadline.DeepCopy()
-	}
 	if in.Lifecycle.RequestedExpiry != nil {
 		out.Lifecycle.RequestedExpiry = in.Lifecycle.RequestedExpiry.DeepCopy()
 	}
@@ -347,6 +509,11 @@ func (in *ServitorClusterStatus) DeepCopy() *ServitorClusterStatus {
 		v.SatelliteWorkerInstanceIDs = append([]string(nil), v.SatelliteWorkerInstanceIDs...)
 		out.ResolvedOptions = &v
 	}
+	if in.LifecycleSnapshot != nil {
+		v := *in.LifecycleSnapshot
+		v.RetrySeconds = append([]int64(nil), v.RetrySeconds...)
+		out.LifecycleSnapshot = &v
+	}
 	if in.Backend != nil {
 		v := *in.Backend
 		out.Backend = &v
@@ -358,6 +525,9 @@ func (in *ServitorClusterStatus) DeepCopy() *ServitorClusterStatus {
 	if in.Review != nil {
 		v := *in.Review
 		v.Resources = append([]SummaryResource(nil), v.Resources...)
+		for index := range v.Resources {
+			v.Resources[index].Actions = append([]string(nil), v.Resources[index].Actions...)
+		}
 		out.Review = &v
 	}
 	if in.Recovery != nil {
@@ -375,6 +545,9 @@ func (in *ServitorClusterStatus) DeepCopy() *ServitorClusterStatus {
 	if in.Ready != nil {
 		v := *in.Ready
 		v.Resources = append([]SummaryResource(nil), v.Resources...)
+		for index := range v.Resources {
+			v.Resources[index].Actions = append([]string(nil), v.Resources[index].Actions...)
+		}
 		out.Ready = &v
 	}
 	if in.ReviewDeadline != nil {

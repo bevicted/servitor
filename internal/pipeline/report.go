@@ -39,8 +39,8 @@ func (r Report) Validate(expectedUID, expectedOperation string) error {
 	if err := validateSummary(r.Ready.Resources); err != nil {
 		return err
 	}
-	if r.Recovery.Version != 1 || strings.TrimSpace(r.Recovery.Target) == "" || strings.TrimSpace(r.Recovery.TFVarsSHA256) == "" {
-		return errors.New("report has incomplete recovery metadata")
+	if err := r.Recovery.Validate(); err != nil {
+		return fmt.Errorf("report has invalid recovery metadata: %w", err)
 	}
 	if r.ResolvedOptions.ClusterName == "" || r.ResolvedOptions.Provider == "" || r.ResolvedOptions.Version == "" {
 		return errors.New("report has incomplete resolved options")
@@ -81,7 +81,7 @@ func DecodeReport(data []byte, expectedUID, expectedOperation string) (Report, e
 		return Report{}, errors.New("report must contain exactly one JSON document")
 	}
 	if err := report.Validate(expectedUID, expectedOperation); err != nil {
-		return Report{}, err
+		return Report{}, fmt.Errorf("validate report: %w", err)
 	}
 	return report, nil
 }

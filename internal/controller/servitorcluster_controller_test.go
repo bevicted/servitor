@@ -33,6 +33,21 @@ func (l reportLogs) ReadContainerLog(context.Context, string, string, string) (i
 	return io.NopCloser(bytes.NewReader(l.data)), l.err
 }
 
+func validRecoveryMetadata() servitorv1alpha1.RecoveryMetadata {
+	return servitorv1alpha1.RecoveryMetadata{
+		Version: 1, Target: "target", TFVarsSHA256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		Endpoints: map[string]string{
+			"IAM": "https://iam.example.invalid", "ContainerService": "https://containers.example.invalid", "GlobalTagging": "https://tagging.example.invalid", "ResourceManagement": "https://management.example.invalid", "ResourceController": "https://controller.example.invalid", "VPC": "https://vpc.example.invalid",
+		},
+		Values: servitorv1alpha1.RecoveryValues{ClusterName: "cluster", ResourceGroupName: "Default", Region: "us-south", ClusterMode: "vpc", Platform: "openshift", KubeVersion: "4.22_openshift", WorkerCount: 2, Zone: "us-south-1", Flavor: "bx2.4x16"},
+	}
+}
+
+func validRecoveryPointer() *servitorv1alpha1.RecoveryMetadata {
+	recovery := validRecoveryMetadata()
+	return &recovery
+}
+
 func TestReconcilePersistsOneOperationAndAdoptsMatchingReport(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := servitorv1alpha1.AddToScheme(scheme); err != nil {
@@ -43,7 +58,8 @@ func TestReconcilePersistsOneOperationAndAdoptsMatchingReport(t *testing.T) {
 	}
 	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "cluster", Namespace: "ns", UID: "cluster-uid", Generation: 1}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "1.2"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 3600, RetrySeconds: []int64{60}, Approval: "approved"}}}
 	client := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&servitorv1alpha1.ServitorCluster{}, &tektonv1.PipelineRun{}, &tektonv1.TaskRun{}).WithObjects(cluster).Build()
-	reconciler := &Reconciler{Client: client, Scheme: scheme, Config: Config{Namespace: "ns", Defaults: servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Target: "target", Provider: "vpc-gen2", Platform: "openshift", Version: "4.22", ResourceGroup: "Default"}}, Backend: servitorv1alpha1.BackendIdentity{Version: 1, Bucket: "ict-state-bucket", Region: "us-south", Endpoint: "https://s3.us-south.example.invalid", SkipCredentialsValidation: true, SkipMetadataAPICheck: true, SkipRegionValidation: true, SkipRequestingAccountID: true, ForcePathStyle: true}, BackendPrefix: "servitor", ExecutionImage: "registry.example/ict@sha256:deadbeef"}, Now: func() time.Time { return time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC) }}
+	now := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
+	reconciler := &Reconciler{Client: client, Scheme: scheme, Config: Config{Namespace: "ns", Defaults: servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Target: "target", Provider: "vpc-gen2", Platform: "openshift", Version: "4.22", ResourceGroup: "Default"}}, Backend: servitorv1alpha1.BackendIdentity{Version: 1, Bucket: "ict-state-bucket", Region: "us-south", Endpoint: "https://s3.us-south.example.invalid", SkipCredentialsValidation: true, SkipMetadataAPICheck: true, SkipRegionValidation: true, SkipRequestingAccountID: true, ForcePathStyle: true}, BackendPrefix: "servitor", ExecutionImage: "registry.example/ict@sha256:deadbeef", ReviewTimeout: 5 * time.Minute}, Now: func() time.Time { return now }}
 	request := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "ns", Name: "cluster"}}
 	for i := 0; i < 4; i++ {
 		if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
@@ -77,10 +93,11 @@ func TestReconcilePersistsOneOperationAndAdoptsMatchingReport(t *testing.T) {
 	if err := client.Get(context.Background(), request.NamespacedName, stored); err != nil {
 		t.Fatal(err)
 	}
-	if stored.Status.ResolvedOptions.Version != "4.22" || stored.Status.ExecutionImage != "registry.example/ict@sha256:deadbeef" {
+	if stored.Status.ResolvedOptions.Version != "4.22" || stored.Status.ExecutionImage != "registry.example/ict@sha256:deadbeef" || stored.Status.LifecycleSnapshot == nil || stored.Status.LifecycleSnapshot.InitialLeaseSeconds != 3600 || len(stored.Status.LifecycleSnapshot.RetrySeconds) != 1 || stored.Status.LifecycleSnapshot.RetrySeconds[0] != 60 {
 		t.Fatal("restart changed frozen planning inputs")
 	}
 
+	now = now.Add(10 * time.Minute)
 	run.Status.Status.Conditions = duckv1.Conditions{{Type: apis.ConditionSucceeded, Status: corev1.ConditionTrue}}
 	run.Status.ChildReferences = []tektonv1.ChildStatusReference{{TypeMeta: runtime.TypeMeta{APIVersion: "tekton.dev/v1", Kind: "TaskRun"}, Name: "task", PipelineTaskName: "operation"}}
 	if err := client.Status().Update(context.Background(), run); err != nil {
@@ -92,7 +109,7 @@ func TestReconcilePersistsOneOperationAndAdoptsMatchingReport(t *testing.T) {
 	}
 	resolved := *stored.Status.ResolvedOptions
 	resolved.ClusterName = "cluster"
-	report, err := json.Marshal(pipeline.Report{Version: 1, ClusterUID: string(stored.UID), OperationID: stored.Status.Operation.ID, ResolvedOptions: resolved, Recovery: servitorv1alpha1.RecoveryMetadata{Version: 1, Target: "target", TFVarsSHA256: "digest"}})
+	report, err := json.Marshal(pipeline.Report{Version: 1, ClusterUID: string(stored.UID), OperationID: stored.Status.Operation.ID, ResolvedOptions: resolved, Recovery: validRecoveryMetadata()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,8 +120,82 @@ func TestReconcilePersistsOneOperationAndAdoptsMatchingReport(t *testing.T) {
 	if err := client.Get(context.Background(), request.NamespacedName, stored); err != nil {
 		t.Fatal(err)
 	}
-	if stored.Status.Phase != servitorv1alpha1.PhaseAwaitingApproval || !stored.Status.Operation.Adopted || stored.Status.ReviewDeadline == nil || stored.Status.ReviewGeneration != stored.Generation || stored.Status.ReviewApproval != "approved" {
+	if stored.Status.Phase != servitorv1alpha1.PhaseAwaitingApproval || !stored.Status.Operation.Adopted || stored.Status.ReviewDeadline == nil || !stored.Status.ReviewDeadline.Time.Equal(now.Add(5*time.Minute)) || stored.Status.ReviewGeneration != stored.Generation || stored.Status.ReviewApproval != "approved" {
 		t.Fatalf("report was not adopted with its approval state: %+v", stored.Status)
+	}
+}
+
+func TestSnapshotOmitsVPCDefaultForClassic(t *testing.T) {
+	cluster := &servitorv1alpha1.ServitorCluster{Spec: servitorv1alpha1.ServitorClusterSpec{
+		UserOptions: servitorv1alpha1.UserOptions{Provider: "classic"},
+	}}
+	reconciler := Reconciler{Config: Config{Defaults: servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{
+		Version: "4.22", Provider: "vpc-gen2", VPCID: "default-vpc",
+	}}, OpenShiftFlavor: "bx2.4x16"}}
+
+	if err := reconciler.snapshot(cluster); err != nil {
+		t.Fatal(err)
+	}
+
+	if cluster.Status.ResolvedOptions.Provider != "classic" || cluster.Status.ResolvedOptions.VPCID != "" {
+		t.Fatalf("Classic snapshot retained VPC default: %+v", cluster.Status.ResolvedOptions)
+	}
+}
+
+func TestReconcileFreezesDerivedStartupDefaults(t *testing.T) {
+	now := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
+	cluster := cleanupCluster(now)
+	cluster.Status = servitorv1alpha1.ServitorClusterStatus{}
+	client := fake.NewClientBuilder().WithScheme(cleanupScheme(t)).WithStatusSubresource(&servitorv1alpha1.ServitorCluster{}).WithObjects(cluster).Build()
+	reconciler := cleanupReconciler(client, now)
+	reconciler.Config.Defaults = servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{
+		Version: "4.22", Target: "target", Provider: "vpc-gen2", ResourceGroup: "Default", Zone: "us-south-1", VPCID: "default-vpc",
+	}}
+	reconciler.Config.OpenShiftFlavor = "bx2.4x16"
+	reconciler.Config.KubernetesFlavor = "bx2.2x8"
+	request := cleanupRequest()
+	for range 2 {
+		if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stored := &servitorv1alpha1.ServitorCluster{}
+	if err := client.Get(context.Background(), request.NamespacedName, stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status.ResolvedOptions == nil || stored.Status.ResolvedOptions.Platform != "openshift" || stored.Status.ResolvedOptions.Flavor != "bx2.4x16" || stored.Status.ResolvedOptions.Zone != "us-south-1" || stored.Status.ResolvedOptions.VPCID != "default-vpc" {
+		t.Fatalf("startup defaults were not fully resolved: %+v", stored.Status.ResolvedOptions)
+	}
+	reconciler.Config.Defaults.Version = "1.31"
+	reconciler.Config.OpenShiftFlavor = "changed"
+	reconciler.Config.KubernetesFlavor = "changed"
+	if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Get(context.Background(), request.NamespacedName, stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status.ResolvedOptions.Platform != "openshift" || stored.Status.ResolvedOptions.Flavor != "bx2.4x16" {
+		t.Fatalf("restart changed frozen startup defaults: %+v", stored.Status.ResolvedOptions)
+	}
+}
+
+func TestReconcileRejectsChangedLifecyclePolicy(t *testing.T) {
+	scheme := cleanupScheme(t)
+	now := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
+	cluster := cleanupCluster(now)
+	cluster.Spec.Lifecycle.InitialLeaseSeconds = 7200
+	cluster.Spec.Lifecycle.RetrySeconds = []int64{120}
+	client := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&servitorv1alpha1.ServitorCluster{}).WithObjects(cluster).Build()
+	if _, err := cleanupReconciler(client, now).Reconcile(context.Background(), cleanupRequest()); err != nil {
+		t.Fatal(err)
+	}
+	stored := &servitorv1alpha1.ServitorCluster{}
+	if err := client.Get(context.Background(), cleanupRequest().NamespacedName, stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status.Phase != servitorv1alpha1.PhaseUnresolved || stored.Status.Diagnostic != "LifecyclePolicyChanged" || stored.Status.LifecycleSnapshot.InitialLeaseSeconds != 3600 || stored.Status.LifecycleSnapshot.RetrySeconds[0] != 60 {
+		t.Fatalf("changed policy was not rejected against the frozen snapshot: %+v", stored.Status)
 	}
 }
 
@@ -123,14 +214,15 @@ func TestReconcileApprovedApplyUsesFrozenInputsAndAdoptsReadyReport(t *testing.T
 		ObjectMeta: metav1.ObjectMeta{Name: "cluster", Namespace: "ns", UID: "cluster-uid", Generation: 1, Finalizers: []string{servitorv1alpha1.CleanupFinalizer}},
 		Spec:       servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "1.2"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 3600, RetrySeconds: []int64{60}}},
 		Status: servitorv1alpha1.ServitorClusterStatus{
-			Phase:            servitorv1alpha1.PhaseAwaitingApproval,
-			ResolvedOptions:  &servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Provider: "vpc-gen2", Version: "4.22", ResourceGroup: "Default"}, ClusterName: "frozen", Region: "us-south"},
-			Backend:          &servitorv1alpha1.BackendIdentity{Version: 1, Bucket: "bucket", Key: "frozen.tfstate", Region: "us-south", Endpoint: "https://s3.example.invalid"},
-			ExecutionImage:   "registry.example/ict@sha256:frozen",
-			Recovery:         &servitorv1alpha1.RecoveryMetadata{Version: 1, Target: "target", TFVarsSHA256: "digest"},
-			Operation:        &servitorv1alpha1.OperationReference{ID: operation, Kind: "plan", PipelineRunName: "plan-run", Adopted: true},
-			ReviewDeadline:   &deadline,
-			ReviewGeneration: 1,
+			Phase:             servitorv1alpha1.PhaseAwaitingApproval,
+			ResolvedOptions:   &servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Provider: "vpc-gen2", Version: "4.22", ResourceGroup: "Default"}, ClusterName: "frozen", Region: "us-south"},
+			LifecycleSnapshot: &servitorv1alpha1.LifecycleSnapshot{InitialLeaseSeconds: 3600, RetrySeconds: []int64{60}},
+			Backend:           &servitorv1alpha1.BackendIdentity{Version: 1, Bucket: "bucket", Key: "frozen.tfstate", Region: "us-south", Endpoint: "https://s3.example.invalid"},
+			ExecutionImage:    "registry.example/ict@sha256:frozen",
+			Recovery:          validRecoveryPointer(),
+			Operation:         &servitorv1alpha1.OperationReference{ID: operation, Kind: "plan", PipelineRunName: "plan-run", Adopted: true},
+			ReviewDeadline:    &deadline,
+			ReviewGeneration:  1,
 		},
 	}
 	client := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&servitorv1alpha1.ServitorCluster{}, &tektonv1.PipelineRun{}, &tektonv1.TaskRun{}).WithObjects(cluster).Build()
@@ -230,12 +322,13 @@ func TestReconcileApprovalSetBeforeReviewRequiresNewApproval(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "cluster", Namespace: "ns", UID: "uid", Generation: 2, Finalizers: []string{servitorv1alpha1.CleanupFinalizer}},
 		Spec:       servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "1.2"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 3600, RetrySeconds: []int64{60}, Approval: "approved"}},
 		Status: servitorv1alpha1.ServitorClusterStatus{
-			Phase:            servitorv1alpha1.PhaseAwaitingApproval,
-			ResolvedOptions:  &servitorv1alpha1.ResolvedOptions{},
-			Operation:        &servitorv1alpha1.OperationReference{ID: "plan-a", Kind: "plan", PipelineRunName: "plan-run", Adopted: true},
-			ReviewDeadline:   &deadline,
-			ReviewGeneration: 1,
-			ReviewApproval:   "approved",
+			Phase:             servitorv1alpha1.PhaseAwaitingApproval,
+			ResolvedOptions:   &servitorv1alpha1.ResolvedOptions{},
+			LifecycleSnapshot: &servitorv1alpha1.LifecycleSnapshot{InitialLeaseSeconds: 3600, RetrySeconds: []int64{60}},
+			Operation:         &servitorv1alpha1.OperationReference{ID: "plan-a", Kind: "plan", PipelineRunName: "plan-run", Adopted: true},
+			ReviewDeadline:    &deadline,
+			ReviewGeneration:  1,
+			ReviewApproval:    "approved",
 		},
 	}
 	client := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&servitorv1alpha1.ServitorCluster{}).WithObjects(cluster).Build()
@@ -295,7 +388,7 @@ func TestReconcileApprovalRejectsLateAndRejectedDecisions(t *testing.T) {
 				t.Fatal(err)
 			}
 			deadline := metav1.NewTime(test.deadline)
-			cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "cluster", Namespace: "ns", UID: "uid", Finalizers: []string{servitorv1alpha1.CleanupFinalizer}}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "1.2"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 3600, RetrySeconds: []int64{60}, Approval: test.approval}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseAwaitingApproval, ResolvedOptions: &servitorv1alpha1.ResolvedOptions{}, ReviewDeadline: &deadline}}
+			cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "cluster", Namespace: "ns", UID: "uid", Finalizers: []string{servitorv1alpha1.CleanupFinalizer}}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "1.2"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 3600, RetrySeconds: []int64{60}, Approval: test.approval}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseAwaitingApproval, ResolvedOptions: &servitorv1alpha1.ResolvedOptions{}, LifecycleSnapshot: &servitorv1alpha1.LifecycleSnapshot{InitialLeaseSeconds: 3600, RetrySeconds: []int64{60}}, ReviewDeadline: &deadline}}
 			client := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&servitorv1alpha1.ServitorCluster{}).WithObjects(cluster).Build()
 			reconciler := &Reconciler{Client: client, Config: Config{Namespace: "ns"}, Now: func() time.Time { return time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC) }}
 			if _, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "ns", Name: "cluster"}}); err != nil {
@@ -319,7 +412,7 @@ func TestReconcileFailedApplyRequestsCleanupWithoutRetry(t *testing.T) {
 	if err := tektonv1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
 	}
-	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "cluster", Namespace: "ns", UID: "uid", Finalizers: []string{servitorv1alpha1.CleanupFinalizer}}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "1.2"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 3600, RetrySeconds: []int64{60}}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseApplying, ResolvedOptions: &servitorv1alpha1.ResolvedOptions{}, Operation: &servitorv1alpha1.OperationReference{ID: "apply-a", Kind: "apply", PipelineRunName: "run"}}}
+	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "cluster", Namespace: "ns", UID: "uid", Finalizers: []string{servitorv1alpha1.CleanupFinalizer}}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "1.2"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 3600, RetrySeconds: []int64{60}}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseApplying, ResolvedOptions: &servitorv1alpha1.ResolvedOptions{}, LifecycleSnapshot: &servitorv1alpha1.LifecycleSnapshot{InitialLeaseSeconds: 3600, RetrySeconds: []int64{60}}, Operation: &servitorv1alpha1.OperationReference{ID: "apply-a", Kind: "apply", PipelineRunName: "run"}}}
 	run := &tektonv1.PipelineRun{ObjectMeta: metav1.ObjectMeta{Name: "run", Namespace: "ns", Labels: map[string]string{pipeline.ClusterUIDLabel: "uid", pipeline.OperationLabel: "apply-a"}}, Status: tektonv1.PipelineRunStatus{Status: duckv1.Status{Conditions: duckv1.Conditions{{Type: apis.ConditionSucceeded, Status: corev1.ConditionFalse}}}}}
 	client := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&servitorv1alpha1.ServitorCluster{}, &tektonv1.PipelineRun{}).WithObjects(cluster, run).Build()
 	reconciler := &Reconciler{Client: client, Config: Config{Namespace: "ns"}}
@@ -347,9 +440,10 @@ func TestReconcileMarksMissingReportLogUnresolved(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "cluster", Namespace: "ns", UID: "cluster-uid", Finalizers: []string{servitorv1alpha1.CleanupFinalizer}},
 		Spec:       servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "1.2"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 3600, RetrySeconds: []int64{60}}},
 		Status: servitorv1alpha1.ServitorClusterStatus{
-			Phase:           servitorv1alpha1.PhasePlanning,
-			ResolvedOptions: &servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Provider: "vpc-gen2", Version: "4.22"}},
-			Operation:       &servitorv1alpha1.OperationReference{ID: operation, PipelineRunName: "run"},
+			Phase:             servitorv1alpha1.PhasePlanning,
+			ResolvedOptions:   &servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Provider: "vpc-gen2", Version: "4.22"}},
+			LifecycleSnapshot: &servitorv1alpha1.LifecycleSnapshot{InitialLeaseSeconds: 3600, RetrySeconds: []int64{60}},
+			Operation:         &servitorv1alpha1.OperationReference{ID: operation, PipelineRunName: "run"},
 		},
 	}
 	run := &tektonv1.PipelineRun{
@@ -375,6 +469,68 @@ func TestReconcileMarksMissingReportLogUnresolved(t *testing.T) {
 	}
 	if cluster.Status.Phase != servitorv1alpha1.PhaseUnresolved || cluster.Status.Diagnostic != "ReportMissing" {
 		t.Fatalf("missing log was not retained as unresolved: %+v", cluster.Status)
+	}
+}
+
+func TestReconcileDoesNotRecreateDispatchedPipelineRun(t *testing.T) {
+	for _, operation := range []struct {
+		name  string
+		kind  string
+		phase string
+	}{
+		{name: "plan", kind: "plan", phase: servitorv1alpha1.PhasePlanning},
+		{name: "apply", kind: "apply", phase: servitorv1alpha1.PhaseApplying},
+	} {
+		t.Run(operation.name, func(t *testing.T) {
+			now := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
+			cluster := cleanupCluster(now)
+			cluster.Status.Phase = operation.phase
+			cluster.Status.Operation = &servitorv1alpha1.OperationReference{
+				ID:              operation.kind,
+				Kind:            operation.kind,
+				PipelineRunName: "missing-run",
+				Dispatched:      true,
+			}
+			client := fake.NewClientBuilder().WithScheme(cleanupScheme(t)).WithStatusSubresource(&servitorv1alpha1.ServitorCluster{}, &tektonv1.PipelineRun{}).WithObjects(cluster).Build()
+			if _, err := cleanupReconciler(client, now).Reconcile(context.Background(), cleanupRequest()); err != nil {
+				t.Fatal(err)
+			}
+			stored := &servitorv1alpha1.ServitorCluster{}
+			if err := client.Get(context.Background(), cleanupRequest().NamespacedName, stored); err != nil {
+				t.Fatal(err)
+			}
+			if stored.Status.Phase != servitorv1alpha1.PhaseUnresolved || stored.Status.Diagnostic != "OperationRunMissing" {
+				t.Fatalf("missing dispatched %s run was not retained as unresolved: %+v", operation.kind, stored.Status)
+			}
+			var runs tektonv1.PipelineRunList
+			if err := client.List(context.Background(), &runs); err != nil || len(runs.Items) != 0 {
+				t.Fatalf("missing dispatched %s run was recreated: %d, %v", operation.kind, len(runs.Items), err)
+			}
+		})
+	}
+}
+
+func TestCleanupDoesNotStartDestroyAfterMissingDispatchedApply(t *testing.T) {
+	now := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
+	cluster := cleanupCluster(now)
+	cluster.Status.Phase = servitorv1alpha1.PhaseCleanupPending
+	cluster.Status.ApplyDispatched = true
+	cluster.Status.Cleanup = &servitorv1alpha1.CleanupStatus{Reason: servitorv1alpha1.CleanupReasonExplicit, RequestedAt: metav1.NewTime(now), RequiresDestroy: true}
+	cluster.Status.Operation = &servitorv1alpha1.OperationReference{ID: "apply", Kind: "apply", PipelineRunName: "missing-apply", Dispatched: true}
+	client := fake.NewClientBuilder().WithScheme(cleanupScheme(t)).WithStatusSubresource(&servitorv1alpha1.ServitorCluster{}, &tektonv1.PipelineRun{}).WithObjects(cluster).Build()
+	if _, err := cleanupReconciler(client, now).Reconcile(context.Background(), cleanupRequest()); err != nil {
+		t.Fatal(err)
+	}
+	stored := &servitorv1alpha1.ServitorCluster{}
+	if err := client.Get(context.Background(), cleanupRequest().NamespacedName, stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status.Phase != servitorv1alpha1.PhaseUnresolved || stored.Status.Diagnostic != "OperationRunMissing" {
+		t.Fatalf("missing dispatched apply was not retained as unresolved: %+v", stored.Status)
+	}
+	var runs tektonv1.PipelineRunList
+	if err := client.List(context.Background(), &runs); err != nil || len(runs.Items) != 0 {
+		t.Fatalf("destroy was started after missing dispatched apply: %d, %v", len(runs.Items), err)
 	}
 }
 
@@ -537,8 +693,8 @@ func TestPlanOnlyCleanupFinalizesWithoutDestroy(t *testing.T) {
 	if err := client.Get(context.Background(), cleanupRequest().NamespacedName, stored); err != nil {
 		t.Fatal(err)
 	}
-	if stored.Status.Cleanup.CompletedAt == nil || stored.Status.Phase != servitorv1alpha1.PhaseCleanupComplete || contains(stored.Finalizers, servitorv1alpha1.CleanupFinalizer) {
-		t.Fatalf("plan-only cleanup did not finalize: %+v", stored)
+	if stored.Status.Cleanup.CompletedAt == nil || stored.Status.Phase != servitorv1alpha1.PhaseCleanupComplete || !contains(stored.Finalizers, servitorv1alpha1.CleanupFinalizer) {
+		t.Fatalf("plan-only cleanup did not retain its observable completion state: %+v", stored)
 	}
 	var runs tektonv1.PipelineRunList
 	if err := client.List(context.Background(), &runs); err != nil || len(runs.Items) != 0 {
@@ -612,7 +768,7 @@ func cleanupScheme(t *testing.T) *runtime.Scheme {
 }
 
 func cleanupCluster(_ time.Time) *servitorv1alpha1.ServitorCluster {
-	return &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "cluster", Namespace: "ns", UID: "cleanup-uid", Generation: 1, Finalizers: []string{servitorv1alpha1.CleanupFinalizer}}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "1.2"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 3600, RetrySeconds: []int64{60}}}, Status: servitorv1alpha1.ServitorClusterStatus{ResolvedOptions: &servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Provider: "vpc-gen2", Version: "4.22"}, ClusterName: "frozen"}, Backend: &servitorv1alpha1.BackendIdentity{Version: 1, Bucket: "bucket", Key: "key", Region: "us-south", Endpoint: "https://s3.example.invalid"}, ExecutionImage: "registry.example/ict@sha256:frozen", Recovery: &servitorv1alpha1.RecoveryMetadata{Version: 1, Target: "target", TFVarsSHA256: "digest"}}}
+	return &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "cluster", Namespace: "ns", UID: "cleanup-uid", Generation: 1, Finalizers: []string{servitorv1alpha1.CleanupFinalizer}}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "1.2"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 3600, RetrySeconds: []int64{60}}}, Status: servitorv1alpha1.ServitorClusterStatus{ResolvedOptions: &servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Provider: "vpc-gen2", Version: "4.22"}, ClusterName: "frozen"}, LifecycleSnapshot: &servitorv1alpha1.LifecycleSnapshot{InitialLeaseSeconds: 3600, RetrySeconds: []int64{60}}, Backend: &servitorv1alpha1.BackendIdentity{Version: 1, Bucket: "bucket", Key: "key", Region: "us-south", Endpoint: "https://s3.example.invalid"}, ExecutionImage: "registry.example/ict@sha256:frozen", Recovery: validRecoveryPointer()}}
 }
 
 func cleanupReconciler(client client.Client, now time.Time) *Reconciler {
@@ -660,11 +816,46 @@ func TestSuccessfulDestroyConsumesReportThenCompletesAndRemovesFinalizer(t *test
 	if err := client.Get(context.Background(), cleanupRequest().NamespacedName, stored); err != nil {
 		t.Fatal(err)
 	}
-	if stored.Status.Cleanup.CompletedAt == nil || stored.Status.Phase != servitorv1alpha1.PhaseCleanupComplete || contains(stored.Finalizers, servitorv1alpha1.CleanupFinalizer) {
-		t.Fatalf("destroy did not finalize after report consumption: %+v", stored.Status)
+	if stored.Status.Cleanup.CompletedAt == nil || stored.Status.Phase != servitorv1alpha1.PhaseCleanupComplete || !contains(stored.Finalizers, servitorv1alpha1.CleanupFinalizer) {
+		t.Fatalf("destroy did not retain observable cleanup completion: %+v", stored.Status)
 	}
 	if err := client.Get(context.Background(), types.NamespacedName{Namespace: "ns", Name: "destroy-run"}, &tektonv1.PipelineRun{}); !apierrors.IsNotFound(err) {
 		t.Fatalf("completed destroy PipelineRun was not explicitly deleted: %v", err)
+	}
+}
+
+func TestCleanupCompleteAllocationRemainsObservableBeforeDeletion(t *testing.T) {
+	now := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
+	cluster := cleanupCluster(now)
+	completed := metav1.NewTime(now)
+	cluster.Finalizers = nil
+	cluster.Status.Phase = servitorv1alpha1.PhaseCleanupComplete
+	cluster.Status.Cleanup = &servitorv1alpha1.CleanupStatus{Reason: servitorv1alpha1.CleanupReasonExplicit, RequestedAt: completed, CompletedAt: &completed}
+	client := fake.NewClientBuilder().WithScheme(cleanupScheme(t)).WithStatusSubresource(&servitorv1alpha1.ServitorCluster{}).WithObjects(cluster).Build()
+	request := cleanupRequest()
+	reconciler := cleanupReconciler(client, now)
+	result, err := reconciler.Reconcile(context.Background(), request)
+	if err != nil || result.RequeueAfter != cleanupNotificationGrace {
+		t.Fatalf("completion was not retained for notification: result=%+v err=%v", result, err)
+	}
+	stored := &servitorv1alpha1.ServitorCluster{}
+	if err := client.Get(context.Background(), request.NamespacedName, stored); err != nil || stored.Status.Phase != servitorv1alpha1.PhaseCleanupComplete {
+		t.Fatalf("cleanup completion was not observable: cluster=%+v err=%v", stored, err)
+	}
+	reconciler.Now = func() time.Time { return now.Add(cleanupNotificationGrace) }
+	if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Get(context.Background(), request.NamespacedName, &servitorv1alpha1.ServitorCluster{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("completed allocation was retained or had its finalizer re-added: %v", err)
+	}
+
+	replacement := cleanupCluster(now)
+	replacement.UID = ""
+	replacement.Finalizers = nil
+	replacement.Status = servitorv1alpha1.ServitorClusterStatus{}
+	if err := client.Create(context.Background(), replacement); err != nil {
+		t.Fatalf("completed allocation name cannot be reused: %v", err)
 	}
 }
 

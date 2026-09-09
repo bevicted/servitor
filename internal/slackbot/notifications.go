@@ -89,7 +89,7 @@ func statusNotices(cluster *servitorv1alpha1.ServitorCluster) []statusNotice {
 	case servitorv1alpha1.PhasePlanning:
 		texts = []string{"Planning..."}
 	case servitorv1alpha1.PhaseAwaitingApproval:
-		texts = reviewNoticeTexts(cluster.Status.Review)
+		texts = reviewNoticeTexts(cluster.Status.ResolvedOptions, cluster.Status.Review)
 	case servitorv1alpha1.PhaseApplying:
 		texts = []string{"Applying the approved configuration..."}
 	case servitorv1alpha1.PhaseReady:
@@ -109,8 +109,8 @@ func statusNotices(cluster *servitorv1alpha1.ServitorCluster) []statusNotice {
 	if cleanup := cluster.Status.Cleanup; cleanup != nil && cleanup.RetryCount > 0 {
 		notices = append(notices, statusNotice{id: fmt.Sprintf("cleanup-retry:%s:%d", uid, cleanup.RetryCount), text: fmt.Sprintf("Cleanup retry %d is scheduled.", cleanup.RetryCount)})
 	}
-	if extension := cluster.Status.LeaseExtension; extension != nil && extension.Outcome == servitorv1alpha1.ExtensionOutcomeApplied && extension.NewExpiry != nil {
-		notices = append(notices, statusNotice{id: "extension:" + uid + ":" + extension.RequestedExpiry.UTC().Format(time.RFC3339Nano), text: "Lease extended. New expiry: " + lifecycle.FormatLeaseExpiry(extension.NewExpiry.Time, time.Now().UTC()) + "."})
+	if extension := cluster.Status.LeaseExtension; extension != nil && extension.Outcome == servitorv1alpha1.ExtensionOutcomeApplied && extension.PreviousExpiry != nil && extension.NewExpiry != nil {
+		notices = append(notices, statusNotice{id: "extension:" + uid + ":" + extension.RequestedExpiry.UTC().Format(time.RFC3339Nano), text: extensionNoticeText(extension, time.Now().UTC())})
 	}
 	return notices
 }
@@ -123,7 +123,7 @@ func phaseNotices(uid, phase string, texts []string) []statusNotice {
 	return notices
 }
 
-func reviewNoticeTexts(review *servitorv1alpha1.ReviewSummary) []string {
+func reviewNoticeTexts(options *servitorv1alpha1.ResolvedOptions, review *servitorv1alpha1.ReviewSummary) []string {
 	rows := make([][]string, 0)
 	if review != nil {
 		rows = make([][]string, 0, len(review.Resources))
@@ -131,7 +131,136 @@ func reviewNoticeTexts(review *servitorv1alpha1.ReviewSummary) []string {
 			rows = append(rows, []string{resource.Role, strings.Join(resource.Actions, "/")})
 		}
 	}
-	return statusTableChunks("Plan ready for review.\nPlanned resources:", []string{"Resource", "Action"}, rows, "\nReply with exact `yes` in this thread to approve or `no` to reject the configuration.")
+	create, change, destroy := actionTotals(rows)
+	texts := statusTableChunks("Cluster request", nil, reviewConfigRows(options), "")
+	return append(texts, statusTableChunks(fmt.Sprintf("Plan ready for review.\nPlan: %d create, %d change, %d destroy\nPlanned resources:", create, change, destroy), []string{"Resource", "Action"}, rows, "\nReply with exact `yes` in this thread to approve or `no` to reject the configuration.")...)
+}
+
+func reviewConfigRows(options *servitorv1alpha1.ResolvedOptions) [][]string {
+	if options == nil {
+		return [][]string{{"Configuration:", "-"}}
+	}
+	location := options.Region
+	switch options.Provider {
+	case "vpc-gen2":
+		if options.Zone != "" {
+			location += "/" + options.Zone
+		}
+	case "classic":
+		location = options.Datacenter
+	case "satellite":
+		location = strings.Join(options.SatelliteZones, ", ")
+	}
+	shape := options.Flavor
+	if shape == "" {
+		shape = options.MachineType
+	}
+	if shape == "" {
+		shape = options.SatelliteHostProfile
+	}
+	worker := shape
+	if options.WorkerCount > 0 && shape != "" {
+		worker = fmt.Sprintf("%d x %s", options.WorkerCount, shape)
+	}
+	return [][]string{
+		{"Name:", options.ClusterName},
+		{"Target:", options.Target},
+		{"Platform:", platformLabel(options.Platform) + " " + options.Version},
+		{"Provider:", providerLabel(options.Provider)},
+		{"Location:", location},
+		{"Resource group:", options.ResourceGroup},
+		{"Worker:", worker},
+		{"Network:", networkDescription(options)},
+	}
+}
+
+func platformLabel(platform string) string {
+	if platform == "openshift" {
+		return "OpenShift"
+	}
+	if platform == "kubernetes" {
+		return "Kubernetes"
+	}
+	return "Platform"
+}
+
+func providerLabel(provider string) string {
+	switch provider {
+	case "vpc-gen2":
+		return "VPC Gen 2"
+	case "classic":
+		return "Classic"
+	case "satellite":
+		return "Satellite"
+	default:
+		return "Provider"
+	}
+}
+
+func networkDescription(options *servitorv1alpha1.ResolvedOptions) string {
+	switch options.Provider {
+	case "classic":
+		if options.PublicVLANID != "" || options.PrivateVLANID != "" {
+			return "reuse Classic VLANs"
+		}
+		return "Classic networking"
+	case "satellite":
+		if options.SatelliteLocationID != "" {
+			return "reuse Satellite location " + options.SatelliteLocationID
+		}
+		return "Satellite networking"
+	default:
+		parts := make([]string, 0, 3)
+		if options.VPCID != "" {
+			parts = append(parts, "reuse VPC "+options.VPCID)
+		} else {
+			parts = append(parts, "create VPC")
+		}
+		if len(options.SubnetIDs) > 0 {
+			parts = append(parts, "reuse subnet")
+		} else {
+			parts = append(parts, "create subnet")
+		}
+		if len(options.PublicGatewayIDs) > 0 {
+			parts = append(parts, "reuse gateway")
+		} else {
+			parts = append(parts, "create gateway")
+		}
+		return strings.Join(parts, "; ")
+	}
+}
+
+func actionTotals(rows [][]string) (create, change, destroy int) {
+	for _, row := range rows {
+		for _, action := range strings.Split(row[1], "/") {
+			switch action {
+			case "create":
+				create++
+			case "update":
+				change++
+			case "delete":
+				destroy++
+			}
+		}
+	}
+	return create, change, destroy
+}
+
+func extensionNoticeText(extension *servitorv1alpha1.LeaseExtensionStatus, now time.Time) string {
+	return fmt.Sprintf("Lease extended.\n\n```\nPrevious expiry: %s\nNew expiry:      %s\nAdded:           %s\n```\nRemaining lease time is capped at 24 hours.", lifecycle.FormatLeaseExpiry(extension.PreviousExpiry.Time, now), lifecycle.FormatLeaseExpiry(extension.NewExpiry.Time, now), formatAddedDuration(time.Duration(extension.AddedSeconds)*time.Second))
+}
+
+func formatAddedDuration(added time.Duration) string {
+	switch {
+	case added <= 0:
+		return "-"
+	case added < time.Hour:
+		return "<1h"
+	case added%time.Hour == 0:
+		return fmt.Sprintf("%dh", added/time.Hour)
+	default:
+		return fmt.Sprintf("~%dh", added.Round(time.Hour)/time.Hour)
+	}
 }
 
 func readyNoticeTexts(ready *servitorv1alpha1.ReadySummary, expiry, now time.Time) []string {
@@ -173,7 +302,9 @@ func statusTableChunks(title string, header []string, rows [][]string, conclusio
 func statusTable(header []string, rows [][]string) string {
 	var buffer bytes.Buffer
 	writer := tabwriter.NewWriter(&buffer, 0, 4, 2, ' ', 0)
-	writeListRow(writer, header)
+	if len(header) > 0 {
+		writeListRow(writer, header)
+	}
 	for _, row := range rows {
 		safeRow := make([]string, len(row))
 		for index, cell := range row {

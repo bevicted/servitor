@@ -8,9 +8,11 @@ import (
 	"io"
 	"log"
 	"os"
+	"os/exec"
+	"strings"
 )
 
-// Runner executes commands and preserves bounded output for task-local logs.
+// Runner executes commands and preserves bounded output. Log receives sanitized failure diagnostics.
 type Runner struct {
 	MaxOutput int
 	Log       io.Writer
@@ -29,6 +31,10 @@ func (r Runner) Run(ctx context.Context, name string, args ...string) (Result, e
 	if err := ctx.Err(); err != nil {
 		return Result{}, err
 	}
+	executable, err := resolveExecutable(name)
+	if err != nil {
+		return Result{}, fmt.Errorf("resolve command: %w", err)
+	}
 	limit := r.MaxOutput
 	if limit <= 0 {
 		limit = 64 * 1024
@@ -45,7 +51,7 @@ func (r Runner) Run(ctx context.Context, name string, args ...string) (Result, e
 	}
 	defer closeFile(stderrReader)
 
-	process, err := os.StartProcess(name, append([]string{name}, args...), &os.ProcAttr{Files: []*os.File{os.Stdin, stdoutWriter, stderrWriter}})
+	process, err := os.StartProcess(executable, append([]string{name}, args...), &os.ProcAttr{Files: []*os.File{os.Stdin, stdoutWriter, stderrWriter}})
 	if err != nil {
 		closeFile(stdoutWriter)
 		closeFile(stderrWriter)
@@ -56,13 +62,8 @@ func (r Runner) Run(ctx context.Context, name string, args ...string) (Result, e
 	var stdout, stderr boundedBuffer
 	stdout.limit = limit
 	stderr.limit = limit
-	stdoutDestination, stderrDestination := io.Writer(&stdout), io.Writer(&stderr)
-	if r.Log != nil {
-		stdoutDestination = io.MultiWriter(stdoutDestination, r.Log)
-		stderrDestination = io.MultiWriter(stderrDestination, r.Log)
-	}
-	stdoutDone := copyOutput(stdoutDestination, stdoutReader)
-	stderrDone := copyOutput(stderrDestination, stderrReader)
+	stdoutDone := copyOutput(&stdout, stdoutReader)
+	stderrDone := copyOutput(&stderr, stderrReader)
 	waitDone := make(chan error, 1)
 	go func() {
 		state, waitErr := process.Wait()
@@ -93,11 +94,22 @@ func (r Runner) Run(ctx context.Context, name string, args ...string) (Result, e
 	}
 	if err != nil {
 		if r.Log != nil {
-			log.New(r.Log, "command: ", log.LstdFlags|log.LUTC).Printf("%q failed: %v\nstdout:\n%s\nstderr:\n%s", append([]string{name}, args...), err, result.Stdout, result.Stderr)
+			log.New(r.Log, "command: ", log.LstdFlags|log.LUTC).Printf("%q failed: %v", executable, err)
 		}
 		return result, fmt.Errorf("command failed")
 	}
 	return result, nil
+}
+
+func resolveExecutable(name string) (string, error) {
+	if strings.ContainsRune(name, os.PathSeparator) {
+		return name, nil
+	}
+	executable, err := exec.LookPath(name)
+	if err != nil {
+		return "", fmt.Errorf("look up executable: %w", err)
+	}
+	return executable, nil
 }
 
 func closeFile(file *os.File) {

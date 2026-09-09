@@ -27,6 +27,7 @@ const maxSlackMessage = 3000
 
 type EventStore interface {
 	Claim(context.Context, string) (bool, error)
+	Seen(context.Context, string) (bool, error)
 }
 type Responder interface {
 	Reply(context.Context, Response) error
@@ -47,7 +48,6 @@ type Bot struct {
 	Client                client.Client
 	Events                EventStore
 	Defaults              command.CreateDefaults
-	ConfirmationTimeout   time.Duration
 	Lease                 time.Duration
 	RetryIntervals        []time.Duration
 	Responder             Responder
@@ -65,24 +65,33 @@ func (b Bot) Handle(ctx context.Context, envelope Envelope) error {
 		if b.Events == nil {
 			return fmt.Errorf("record Slack event: receipt store is not configured")
 		}
-		claimed, err := b.Events.Claim(ctx, envelope.ID)
+		seen, err := b.Events.Seen(ctx, envelope.ID)
 		if err != nil {
-			return fmt.Errorf("record Slack event: %w", err)
+			return fmt.Errorf("read Slack event receipt: %w", err)
 		}
-		if !claimed {
+		if seen {
 			return nil
 		}
 	}
+	claim := func() error {
+		if envelope.ID == "" {
+			return nil
+		}
+		if _, err := b.Events.Claim(ctx, envelope.ID); err != nil {
+			return fmt.Errorf("record Slack event: %w", err)
+		}
+		return nil
+	}
 	message := envelope.Message
 	if message.Subtype != "" || message.BotID != "" || (b.SelfUserID != "" && message.User == b.SelfUserID) {
-		return nil
+		return claim()
 	}
 	if message.ChannelType == "im" {
 		b.handleDM(ctx, message)
-		return nil
+		return claim()
 	}
 	if message.Channel != b.ChannelID {
-		return nil
+		return claim()
 	}
 	thread := message.Timestamp
 	if message.ThreadTimestamp != "" {
@@ -102,11 +111,11 @@ func (b Bot) Handle(ctx context.Context, envelope Envelope) error {
 				b.extend(ctx, message, thread, true, reply)
 			}
 		}
-		return nil
+		return claim()
 	}
 	text, mentioned := channelCommand(message.Text, b.SelfUserID)
 	if !mentioned {
-		return nil
+		return claim()
 	}
 	switch firstToken(text) {
 	case "help":
@@ -114,7 +123,9 @@ func (b Bot) Handle(ctx context.Context, envelope Envelope) error {
 	case "list":
 		b.list(ctx, message.User, reply)
 	case "create":
-		b.create(ctx, message, text, reply)
+		if !b.create(ctx, message, text, reply) {
+			return nil
+		}
 	case "done":
 		b.cleanup(ctx, message, thread, true)
 	case "destroy":
@@ -124,7 +135,7 @@ func (b Bot) Handle(ctx context.Context, envelope Envelope) error {
 	default:
 		reply(unknownText())
 	}
-	return nil
+	return claim()
 }
 
 func (b Bot) handleDM(ctx context.Context, message Message) {
@@ -141,55 +152,56 @@ func (b Bot) handleDM(ctx context.Context, message Message) {
 	}
 }
 
-func (b Bot) create(ctx context.Context, message Message, text string, respond func(string)) {
+func (b Bot) create(ctx context.Context, message Message, text string, respond func(string)) bool {
 	options, err := command.ParseCreateOptions(text)
 	if err != nil {
 		respond(rejectedText(err.Error()))
-		return
+		return true
 	}
 	if b.Client == nil || b.Namespace == "" {
 		respond(rejectedText("Create is unavailable. Inspect the allocation CR status and private cluster logs."))
-		return
+		return true
 	}
 	name := ownerClusterName(message.User)
 	existing := &servitorv1alpha1.ServitorCluster{}
 	err = b.Client.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: name}, existing)
 	if err == nil {
 		respond(existingAllocationNotice(existing, b.now()))
-		return
+		return true
 	}
 	if !apierrors.IsNotFound(err) {
 		b.logf("get existing allocation: %v", err)
 		respond(rejectedText("Unable to check an existing allocation. No operation was started."))
-		return
+		return false
 	}
 	// Delivery precedes CR creation. A controller can therefore never begin
 	// planning an allocation the user was not told was accepted.
 	if b.Responder == nil {
 		b.logf("deliver create acceptance: responder is not configured")
-		return
+		return false
 	}
 	if err := b.Responder.Reply(ctx, Response{Channel: message.Channel, ThreadTimestamp: message.Timestamp, Text: "Command accepted.\nPlanning..."}); err != nil {
 		b.logf("deliver create acceptance: %v", err)
-		return
+		return false
 	}
 	now := b.now()
-	deadline := metav1.NewTime(now.Add(b.reviewTimeout()))
 	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: b.Namespace}, Spec: servitorv1alpha1.ServitorClusterSpec{
 		Slack:       servitorv1alpha1.SlackIdentity{OwnerID: message.User, ChannelID: message.Channel, ThreadTimestamp: message.Timestamp},
 		UserOptions: userOptions(options.Values()),
-		Lifecycle:   servitorv1alpha1.LifecyclePolicy{ConfirmationDeadline: &deadline, InitialLeaseSeconds: int64(b.lease() / time.Second), RetrySeconds: seconds(b.RetryIntervals)},
+		Lifecycle:   servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: int64(b.lease() / time.Second), RetrySeconds: seconds(b.RetryIntervals)},
 	}}
 	if err := b.Client.Create(ctx, cluster); err != nil {
 		if apierrors.IsAlreadyExists(err) {
 			if getErr := b.Client.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: name}, existing); getErr == nil {
 				respond(existingAllocationNotice(existing, now))
-				return
+				return true
 			}
 		}
 		b.logf("create allocation: %v", err)
 		respond(rejectedText("Unable to record the create request. No operation was started."))
+		return false
 	}
+	return true
 }
 
 func (b Bot) confirm(ctx context.Context, message Message, thread string) {
@@ -239,10 +251,10 @@ func (b Bot) extend(ctx context.Context, message Message, thread string, require
 		return
 	}
 	cluster, err := b.ownerCluster(ctx, message.User)
-	if err != nil || !ownsThread(cluster, message, thread, requireThread) || cluster.Status.Phase != servitorv1alpha1.PhaseReady || cluster.Status.LeaseExpiresAt == nil {
+	if err != nil || !ownsThread(cluster, message, thread, requireThread) || cluster.Status.Phase != servitorv1alpha1.PhaseReady || cluster.Status.LeaseExpiresAt == nil || cluster.Status.LifecycleSnapshot == nil {
 		return
 	}
-	target, err := command.ExtensionTarget(cluster.Status.LeaseExpiresAt.Time, increment, time.Duration(cluster.Spec.Lifecycle.InitialLeaseSeconds)*time.Second)
+	target, err := command.ExtensionTarget(cluster.Status.LeaseExpiresAt.Time, increment, time.Duration(cluster.Status.LifecycleSnapshot.InitialLeaseSeconds)*time.Second)
 	if err != nil {
 		respond(rejectedText(err.Error()))
 		return
@@ -391,12 +403,6 @@ func seconds(values []time.Duration) []int64 {
 		result[i] = int64(value / time.Second)
 	}
 	return result
-}
-func (b Bot) reviewTimeout() time.Duration {
-	if b.ConfirmationTimeout > 0 {
-		return b.ConfirmationTimeout
-	}
-	return 5 * time.Minute
 }
 func (b Bot) lease() time.Duration {
 	if b.Lease > 0 {

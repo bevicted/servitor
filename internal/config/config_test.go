@@ -35,6 +35,47 @@ func TestValidateFailsClosedForRequiredDeploymentInputs(t *testing.T) {
 	}
 }
 
+func TestValidateRejectsUnsafeCOSEndpoints(t *testing.T) {
+	for _, endpoint := range []string{
+		"http://s3.example.invalid",
+		"https://user:secret@s3.example.invalid",
+		"https://user@s3.example.invalid",
+		"https://s3.example.invalid?api_key=value",
+		"https://s3.example.invalid#token=value",
+		"https:///missing-host",
+		" https://s3.example.invalid",
+		"https://s3.example.invalid/password=secret",
+		"https://s3.example.invalid/p%61ssword=value",
+	} {
+		t.Run(endpoint, func(t *testing.T) {
+			config := validConfig()
+			config.COS.Endpoint = endpoint
+			if err := config.Validate(); err == nil {
+				t.Fatal("Validate() unexpectedly succeeded")
+			}
+		})
+	}
+}
+
+func TestValidateRejectsInvalidExecutionImages(t *testing.T) {
+	for _, image := range []string{
+		"registry.example.invalid/servitor-task:latest",
+		"@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		"registry.example.invalid/servitor-task@sha256:",
+		"registry.example.invalid/servitor-task@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		"registry.example.invalid/servitor-task@sha256:gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg",
+		"registry.example.invalid/servitor-task@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaextra",
+	} {
+		t.Run(image, func(t *testing.T) {
+			config := validConfig()
+			config.Images.Execution = image
+			if err := config.Validate(); err == nil {
+				t.Fatal("Validate() unexpectedly succeeded")
+			}
+		})
+	}
+}
+
 func TestLoadRejectsUnknownFieldsAndMultipleDocuments(t *testing.T) {
 	directory := t.TempDir()
 	path := filepath.Join(directory, "config.yaml")

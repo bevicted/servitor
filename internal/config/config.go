@@ -2,9 +2,11 @@
 package config
 
 import (
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"regexp"
 	"strings"
@@ -186,14 +188,14 @@ func (c Config) Validate() error {
 			return fmt.Errorf("config: %s is required", field.name)
 		}
 	}
-	if !strings.HasPrefix(c.COS.Endpoint, "https://") {
-		return errors.New("config: cos.endpoint must use https")
+	if !validCOSEndpoint(c.COS.Endpoint) {
+		return errors.New("config: cos.endpoint must be a canonical credential-free https URL")
 	}
 	if strings.Contains(c.COS.KeyPrefix, "..") {
 		return errors.New("config: cos.key_prefix must not contain '..'")
 	}
-	if !strings.Contains(c.Images.Execution, "@sha256:") {
-		return errors.New("config: images.execution must be digest-pinned")
+	if !validExecutionImage(c.Images.Execution) {
+		return errors.New("config: images.execution must have a non-empty image name and a 64-character hexadecimal sha256 digest")
 	}
 	if c.COS.UseLockfile {
 		return errors.New("config: cos.use_lockfile is unsupported by the pinned Terraform runtime")
@@ -216,6 +218,36 @@ func (c Config) Validate() error {
 		}
 	}
 	return nil
+}
+
+func validCOSEndpoint(value string) bool {
+	if len(value) == 0 || len(value) > 512 || strings.TrimSpace(value) != value {
+		return false
+	}
+	endpoint, err := url.ParseRequestURI(value)
+	if err != nil || endpoint.String() != value || endpoint.Scheme != "https" || endpoint.Host == "" || endpoint.User != nil || endpoint.RawQuery != "" || endpoint.Fragment != "" {
+		return false
+	}
+	for _, component := range []string{endpoint.Scheme, endpoint.Opaque, endpoint.Host, endpoint.Path, endpoint.RawPath, endpoint.RawQuery, endpoint.Fragment, endpoint.RawFragment} {
+		if containsCredentialMarker(component) {
+			return false
+		}
+	}
+	return true
+}
+
+func validExecutionImage(value string) bool {
+	imageName, digest, found := strings.Cut(value, "@sha256:")
+	if !found || imageName == "" || strings.TrimSpace(imageName) != imageName || len(digest) != 64 {
+		return false
+	}
+	_, err := hex.DecodeString(digest)
+	return err == nil
+}
+
+func containsCredentialMarker(value string) bool {
+	lower := strings.ToLower(value)
+	return strings.Contains(lower, "password") || strings.Contains(lower, "secret") || strings.Contains(lower, "api_key") || strings.Contains(lower, "apikey") || strings.Contains(lower, "access_key") || strings.Contains(lower, "authorization") || strings.Contains(lower, "bearer ") || strings.Contains(lower, "token=")
 }
 
 func requiredDNSLabel(field, value string) error {

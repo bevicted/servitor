@@ -69,9 +69,13 @@ func main() {
 	if err != nil {
 		fail(fmt.Errorf("create manager: %w", err))
 	}
+	controllerSettings, err := controllerConfig(operator)
+	if err != nil {
+		fail(err)
+	}
 	reconciler := &controller.Reconciler{
 		Client: manager.GetClient(), Scheme: manager.GetScheme(), Logs: controller.NewPodLogReader(kubernetes.NewForConfigOrDie(restConfig)),
-		Config: controllerConfig(operator),
+		Config: controllerSettings,
 	}
 	if err := reconciler.SetupWithManager(manager); err != nil {
 		fail(fmt.Errorf("configure controller: %w", err))
@@ -80,8 +84,7 @@ func main() {
 	bot := slackbot.Bot{
 		ChannelID: operator.Slack.ChannelID, Namespace: operator.Namespace, Client: manager.GetClient(),
 		Events: state.NewEventStore(manager.GetClient(), operator.Namespace), Defaults: commandDefaults(operator),
-		ConfirmationTimeout: operator.Lifecycle.ConfirmationTimeout, Lease: operator.Lifecycle.Lease,
-		RetryIntervals: operator.Lifecycle.RetryIntervals, Responder: transport,
+		Lease: operator.Lifecycle.Lease, RetryIntervals: operator.Lifecycle.RetryIntervals, Responder: transport,
 	}
 	if err := manager.Add(slackbot.NewLeaderRunnable(transport, bot)); err != nil {
 		fail(fmt.Errorf("configure Slack intake: %w", err))
@@ -94,7 +97,10 @@ func main() {
 	}
 }
 
-func controllerConfig(operator config.Config) controller.Config {
+func controllerConfig(operator config.Config) (controller.Config, error) {
+	if _, err := command.InferPlatform(operator.Defaults.Version); err != nil {
+		return controller.Config{}, fmt.Errorf("resolve controller startup defaults: %w", err)
+	}
 	return controller.Config{
 		Namespace: operator.Namespace,
 		Defaults: servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{
@@ -112,8 +118,9 @@ func controllerConfig(operator config.Config) controller.Config {
 			ICTConfigMap: operator.ICT.TargetConfigMap, ICTConfigKey: operator.ICT.TargetConfigKey,
 			COSSecret: operator.Secrets.COS, IBMSecret: operator.Secrets.IBM,
 		},
-		ReviewTimeout: operator.Lifecycle.ConfirmationTimeout,
-	}
+		ReviewTimeout:   operator.Lifecycle.ConfirmationTimeout,
+		OpenShiftFlavor: operator.Defaults.OpenShiftFlavor, KubernetesFlavor: operator.Defaults.KubernetesFlavor,
+	}, nil
 }
 
 func config2() (*rest.Config, error) { return ctrlconfig.GetConfig() }

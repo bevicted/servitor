@@ -25,7 +25,6 @@ spec:
       serviceAccountName: servitor-controller
       automountServiceAccountToken: true
       securityContext:
-        fsGroup: 0
         runAsNonRoot: true
         seccompProfile: { type: RuntimeDefault }
       containers:

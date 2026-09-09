@@ -83,10 +83,7 @@ func newOperationRun(cluster *servitorv1alpha1.ServitorCluster, kind string, tas
 		}
 		params = append(params, tektonv1.Param{Name: "recovery", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: string(recovery)}})
 	}
-	taskRunTemplate, err := operationTaskRunTemplate()
-	if err != nil {
-		return nil, err
-	}
+	taskRunTemplate := operationTaskRunTemplate()
 	return &tektonv1.PipelineRun{
 		TypeMeta: metav1.TypeMeta{APIVersion: "tekton.dev/v1", Kind: "PipelineRun"},
 		ObjectMeta: metav1.ObjectMeta{
@@ -104,12 +101,8 @@ func newOperationRun(cluster *servitorv1alpha1.ServitorCluster, kind string, tas
 	}, nil
 }
 
-func operationTaskRunTemplate() (tektonv1.PipelineTaskRunTemplate, error) {
-	template := tektonv1.PipelineTaskRunTemplate{ServiceAccountName: "servitor-task"}
-	if err := json.Unmarshal([]byte(`{"podTemplate":{"securityContext":{"fsGroup":0}}}`), &template); err != nil {
-		return tektonv1.PipelineTaskRunTemplate{}, fmt.Errorf("configure operation task security: %w", err)
-	}
-	return template, nil
+func operationTaskRunTemplate() tektonv1.PipelineTaskRunTemplate {
+	return tektonv1.PipelineTaskRunTemplate{ServiceAccountName: "servitor-task"}
 }
 
 func MatchingRun(run *tektonv1.PipelineRun, uid, operation string) bool {

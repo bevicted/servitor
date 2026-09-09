@@ -33,17 +33,38 @@ func TestStatusNotifierDeliversTransitionOnceAcrossRestart(t *testing.T) {
 	if err := notifier.notify(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if len(responses.responses) != 1 || responses.responses[0].ThreadTimestamp != "root" {
+	if len(responses.responses) != 2 || responses.responses[0].ThreadTimestamp != "root" || responses.responses[1].ThreadTimestamp != "root" {
 		t.Fatalf("responses=%+v", responses.responses)
+	}
+}
+
+func TestStatusNotifierDeliversObservableCleanupCompletion(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := servitorv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	completed := metav1.NewTime(time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC))
+	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "slack-owner", Namespace: "servitor", UID: "uid"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseCleanupComplete, Cleanup: &servitorv1alpha1.CleanupStatus{CompletedAt: &completed}}}
+	kube := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(cluster).Build()
+	responses := &memoryResponder{}
+	notifier := &StatusNotifier{Client: kube, Namespace: "servitor", Responder: responses, Receipts: state.NewEventStore(kube, "servitor")}
+	if err := notifier.notify(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(responses.responses) != 1 || responses.responses[0].Text != "Cleanup complete." {
+		t.Fatalf("cleanup notification was not delivered: %+v", responses.responses)
 	}
 }
 
 func TestStatusNoticesIncludePersistedReviewAndReadySummaries(t *testing.T) {
 	expiry := metav1.NewTime(time.Date(2026, 9, 8, 4, 0, 0, 0, time.UTC))
-	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "slack-owner", Namespace: "servitor", UID: "uid"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseAwaitingApproval, Review: &servitorv1alpha1.ReviewSummary{Resources: []servitorv1alpha1.SummaryResource{{Role: "Cluster<@U1>", Actions: []string{"create", "update```"}}}}}}
+	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "slack-owner", Namespace: "servitor", UID: "uid"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseAwaitingApproval, ResolvedOptions: &servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Target: "target", Provider: "vpc-gen2", Platform: "openshift", Version: "4.22", ResourceGroup: "Default", Zone: "us-south-1", Flavor: "bx2.4x16", WorkerCount: 2}, ClusterName: "cluster", Region: "us-south"}, Review: &servitorv1alpha1.ReviewSummary{Resources: []servitorv1alpha1.SummaryResource{{Role: "Cluster<@U1>", Actions: []string{"create", "update```"}}}}}}
 	review := statusNotices(cluster)
 	reviewText := joinNotices(review)
-	for _, wanted := range []string{"Plan ready for review.", "Resource", "Action", "Cluster U1", "create/update"} {
+	for _, wanted := range []string{"Cluster request", "Name:", "Target:", "Platform:", "Provider:", "Location:", "Resource group:", "Worker:", "Network:", "Plan ready for review.", "Resource", "Action", "Cluster U1", "create/update"} {
 		if !strings.Contains(reviewText, wanted) {
 			t.Fatalf("review notice missing %q: %s", wanted, reviewText)
 		}
@@ -56,9 +77,11 @@ func TestStatusNoticesIncludePersistedReviewAndReadySummaries(t *testing.T) {
 	cluster.Status.Phase = servitorv1alpha1.PhaseReady
 	cluster.Status.LeaseExpiresAt = &expiry
 	cluster.Status.Ready = &servitorv1alpha1.ReadySummary{Resources: []servitorv1alpha1.SummaryResource{{Role: "Cluster", Name: "created<@U1>", ID: "id```"}, {Role: "VPC", Name: "shared", ID: "vpc", Reused: true}}}
+	previous := metav1.NewTime(expiry.Add(-2 * time.Hour))
+	cluster.Status.LeaseExtension = &servitorv1alpha1.LeaseExtensionStatus{RequestedExpiry: expiry, PreviousExpiry: &previous, NewExpiry: &expiry, AddedSeconds: int64((2 * time.Hour).Seconds()), Outcome: servitorv1alpha1.ExtensionOutcomeApplied}
 	ready := statusNotices(cluster)
 	readyText := joinNotices(ready)
-	for _, wanted := range []string{"Your cluster is ready.", "Created", "Reused", "Resource", "Name", "ID", "Cluster", "VPC"} {
+	for _, wanted := range []string{"Your cluster is ready.", "Created", "Reused", "Resource", "Name", "ID", "Cluster", "VPC", "Lease extended.", "Previous expiry:", "New expiry:", "Added:", "2h", "Remaining lease time is capped at 24 hours."} {
 		if !strings.Contains(readyText, wanted) {
 			t.Fatalf("ready notice missing %q: %s", wanted, readyText)
 		}

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	servitorv1alpha1 "github.com/bevicted/servitor/api/v1alpha1"
+	"github.com/bevicted/servitor/internal/command"
 	"github.com/bevicted/servitor/internal/pipeline"
 	tektonv1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -26,15 +27,19 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 )
 
+const cleanupNotificationGrace = 10 * time.Second
+
 // Config values are loaded once at manager startup. Existing status snapshots always win.
 type Config struct {
-	Namespace      string
-	Defaults       servitorv1alpha1.ResolvedOptions
-	Backend        servitorv1alpha1.BackendIdentity
-	BackendPrefix  string
-	ExecutionImage string
-	TaskConfig     pipeline.TaskConfig
-	ReviewTimeout  time.Duration
+	Namespace        string
+	Defaults         servitorv1alpha1.ResolvedOptions
+	Backend          servitorv1alpha1.BackendIdentity
+	BackendPrefix    string
+	ExecutionImage   string
+	TaskConfig       pipeline.TaskConfig
+	ReviewTimeout    time.Duration
+	OpenShiftFlavor  string
+	KubernetesFlavor string
 }
 
 // Reconciler is the sole status writer for ServitorCluster.
@@ -47,7 +52,7 @@ type Reconciler struct {
 	LogRetry time.Duration
 }
 
-// +kubebuilder:rbac:groups=servitor.bevicted.github.io,resources=servitorclusters,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups=servitor.bevicted.github.io,resources=servitorclusters,verbs=get;list;watch;update;patch;delete
 // +kubebuilder:rbac:groups=servitor.bevicted.github.io,resources=servitorclusters/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=servitor.bevicted.github.io,resources=servitorclusters/finalizers,verbs=update
 // +kubebuilder:rbac:groups=tekton.dev,resources=pipelineruns;taskruns,verbs=get;list;watch;create;delete
@@ -65,13 +70,20 @@ func (r *Reconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.
 	if err := cluster.Spec.Validate(); err != nil {
 		return r.unresolved(ctx, cluster, "InvalidSpec", err)
 	}
-	if cluster.DeletionTimestamp.IsZero() {
-		if !contains(cluster.Finalizers, servitorv1alpha1.CleanupFinalizer) {
-			cluster.Finalizers = append(cluster.Finalizers, servitorv1alpha1.CleanupFinalizer)
-			return ctrl.Result{}, r.Update(ctx, cluster)
+	if cluster.Status.Phase == servitorv1alpha1.PhaseCleanupComplete || cluster.Status.Cleanup != nil && cluster.Status.Cleanup.CompletedAt != nil {
+		if cluster.DeletionTimestamp.IsZero() {
+			if cluster.Status.Cleanup != nil && cluster.Status.Cleanup.CompletedAt != nil {
+				if remaining := cluster.Status.Cleanup.CompletedAt.Time.Add(cleanupNotificationGrace).Sub(r.now()); remaining > 0 {
+					return ctrl.Result{RequeueAfter: remaining}, nil
+				}
+			}
+			return ctrl.Result{}, r.Delete(ctx, cluster)
 		}
-	} else if cluster.Status.Cleanup != nil && cluster.Status.Cleanup.CompletedAt != nil {
 		return r.removeFinalizer(ctx, cluster)
+	}
+	if cluster.DeletionTimestamp.IsZero() && !contains(cluster.Finalizers, servitorv1alpha1.CleanupFinalizer) {
+		cluster.Finalizers = append(cluster.Finalizers, servitorv1alpha1.CleanupFinalizer)
+		return ctrl.Result{}, r.Update(ctx, cluster)
 	}
 
 	if !cluster.DeletionTimestamp.IsZero() {
@@ -90,8 +102,16 @@ func (r *Reconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.
 		return r.reconcileCleanup(ctx, cluster)
 	}
 	if cluster.Status.ResolvedOptions == nil {
-		r.snapshot(cluster)
+		if err := r.snapshot(cluster); err != nil {
+			return r.unresolved(ctx, cluster, "InvalidResolvedOptions", err)
+		}
 		return ctrl.Result{}, r.Status().Update(ctx, cluster)
+	}
+	if cluster.Status.LifecycleSnapshot == nil {
+		return r.unresolved(ctx, cluster, "LifecycleSnapshotMissing", errors.New("lifecycle policy snapshot is missing"))
+	}
+	if !matchesLifecycleSnapshot(cluster.Spec.Lifecycle, *cluster.Status.LifecycleSnapshot) {
+		return r.unresolved(ctx, cluster, "LifecyclePolicyChanged", errors.New("immutable lifecycle policy changed"))
 	}
 	if cluster.Status.Phase == servitorv1alpha1.PhaseAwaitingApproval {
 		return r.reconcileApproval(ctx, cluster)
@@ -276,10 +296,14 @@ func (r *Reconciler) waitForCleanupOperation(ctx context.Context, cluster *servi
 	run := &tektonv1.PipelineRun{}
 	err := r.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: operation.PipelineRunName}, run)
 	if apierrors.IsNotFound(err) {
-		if operation.Kind == "destroy" {
-			if operation.Dispatched {
-				return r.unresolved(ctx, cluster, "DestroyRunMissing", errors.New("persisted destroy PipelineRun is missing"))
+		if operation.Dispatched {
+			reason := "OperationRunMissing"
+			if operation.Kind == "destroy" {
+				reason = "DestroyRunMissing"
 			}
+			return r.unresolved(ctx, cluster, reason, errors.New("persisted dispatched PipelineRun is missing"))
+		}
+		if operation.Kind == "destroy" {
 			created, buildErr := pipeline.NewDestroyRun(cluster, r.Config.TaskConfig)
 			if buildErr != nil {
 				return r.unresolved(ctx, cluster, "InvalidOperation", buildErr)
@@ -352,13 +376,14 @@ func (r *Reconciler) recordDestroyFailure(ctx context.Context, cluster *servitor
 	cleanup := cluster.Status.Cleanup
 	cluster.Status.Operation = nil
 	cluster.Status.Diagnostic = "DestroyFailed"
-	if cleanup.RetryCount >= len(cluster.Spec.Lifecycle.RetrySeconds) {
+	retrySeconds := cluster.Status.LifecycleSnapshot.RetrySeconds
+	if cleanup.RetryCount >= len(retrySeconds) {
 		cleanup.NextRetryAt = nil
 		cluster.Status.Phase = servitorv1alpha1.PhaseUnresolved
 		setCondition(cluster, "Ready", metav1.ConditionFalse, "Unresolved", "destroy retries are exhausted; recovery context and finalizer are retained")
 		return ctrl.Result{}, r.Status().Update(ctx, cluster)
 	}
-	delay := time.Duration(cluster.Spec.Lifecycle.RetrySeconds[cleanup.RetryCount]) * time.Second
+	delay := time.Duration(retrySeconds[cleanup.RetryCount]) * time.Second
 	cleanup.RetryCount++
 	next := metav1.NewTime(r.now().Add(delay))
 	cleanup.NextRetryAt = &next
@@ -381,7 +406,7 @@ func (r *Reconciler) completeCleanup(ctx context.Context, cluster *servitorv1alp
 	if err := r.Status().Update(ctx, cluster); err != nil {
 		return ctrl.Result{}, err
 	}
-	return r.removeFinalizer(ctx, cluster)
+	return ctrl.Result{RequeueAfter: cleanupNotificationGrace}, nil
 }
 
 func (r *Reconciler) deleteTerminalOperationRuns(ctx context.Context, cluster *servitorv1alpha1.ServitorCluster) error {
@@ -420,6 +445,9 @@ func (r *Reconciler) observeOperation(ctx context.Context, cluster *servitorv1al
 	run := &tektonv1.PipelineRun{}
 	err := r.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: operation.PipelineRunName}, run)
 	if apierrors.IsNotFound(err) {
+		if operation.Dispatched {
+			return r.unresolved(ctx, cluster, "OperationRunMissing", errors.New("persisted dispatched PipelineRun is missing"))
+		}
 		var created *tektonv1.PipelineRun
 		var buildErr error
 		switch operation.Kind {
@@ -496,11 +524,8 @@ func (r *Reconciler) adoptReport(ctx context.Context, cluster *servitorv1alpha1.
 		cluster.Status.Recovery = &report.Recovery
 		cluster.Status.Review = &report.Review
 		cluster.Status.Phase = servitorv1alpha1.PhaseAwaitingApproval
-		deadline := r.now().Add(r.reviewTimeout())
-		if cluster.Spec.Lifecycle.ConfirmationDeadline != nil {
-			deadline = cluster.Spec.Lifecycle.ConfirmationDeadline.Time
-		}
-		cluster.Status.ReviewDeadline = &metav1.Time{Time: deadline}
+		deadline := metav1.NewTime(r.now().Add(r.reviewTimeout()))
+		cluster.Status.ReviewDeadline = &deadline
 		cluster.Status.ReviewGeneration = cluster.Generation
 		cluster.Status.ReviewApproval = cluster.Spec.Lifecycle.Approval
 		setCondition(cluster, "PlanningSucceeded", metav1.ConditionTrue, "ReportAdopted", "validated planning report adopted")
@@ -510,7 +535,7 @@ func (r *Reconciler) adoptReport(ctx context.Context, cluster *servitorv1alpha1.
 		// This is the sole Ready transition. Never recompute this persisted
 		// deadline during report adoption or later duplicate reconciles.
 		if cluster.Status.LeaseExpiresAt == nil {
-			expiry := metav1.NewTime(r.now().Add(time.Duration(cluster.Spec.Lifecycle.InitialLeaseSeconds) * time.Second))
+			expiry := metav1.NewTime(r.now().Add(time.Duration(cluster.Status.LifecycleSnapshot.InitialLeaseSeconds) * time.Second))
 			cluster.Status.LeaseExpiresAt = &expiry
 		}
 		setCondition(cluster, "Ready", metav1.ConditionTrue, "ReportAdopted", "validated apply report adopted")
@@ -518,10 +543,37 @@ func (r *Reconciler) adoptReport(ctx context.Context, cluster *servitorv1alpha1.
 	return ctrl.Result{}, r.Status().Update(ctx, cluster)
 }
 
-func (r *Reconciler) snapshot(cluster *servitorv1alpha1.ServitorCluster) {
+func (r *Reconciler) snapshot(cluster *servitorv1alpha1.ServitorCluster) error {
 	resolved := r.Config.Defaults
+	// Platform and VPC worker flavor are derived from the selected request
+	// version and provider, rather than inherited from another default version.
+	resolved.Platform = ""
+	resolved.Flavor = ""
 	overlay(&resolved.UserOptions, cluster.Spec.UserOptions)
+	platform, err := command.InferPlatform(resolved.Version)
+	if err != nil {
+		return fmt.Errorf("infer platform: %w", err)
+	}
+	if resolved.Platform == "" {
+		resolved.Platform = platform
+	} else if resolved.Platform != platform {
+		return fmt.Errorf("platform %q does not match version %q", resolved.Platform, resolved.Version)
+	}
+	if resolved.Provider == "vpc-gen2" && resolved.Flavor == "" {
+		if resolved.Platform == "openshift" {
+			resolved.Flavor = r.Config.OpenShiftFlavor
+		} else {
+			resolved.Flavor = r.Config.KubernetesFlavor
+		}
+	}
+	if resolved.Provider == "classic" {
+		resolved.VPCID = ""
+	}
 	cluster.Status.ResolvedOptions = &resolved
+	cluster.Status.LifecycleSnapshot = &servitorv1alpha1.LifecycleSnapshot{
+		InitialLeaseSeconds: cluster.Spec.Lifecycle.InitialLeaseSeconds,
+		RetrySeconds:        append([]int64(nil), cluster.Spec.Lifecycle.RetrySeconds...),
+	}
 	backend := r.Config.Backend
 	if backend.Key == "" {
 		backend.Key = strings.Trim(strings.TrimSpace(r.Config.BackendPrefix), "/") + "/" + string(cluster.UID) + ".tfstate"
@@ -529,6 +581,19 @@ func (r *Reconciler) snapshot(cluster *servitorv1alpha1.ServitorCluster) {
 	cluster.Status.Backend = &backend
 	cluster.Status.ExecutionImage = r.Config.ExecutionImage
 	cluster.Status.Phase = servitorv1alpha1.PhasePending
+	return nil
+}
+
+func matchesLifecycleSnapshot(policy servitorv1alpha1.LifecyclePolicy, snapshot servitorv1alpha1.LifecycleSnapshot) bool {
+	if policy.InitialLeaseSeconds != snapshot.InitialLeaseSeconds || len(policy.RetrySeconds) != len(snapshot.RetrySeconds) {
+		return false
+	}
+	for index, retry := range policy.RetrySeconds {
+		if retry != snapshot.RetrySeconds[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func (r *Reconciler) unresolved(ctx context.Context, cluster *servitorv1alpha1.ServitorCluster, reason string, err error) (ctrl.Result, error) {

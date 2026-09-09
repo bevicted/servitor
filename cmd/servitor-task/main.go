@@ -71,6 +71,8 @@ type backendConfig struct {
 	UseLockfile               bool   `json:"use_lockfile,omitempty"`
 }
 
+const maxTerraformShowBytes = 4 * 1024 * 1024
+
 func main() {
 	var uid, operation, kind, optionsFile, backendFile, recoveryFile, resultFile, reportFile, emitReport, ictPath, terraformPath, optionsJSON, backendJSON, recoveryJSON string
 	flag.StringVar(&uid, "cluster-uid", "", "ServitorCluster UID")
@@ -178,7 +180,9 @@ func runPlan(ctx context.Context, uid, operation string, options servitorv1alpha
 	if err != nil || result.Version != 1 || result.StateID != operation || !filepath.IsAbs(result.PlanPath) {
 		return errors.New("ICT produced no valid planning result")
 	}
-	shown, err := (command.Runner{MaxOutput: pipeline.MaxReportBytes}).Run(ctx, terraformPath, "show", "-json", result.PlanPath)
+	workspace := filepath.Dir(filepath.Dir(result.PlanPath))
+	planPath := filepath.Join(filepath.Base(filepath.Dir(result.PlanPath)), filepath.Base(result.PlanPath))
+	shown, err := (command.Runner{MaxOutput: maxTerraformShowBytes}).Run(ctx, terraformPath, "-chdir="+workspace, "show", "-json", planPath)
 	if err != nil || shown.StdoutTruncated {
 		return errors.New("cannot obtain bounded Terraform plan review")
 	}
@@ -186,7 +190,10 @@ func runPlan(ctx context.Context, uid, operation string, options servitorv1alpha
 	if err != nil {
 		return fmt.Errorf("sanitize Terraform plan: %w", err)
 	}
-	options.ClusterName, options.Region = result.Values.ClusterName, result.Values.Region
+	options, err = resolvedOptionsFromValues(options, result.Values)
+	if err != nil {
+		return err
+	}
 	recovery := servitorv1alpha1.RecoveryMetadata{Version: result.Recovery.Version, Target: result.Recovery.Target, Endpoints: result.Recovery.Endpoints, Values: result.Recovery.Values, SatelliteSSHPublicKeyFingerprint: result.Recovery.SatelliteSSHPublicKeyFingerprint, TFVarsSHA256: result.Recovery.TFVarsSHA256}
 	return writeReport(reportFile, pipeline.Report{Version: 1, ClusterUID: uid, OperationID: operation, ResolvedOptions: options, Recovery: recovery, Review: summaryFromPlan(plan)})
 }
@@ -203,7 +210,7 @@ func runApply(ctx context.Context, uid, operation string, options servitorv1alph
 	if err != nil || result.Version != 1 || result.Operation != "apply" || !filepath.IsAbs(result.Workspace) {
 		return errors.New("ICT produced no valid apply result")
 	}
-	shown, err := (command.Runner{MaxOutput: pipeline.MaxReportBytes}).Run(ctx, terraformPath, "-chdir="+result.Workspace, "show", "-json")
+	shown, err := (command.Runner{MaxOutput: maxTerraformShowBytes}).Run(ctx, terraformPath, "-chdir="+result.Workspace, "show", "-json")
 	if err != nil || shown.StdoutTruncated {
 		return errors.New("cannot obtain bounded Terraform ready summary")
 	}
@@ -307,6 +314,42 @@ func summaryFromState(state terraformview.State) servitorv1alpha1.ReadySummary {
 		summary.Resources = append(summary.Resources, servitorv1alpha1.SummaryResource{Role: resource.Role(), ID: resource.ID, Name: resource.DisplayName, Reused: resource.Reused})
 	}
 	return summary
+}
+
+func resolvedOptionsFromValues(options servitorv1alpha1.ResolvedOptions, values servitorv1alpha1.RecoveryValues) (servitorv1alpha1.ResolvedOptions, error) {
+	provider := map[string]string{"vpc": "vpc-gen2", "classic": "classic", "satellite": "satellite"}[values.ClusterMode]
+	if provider == "" {
+		return servitorv1alpha1.ResolvedOptions{}, errors.New("ICT produced an unsupported cluster mode")
+	}
+	options.UserOptions = servitorv1alpha1.UserOptions{
+		Target:                         options.Target,
+		Provider:                       provider,
+		Platform:                       values.Platform,
+		Version:                        values.KubeVersion,
+		ResourceGroup:                  values.ResourceGroupName,
+		Zone:                           values.Zone,
+		Flavor:                         values.Flavor,
+		VPCID:                          values.VPCID,
+		Datacenter:                     values.Datacenter,
+		MachineType:                    values.MachineType,
+		PublicVLANID:                   values.PublicVLANID,
+		PrivateVLANID:                  values.PrivateVLANID,
+		SubnetIDs:                      append([]string(nil), values.SubnetIDs...),
+		PublicGatewayIDs:               append([]string(nil), values.PublicGatewayIDs...),
+		SatelliteZones:                 append([]string(nil), values.SatelliteZones...),
+		SatelliteManagedFrom:           values.SatelliteManagedFrom,
+		SatelliteLocationID:            values.SatelliteLocationID,
+		SatelliteHostImage:             values.SatelliteHostImage,
+		SatelliteHostProfile:           values.SatelliteHostProfile,
+		SatelliteSSHKeyID:              values.SatelliteSSHKeyID,
+		SatelliteWorkerInstanceIDs:     append([]string(nil), values.SatelliteWorkerInstanceIDs...),
+		SatelliteWorkerOperatingSystem: values.SatelliteWorkerOperatingSystem,
+		Name:                           options.Name,
+		WorkerCount:                    values.WorkerCount,
+	}
+	options.ClusterName = values.ClusterName
+	options.Region = values.Region
+	return options, nil
 }
 
 func optionArgs(options servitorv1alpha1.ResolvedOptions) []string {
