@@ -5,7 +5,7 @@ metadata:
 rules:
   - apiGroups: [servitor.bevicted.github.io]
     resources: [servitorclusters]
-    verbs: [get, list, watch, update, patch, delete]
+    verbs: [get, list, watch, create, update, patch, delete]
   - apiGroups: [servitor.bevicted.github.io]
     resources: [servitorclusters/status]
     verbs: [get, update, patch]

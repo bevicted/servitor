@@ -52,7 +52,7 @@ type Reconciler struct {
 	LogRetry time.Duration
 }
 
-// +kubebuilder:rbac:groups=servitor.bevicted.github.io,resources=servitorclusters,verbs=get;list;watch;update;patch;delete
+// +kubebuilder:rbac:groups=servitor.bevicted.github.io,resources=servitorclusters,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=servitor.bevicted.github.io,resources=servitorclusters/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=servitor.bevicted.github.io,resources=servitorclusters/finalizers,verbs=update
 // +kubebuilder:rbac:groups=tekton.dev,resources=pipelineruns;taskruns,verbs=get;list;watch;create;delete
