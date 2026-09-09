@@ -200,7 +200,7 @@ func (b Bot) create(ctx context.Context, message Message, text string, respond f
 		b.logf("deliver create acceptance: responder is not configured")
 		return false
 	}
-	if err := b.Responder.Reply(ctx, Response{Channel: message.Channel, ThreadTimestamp: message.Timestamp, Text: "Command accepted.\nPlanning..."}); err != nil {
+	if err := b.Responder.Reply(ctx, Response{Channel: message.Channel, ThreadTimestamp: message.Timestamp, Text: "Planning..."}); err != nil {
 		b.logf("deliver create acceptance: %v", err)
 		return false
 	}
@@ -266,7 +266,7 @@ func (b Bot) cleanup(ctx context.Context, message Message, thread string, acknow
 		return
 	}
 	if acknowledge {
-		b.respond(ctx, message.Channel, thread, "Command accepted.\nCleaning up...")
+		b.respond(ctx, message.Channel, thread, "Cleaning up...")
 	}
 }
 

@@ -17,7 +17,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
 type memoryResponder struct {
@@ -50,7 +52,7 @@ func TestCreateAcknowledgesBeforeCreatingOneDeterministicCluster(t *testing.T) {
 	if err := bot.Handle(context.Background(), Envelope{ID: "Ev1", Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "<@BOT> create --version 4.22", Timestamp: "123"}}); err != nil {
 		t.Fatal(err)
 	}
-	if len(responses.responses) != 1 || responses.responses[0].Text != "Command accepted.\nPlanning..." {
+	if len(responses.responses) != 1 || responses.responses[0].Text != "Planning..." {
 		t.Fatalf("responses=%+v", responses.responses)
 	}
 	cluster := &servitorv1alpha1.ServitorCluster{}
@@ -87,7 +89,7 @@ func TestHandleCreateNormalizesMixedAssignmentsWithoutDefaults(t *testing.T) {
 			if err := bot.Handle(context.Background(), event); err != nil {
 				t.Fatal(err)
 			}
-			if len(responses.responses) != 1 || responses.responses[0].Text != "Command accepted.\nPlanning..." {
+			if len(responses.responses) != 1 || responses.responses[0].Text != "Planning..." {
 				t.Fatalf("responses=%+v", responses.responses)
 			}
 			cluster := &servitorv1alpha1.ServitorCluster{}
@@ -157,6 +159,148 @@ func TestCreateDoesNotProceedWhenAcceptanceDeliveryFails(t *testing.T) {
 	if err := bot.Client.Get(context.Background(), name, cluster); err != nil {
 		t.Fatalf("redelivered create was suppressed: %v", err)
 	}
+}
+
+type progressRecorder struct {
+	events    []string
+	responses []Response
+	err       error
+}
+
+func (r *progressRecorder) Reply(_ context.Context, response Response) error {
+	r.events = append(r.events, "reply: "+response.Text)
+	if r.err != nil {
+		return r.err
+	}
+	r.responses = append(r.responses, response)
+	return nil
+}
+
+func progressBotForTest(t *testing.T, recorder *progressRecorder, failCreate, failUpdate bool, objects ...runtime.Object) Bot {
+	t.Helper()
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := servitorv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	kube := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(objects...).WithInterceptorFuncs(interceptor.Funcs{
+		Create: func(ctx context.Context, underlying client.WithWatch, object client.Object, options ...client.CreateOption) error {
+			if _, ok := object.(*servitorv1alpha1.ServitorCluster); ok {
+				recorder.events = append(recorder.events, "kubernetes create")
+				if failCreate {
+					return errors.New("persistence failure")
+				}
+			}
+			return underlying.Create(ctx, object, options...)
+		},
+		Update: func(ctx context.Context, underlying client.WithWatch, object client.Object, options ...client.UpdateOption) error {
+			if _, ok := object.(*servitorv1alpha1.ServitorCluster); ok {
+				recorder.events = append(recorder.events, "kubernetes update")
+				if failUpdate {
+					return errors.New("persistence failure")
+				}
+			}
+			return underlying.Update(ctx, object, options...)
+		},
+	}).Build()
+	return Bot{ChannelID: "C1", SelfUserID: "BOT", Namespace: "servitor", Client: kube, Events: state.NewEventStore(kube, "servitor"), Responder: recorder, Lease: 4 * time.Hour, RetryIntervals: []time.Duration{time.Minute}, Clock: func() time.Time { return time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC) }}
+}
+
+func TestHandleCommandProgressAndPersistenceOrdering(t *testing.T) {
+	message := func(text, timestamp string) Message {
+		return Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: text, Timestamp: timestamp}
+	}
+	cluster := func() *servitorv1alpha1.ServitorCluster {
+		return &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: ownerClusterName("U1"), Namespace: "servitor"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 14400}}}
+	}
+
+	t.Run("create delivers planning before Kubernetes creation", func(t *testing.T) {
+		recorder := &progressRecorder{}
+		bot := progressBotForTest(t, recorder, false, false)
+		if err := bot.Handle(context.Background(), Envelope{Message: message("<@BOT> create --version 4.22", "create")}); err != nil {
+			t.Fatal(err)
+		}
+		if want := []string{"reply: Planning...", "kubernetes create"}; !reflect.DeepEqual(recorder.events, want) {
+			t.Fatalf("events=%q, want %q", recorder.events, want)
+		}
+		if len(recorder.responses) != 1 || recorder.responses[0].Text != "Planning..." {
+			t.Fatalf("responses=%+v", recorder.responses)
+		}
+	})
+
+	t.Run("done persists cleanup before acknowledging it", func(t *testing.T) {
+		recorder := &progressRecorder{}
+		bot := progressBotForTest(t, recorder, false, false, cluster())
+		if err := bot.Handle(context.Background(), Envelope{Message: message("<@BOT> done", "done")}); err != nil {
+			t.Fatal(err)
+		}
+		if want := []string{"kubernetes update", "reply: Cleaning up..."}; !reflect.DeepEqual(recorder.events, want) {
+			t.Fatalf("events=%q, want %q", recorder.events, want)
+		}
+		current := &servitorv1alpha1.ServitorCluster{}
+		if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: ownerClusterName("U1")}, current); err != nil || !current.Spec.Lifecycle.CleanupRequested {
+			t.Fatalf("cleanup request = (%t, %v), want (true, nil)", current.Spec.Lifecycle.CleanupRequested, err)
+		}
+	})
+
+	t.Run("destroy persists cleanup silently", func(t *testing.T) {
+		recorder := &progressRecorder{}
+		bot := progressBotForTest(t, recorder, false, false, cluster())
+		if err := bot.Handle(context.Background(), Envelope{Message: message("<@BOT> destroy", "destroy")}); err != nil {
+			t.Fatal(err)
+		}
+		if want := []string{"kubernetes update"}; !reflect.DeepEqual(recorder.events, want) {
+			t.Fatalf("events=%q, want %q", recorder.events, want)
+		}
+		if len(recorder.responses) != 0 {
+			t.Fatalf("destroy responses=%+v", recorder.responses)
+		}
+	})
+
+	t.Run("failed create reply does not create an allocation", func(t *testing.T) {
+		recorder := &progressRecorder{err: errors.New("Slack unavailable")}
+		bot := progressBotForTest(t, recorder, false, false)
+		if err := bot.Handle(context.Background(), Envelope{Message: message("<@BOT> create --version 4.22", "create")}); err != nil {
+			t.Fatal(err)
+		}
+		if want := []string{"reply: Planning..."}; !reflect.DeepEqual(recorder.events, want) {
+			t.Fatalf("events=%q, want %q", recorder.events, want)
+		}
+		current := &servitorv1alpha1.ServitorCluster{}
+		if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: ownerClusterName("U1")}, current); err == nil {
+			t.Fatal("failed reply created an allocation")
+		}
+	})
+
+	t.Run("persistence failures do not claim progress", func(t *testing.T) {
+		recorder := &progressRecorder{}
+		bot := progressBotForTest(t, recorder, true, false)
+		if err := bot.Handle(context.Background(), Envelope{Message: message("<@BOT> create --version 4.22", "create")}); err != nil {
+			t.Fatal(err)
+		}
+		if want := []string{"reply: Planning...", "kubernetes create", "reply: Command rejected.\n\nUnable to record the create request. No operation was started."}; !reflect.DeepEqual(recorder.events, want) {
+			t.Fatalf("create events=%q, want %q", recorder.events, want)
+		}
+		current := &servitorv1alpha1.ServitorCluster{}
+		if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: ownerClusterName("U1")}, current); err == nil {
+			t.Fatal("failed persistence created an allocation")
+		}
+
+		recorder = &progressRecorder{}
+		bot = progressBotForTest(t, recorder, false, true, cluster())
+		if err := bot.Handle(context.Background(), Envelope{Message: message("<@BOT> done", "done")}); err != nil {
+			t.Fatal(err)
+		}
+		if want := []string{"kubernetes update"}; !reflect.DeepEqual(recorder.events, want) {
+			t.Fatalf("cleanup events=%q, want %q", recorder.events, want)
+		}
+		current = &servitorv1alpha1.ServitorCluster{}
+		if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: ownerClusterName("U1")}, current); err != nil || current.Spec.Lifecycle.CleanupRequested {
+			t.Fatalf("cleanup request = (%t, %v), want (false, nil)", current.Spec.Lifecycle.CleanupRequested, err)
+		}
+	})
 }
 
 func TestReviewDecisionIsAcknowledgedImmediately(t *testing.T) {
