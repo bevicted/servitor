@@ -449,6 +449,69 @@ func TestReconcileFailedApplyRequestsCleanupWithoutRetry(t *testing.T) {
 	}
 }
 
+func TestReconcileAdoptsPlanRejectionWithoutDestroy(t *testing.T) {
+	scheme := cleanupScheme(t)
+	now := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
+	cluster := cleanupCluster(now)
+	cluster.Status.Phase = servitorv1alpha1.PhasePlanning
+	cluster.Status.Operation = operationReference("plan", "plan-run")
+	plan := &tektonv1.PipelineRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "plan-run", Namespace: "ns", Labels: map[string]string{pipeline.ClusterUIDLabel: string(cluster.UID), pipeline.OperationLabel: "plan"}},
+		Status:     tektonv1.PipelineRunStatus{Status: duckv1.Status{Conditions: duckv1.Conditions{{Type: apis.ConditionSucceeded, Status: corev1.ConditionTrue}}}, PipelineRunStatusFields: tektonv1.PipelineRunStatusFields{ChildReferences: []tektonv1.ChildStatusReference{{TypeMeta: runtime.TypeMeta{Kind: "TaskRun"}, Name: "plan-task", PipelineTaskName: "operation"}}}},
+	}
+	task := &tektonv1.TaskRun{ObjectMeta: metav1.ObjectMeta{Name: "plan-task", Namespace: "ns"}, Status: tektonv1.TaskRunStatus{TaskRunStatusFields: tektonv1.TaskRunStatusFields{PodName: "pod", Steps: []tektonv1.StepState{{Name: pipeline.ReportContainerName, Container: "step-report"}}}}}
+	report, err := json.Marshal(pipeline.Report{Version: 1, ClusterUID: string(cluster.UID), OperationID: "plan", PlanRejection: &servitorv1alpha1.PlanRejection{ReasonCode: "version_not_supported", OptionKey: "version"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&servitorv1alpha1.ServitorCluster{}, &tektonv1.PipelineRun{}, &tektonv1.TaskRun{}).WithObjects(cluster, plan, task).Build()
+	reconciler := cleanupReconciler(client, now)
+	reconciler.Logs = reportLogs{data: report}
+	for range 3 {
+		if _, err := reconciler.Reconcile(context.Background(), cleanupRequest()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stored := &servitorv1alpha1.ServitorCluster{}
+	if err := client.Get(context.Background(), cleanupRequest().NamespacedName, stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status.PlanRejection == nil || stored.Status.PlanRejection.OptionKey != "version" || stored.Status.Cleanup == nil || stored.Status.Cleanup.Reason != servitorv1alpha1.CleanupReasonPlanningFailed || stored.Status.Cleanup.RequiresDestroy || stored.Status.Phase != servitorv1alpha1.PhaseCleanupComplete {
+		t.Fatalf("plan rejection was not safely adopted: %+v", stored.Status)
+	}
+	var runs tektonv1.PipelineRunList
+	if err := client.List(context.Background(), &runs); err != nil || len(runs.Items) != 0 {
+		t.Fatalf("plan rejection dispatched operation work: %d, %v", len(runs.Items), err)
+	}
+}
+
+func TestReconcileKeepsWrongKindPlanRejectionUnresolved(t *testing.T) {
+	scheme := cleanupScheme(t)
+	now := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
+	cluster := cleanupCluster(now)
+	cluster.Status.Phase = servitorv1alpha1.PhaseApplying
+	cluster.Status.Operation = &servitorv1alpha1.OperationReference{ID: "apply", Kind: "apply", PipelineRunName: "apply-run"}
+	run := &tektonv1.PipelineRun{ObjectMeta: metav1.ObjectMeta{Name: "apply-run", Namespace: "ns", Labels: map[string]string{pipeline.ClusterUIDLabel: string(cluster.UID), pipeline.OperationLabel: "apply"}}, Status: tektonv1.PipelineRunStatus{Status: duckv1.Status{Conditions: duckv1.Conditions{{Type: apis.ConditionSucceeded, Status: corev1.ConditionTrue}}}, PipelineRunStatusFields: tektonv1.PipelineRunStatusFields{ChildReferences: []tektonv1.ChildStatusReference{{TypeMeta: runtime.TypeMeta{Kind: "TaskRun"}, Name: "apply-task", PipelineTaskName: "operation"}}}}}
+	task := &tektonv1.TaskRun{ObjectMeta: metav1.ObjectMeta{Name: "apply-task", Namespace: "ns"}, Status: tektonv1.TaskRunStatus{TaskRunStatusFields: tektonv1.TaskRunStatusFields{PodName: "pod", Steps: []tektonv1.StepState{{Name: pipeline.ReportContainerName, Container: "step-report"}}}}}
+	report, err := json.Marshal(pipeline.Report{Version: 1, ClusterUID: string(cluster.UID), OperationID: "apply", PlanRejection: &servitorv1alpha1.PlanRejection{ReasonCode: "version_not_supported", OptionKey: "version"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&servitorv1alpha1.ServitorCluster{}, &tektonv1.PipelineRun{}, &tektonv1.TaskRun{}).WithObjects(cluster, run, task).Build()
+	reconciler := cleanupReconciler(client, now)
+	reconciler.Logs = reportLogs{data: report}
+	if _, err := reconciler.Reconcile(context.Background(), cleanupRequest()); err != nil {
+		t.Fatal(err)
+	}
+	stored := &servitorv1alpha1.ServitorCluster{}
+	if err := client.Get(context.Background(), cleanupRequest().NamespacedName, stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status.Phase != servitorv1alpha1.PhaseUnresolved || stored.Status.Diagnostic != "InvalidReport" || stored.Status.PlanRejection != nil {
+		t.Fatalf("wrong-kind planning rejection was accepted: %+v", stored.Status)
+	}
+}
+
 func TestReconcileMarksMissingReportLogUnresolved(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := servitorv1alpha1.AddToScheme(scheme); err != nil {
@@ -843,6 +906,41 @@ func TestSuccessfulDestroyConsumesReportThenCompletesAndRemovesFinalizer(t *test
 	}
 	if err := client.Get(context.Background(), types.NamespacedName{Namespace: "ns", Name: "destroy-run"}, &tektonv1.PipelineRun{}); !apierrors.IsNotFound(err) {
 		t.Fatalf("completed destroy PipelineRun was not explicitly deleted: %v", err)
+	}
+}
+
+func TestDestroyPlanRejectionRemainsUnresolved(t *testing.T) {
+	now := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
+	scheme := cleanupScheme(t)
+	cluster := cleanupCluster(now)
+	operation := destroyID(string(cluster.UID), 0)
+	cluster.Status.Phase = servitorv1alpha1.PhaseCleanupPending
+	cluster.Status.ApplyDispatched = true
+	cluster.Status.Cleanup = &servitorv1alpha1.CleanupStatus{Reason: servitorv1alpha1.CleanupReasonExplicit, RequestedAt: metav1.NewTime(now), RequiresDestroy: true}
+	cluster.Status.Operation = &servitorv1alpha1.OperationReference{ID: operation, Kind: "destroy", PipelineRunName: "destroy-run", Dispatched: true}
+	run := &tektonv1.PipelineRun{ObjectMeta: metav1.ObjectMeta{Name: "destroy-run", Namespace: "ns", Labels: map[string]string{pipeline.ClusterUIDLabel: string(cluster.UID), pipeline.OperationLabel: operation}}}
+	succeededRun(run)
+	run.Status.ChildReferences = []tektonv1.ChildStatusReference{{TypeMeta: runtime.TypeMeta{Kind: "TaskRun"}, Name: "destroy-task", PipelineTaskName: "operation"}}
+	task := &tektonv1.TaskRun{ObjectMeta: metav1.ObjectMeta{Name: "destroy-task", Namespace: "ns"}, Status: tektonv1.TaskRunStatus{TaskRunStatusFields: tektonv1.TaskRunStatusFields{PodName: "pod", Steps: []tektonv1.StepState{{Name: pipeline.ReportContainerName, Container: "step-report"}}}}}
+	report, err := json.Marshal(pipeline.Report{Version: 1, ClusterUID: string(cluster.UID), OperationID: operation, PlanRejection: &servitorv1alpha1.PlanRejection{ReasonCode: "version_not_supported", OptionKey: "version"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&servitorv1alpha1.ServitorCluster{}, &tektonv1.PipelineRun{}, &tektonv1.TaskRun{}).WithObjects(cluster, run, task).Build()
+	reconciler := cleanupReconciler(client, now)
+	reconciler.Logs = reportLogs{data: report}
+	if _, err := reconciler.Reconcile(context.Background(), cleanupRequest()); err != nil {
+		t.Fatal(err)
+	}
+	stored := &servitorv1alpha1.ServitorCluster{}
+	if err := client.Get(context.Background(), cleanupRequest().NamespacedName, stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status.Phase != servitorv1alpha1.PhaseUnresolved || stored.Status.Cleanup.CompletedAt != nil {
+		t.Fatalf("planning rejection in destroy report completed cleanup: %+v", stored.Status)
+	}
+	if err := client.Get(context.Background(), types.NamespacedName{Namespace: "ns", Name: "destroy-run"}, &tektonv1.PipelineRun{}); err != nil {
+		t.Fatalf("destroy PipelineRun was deleted after a rejected report: %v", err)
 	}
 }
 

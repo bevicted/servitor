@@ -332,6 +332,20 @@ type CleanupStatus struct {
 	CompletedAt     *metav1.Time  `json:"completedAt,omitempty"`
 }
 
+// PlanRejection is the bounded, user-correctable outcome of planning validation.
+type PlanRejection struct {
+	ReasonCode string `json:"reasonCode"`
+	OptionKey  string `json:"optionKey"`
+}
+
+func (r PlanRejection) Validate() error {
+	if (r.ReasonCode != "target_not_configured" && r.ReasonCode != "provider_not_supported" && r.ReasonCode != "version_not_supported" && r.ReasonCode != "option_not_available") ||
+		(r.OptionKey != "target" && r.OptionKey != "provider" && r.OptionKey != "version" && r.OptionKey != "resource-group" && r.OptionKey != "zone" && r.OptionKey != "flavor" && r.OptionKey != "datacenter" && r.OptionKey != "machine-type" && r.OptionKey != "satellite-host-profile") {
+		return fmt.Errorf("invalid planning rejection")
+	}
+	return nil
+}
+
 // SummaryResource is deliberately bounded, sanitized review metadata.
 type SummaryResource struct {
 	Role    string   `json:"role,omitempty"`
@@ -394,6 +408,7 @@ type ServitorClusterStatus struct {
 	ApplyDispatched  bool                  `json:"applyDispatched,omitempty"`
 	CleanupRequested bool                  `json:"cleanupRequested,omitempty"`
 	Cleanup          *CleanupStatus        `json:"cleanup,omitempty"`
+	PlanRejection    *PlanRejection        `json:"planRejection,omitempty"`
 	Diagnostic       string                `json:"diagnostic,omitempty"`
 }
 
@@ -574,6 +589,10 @@ func (in *ServitorClusterStatus) DeepCopy() *ServitorClusterStatus {
 			v.CompletedAt = in.Cleanup.CompletedAt.DeepCopy()
 		}
 		out.Cleanup = &v
+	}
+	if in.PlanRejection != nil {
+		v := *in.PlanRejection
+		out.PlanRejection = &v
 	}
 	return out
 }

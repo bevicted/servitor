@@ -428,4 +428,35 @@ spec:
                     retryCount: { type: integer, minimum: 0, maximum: 8 }
                     nextRetryAt: { type: string, format: date-time }
                     completedAt: { type: string, format: date-time }
+                planRejection:
+                  type: object
+                  required: [reasonCode, optionKey]
+                  properties:
+                    reasonCode:
+                      {
+                        type: string,
+                        enum:
+                          [
+                            target_not_configured,
+                            provider_not_supported,
+                            version_not_supported,
+                            option_not_available,
+                          ],
+                      }
+                    optionKey:
+                      {
+                        type: string,
+                        enum:
+                          [
+                            target,
+                            provider,
+                            version,
+                            resource-group,
+                            zone,
+                            flavor,
+                            datacenter,
+                            machine-type,
+                            satellite-host-profile,
+                          ],
+                      }
                 diagnostic: { type: string, maxLength: 128 }

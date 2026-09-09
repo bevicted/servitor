@@ -58,6 +58,18 @@ func TestStatusNoticesSuppressCommandProgressDuplicatesAndDescribeUnresolvedOper
 	}
 }
 
+func TestStatusNoticesExplainPlanningRejectionWithoutServiceDetails(t *testing.T) {
+	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "slack-owner", Namespace: "servitor", UID: "uid"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseCleanupPending, Cleanup: &servitorv1alpha1.CleanupStatus{Reason: servitorv1alpha1.CleanupReasonPlanningFailed}, PlanRejection: &servitorv1alpha1.PlanRejection{ReasonCode: "version_not_supported", OptionKey: "version"}}}
+	notices := statusNotices(cluster)
+	if len(notices) != 1 || notices[0].text != "Cannot plan this request: `version` is not supported. Correct `version` and create a new request.\nCleaning up..." {
+		t.Fatalf("planning rejection notice = %+v", notices)
+	}
+	cluster.Status.PlanRejection = nil
+	if notices := statusNotices(cluster); len(notices) != 1 || notices[0].text != "Planning failed. Cleaning up..." {
+		t.Fatalf("planning failure notice = %+v", notices)
+	}
+}
+
 func TestStatusNotifierDeliversObservableCleanupCompletion(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := corev1.AddToScheme(scheme); err != nil {

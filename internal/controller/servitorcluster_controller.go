@@ -362,8 +362,14 @@ func (r *Reconciler) consumeDestroyReport(ctx context.Context, cluster *servitor
 	if r.Logs == nil {
 		return errors.New("Pod log client is not configured")
 	}
-	_, err := pipeline.ReadReport(ctx, r.Logs, cluster.Namespace, taskRun.Status.PodName, container, string(cluster.UID), cluster.Status.Operation.ID)
-	return err
+	report, err := pipeline.ReadReport(ctx, r.Logs, cluster.Namespace, taskRun.Status.PodName, container, string(cluster.UID), cluster.Status.Operation.ID)
+	if err != nil {
+		return err
+	}
+	if report.PlanRejection != nil {
+		return errors.New("destroy report must not contain a planning rejection")
+	}
+	return nil
 }
 
 func (r *Reconciler) handleDestroyReportError(ctx context.Context, cluster *servitorv1alpha1.ServitorCluster, err error) (ctrl.Result, error) {
@@ -520,6 +526,14 @@ func (r *Reconciler) adoptReport(ctx context.Context, cluster *servitorv1alpha1.
 		return r.unresolved(ctx, cluster, "InvalidReport", err)
 	}
 	cluster.Status.Operation.Adopted = true
+	if report.PlanRejection != nil {
+		if cluster.Status.Operation.Kind != "plan" {
+			return r.unresolved(ctx, cluster, "InvalidReport", errors.New("only planning may return a planning rejection"))
+		}
+		cluster.Status.PlanRejection = report.PlanRejection
+		setCondition(cluster, "PlanningSucceeded", metav1.ConditionFalse, "PlanRejected", "selected option validation rejected the plan")
+		return r.requestCleanup(ctx, cluster, servitorv1alpha1.CleanupReasonPlanningFailed)
+	}
 	if cluster.Status.Operation.Kind == "plan" {
 		cluster.Status.ResolvedOptions = &report.ResolvedOptions
 		cluster.Status.Recovery = &report.Recovery

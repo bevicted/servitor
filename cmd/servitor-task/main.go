@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	servitorv1alpha1 "github.com/bevicted/servitor/api/v1alpha1"
 	"github.com/bevicted/servitor/internal/command"
@@ -77,6 +78,7 @@ const maxTerraformShowBytes = 4 * 1024 * 1024
 func main() {
 	var uid, operation, kind, optionsFile, backendFile, recoveryFile, resultFile, reportFile, emitReport, ictPath, terraformPath, optionsJSON, backendJSON, recoveryJSON string
 	var inventoryConfig, inventoryTarget, inventoryRunID, inventoryRevision, inventoryReport, emitInventoryReport, apiKeyEnv string
+	var planningInventoryConfig string
 	flag.StringVar(&uid, "cluster-uid", "", "ServitorCluster UID")
 	flag.StringVar(&operation, "operation-id", "", "persisted operation ID")
 	flag.StringVar(&kind, "operation-kind", "", "plan, apply, or destroy")
@@ -90,6 +92,7 @@ func main() {
 	flag.StringVar(&reportFile, "report", "", "task-local report JSON")
 	flag.StringVar(&emitReport, "emit-report", "", "emit one validated task-local report JSON document")
 	flag.StringVar(&inventoryConfig, "inventory-config", "", "mounted inventory target configuration")
+	flag.StringVar(&planningInventoryConfig, "planning-inventory-config", "/etc/servitor/ict/config.yaml", "mounted configuration for planning validation")
 	flag.StringVar(&inventoryTarget, "inventory-target", "", "configured inventory target")
 	flag.StringVar(&inventoryRunID, "inventory-run-id", "", "inventory run identity")
 	flag.StringVar(&inventoryRevision, "inventory-revision", "", "target configuration revision")
@@ -127,7 +130,7 @@ func main() {
 		err = materializeParameterFile(recoveryFile, recoveryJSON)
 	}
 	if err == nil {
-		err = run(context.Background(), uid, operation, kind, optionsFile, backendFile, recoveryFile, resultFile, reportFile, ictPath, terraformPath)
+		err = run(context.Background(), uid, operation, kind, optionsFile, backendFile, recoveryFile, resultFile, reportFile, ictPath, terraformPath, planningInventoryConfig, os.Getenv(apiKeyEnv))
 	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "servitor-task:", err)
@@ -216,7 +219,7 @@ func materializeParameterFile(path, contents string) error {
 	return os.WriteFile(path, []byte(contents), 0o600)
 }
 
-func run(ctx context.Context, uid, operation, kind, optionsFile, backendFile, recoveryFile, resultFile, reportFile, ictPath, terraformPath string) error {
+func run(ctx context.Context, uid, operation, kind, optionsFile, backendFile, recoveryFile, resultFile, reportFile, ictPath, terraformPath, planningInventoryConfig, apiKey string) error {
 	if uid == "" || operation == "" || (kind != "plan" && kind != "apply" && kind != "destroy") {
 		return errors.New("cluster UID, operation ID, and operation kind are required")
 	}
@@ -234,7 +237,7 @@ func run(ctx context.Context, uid, operation, kind, optionsFile, backendFile, re
 		return fmt.Errorf("read resolved options: %w", err)
 	}
 	if kind == "plan" {
-		return runPlan(ctx, uid, operation, options, backendFile, resultFile, reportFile, ictPath, terraformPath)
+		return runPlan(ctx, uid, operation, options, backendFile, resultFile, reportFile, ictPath, terraformPath, planningInventoryConfig, apiKey)
 	}
 	if kind == "apply" {
 		return runApply(ctx, uid, operation, options, backendFile, recoveryFile, resultFile, reportFile, ictPath, terraformPath)
@@ -242,7 +245,14 @@ func run(ctx context.Context, uid, operation, kind, optionsFile, backendFile, re
 	return runDestroy(ctx, uid, operation, options, backendFile, recoveryFile, resultFile, reportFile, ictPath)
 }
 
-func runPlan(ctx context.Context, uid, operation string, options servitorv1alpha1.ResolvedOptions, backendFile, resultFile, reportFile, ictPath, terraformPath string) error {
+func runPlan(ctx context.Context, uid, operation string, options servitorv1alpha1.ResolvedOptions, backendFile, resultFile, reportFile, ictPath, terraformPath, planningInventoryConfig, apiKey string) error {
+	options, rejection, err := validatePlanOptions(ctx, planningInventoryConfig, apiKey, options)
+	if err != nil {
+		return err
+	}
+	if rejection != nil {
+		return writeReport(reportFile, pipeline.Report{Version: 1, ClusterUID: uid, OperationID: operation, PlanRejection: rejection})
+	}
 	platform, err := command.InferPlatform(options.Version)
 	if err != nil || options.Platform != platform {
 		return errors.New("resolved platform does not match version")
@@ -278,6 +288,104 @@ func runPlan(ctx context.Context, uid, operation string, options servitorv1alpha
 	}
 	recovery := servitorv1alpha1.RecoveryMetadata{Version: result.Recovery.Version, Target: result.Recovery.Target, Endpoints: result.Recovery.Endpoints, Values: result.Recovery.Values, SatelliteSSHPublicKeyFingerprint: result.Recovery.SatelliteSSHPublicKeyFingerprint, TFVarsSHA256: result.Recovery.TFVarsSHA256}
 	return writeReport(reportFile, pipeline.Report{Version: 1, ClusterUID: uid, OperationID: operation, ResolvedOptions: options, Recovery: recovery, Review: summaryFromPlan(plan)})
+}
+
+func validatePlanOptions(ctx context.Context, configPath, apiKey string, options servitorv1alpha1.ResolvedOptions) (servitorv1alpha1.ResolvedOptions, *servitorv1alpha1.PlanRejection, error) {
+	if !filepath.IsAbs(configPath) {
+		return servitorv1alpha1.ResolvedOptions{}, nil, errors.New("selected option validation configuration is unavailable")
+	}
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return servitorv1alpha1.ResolvedOptions{}, nil, errors.New("selected option validation configuration is unavailable")
+	}
+	config, err := inventory.LoadConfig(data)
+	if err != nil {
+		return servitorv1alpha1.ResolvedOptions{}, nil, errors.New("selected option validation configuration is invalid")
+	}
+	target, ok := config.Targets[options.Target]
+	if !ok {
+		return options, &servitorv1alpha1.PlanRejection{ReasonCode: "target_not_configured", OptionKey: "target"}, nil
+	}
+	if !containsOption(target.Providers, options.Provider) {
+		return options, &servitorv1alpha1.PlanRejection{ReasonCode: "provider_not_supported", OptionKey: "provider"}, nil
+	}
+	catalog, err := inventory.Discover(ctx, config, options.Target, apiKey, nil)
+	if err != nil {
+		return servitorv1alpha1.ResolvedOptions{}, nil, inventory.RedactedError(err)
+	}
+	version, platform, ok := supportedPlanVersion(catalog.Versions, options.Version)
+	if !ok {
+		return options, &servitorv1alpha1.PlanRejection{ReasonCode: "version_not_supported", OptionKey: "version"}, nil
+	}
+	options.Version = version
+	options.Platform = platform
+	if options.ResourceGroup != "" && !containsOption(catalog.ResourceGroups, options.ResourceGroup) {
+		return options, &servitorv1alpha1.PlanRejection{ReasonCode: "option_not_available", OptionKey: "resource-group"}, nil
+	}
+	switch options.Provider {
+	case "vpc-gen2":
+		location, found := planLocation(catalog.VPCLocations, options.Zone)
+		if options.Zone != "" && !found {
+			return options, &servitorv1alpha1.PlanRejection{ReasonCode: "option_not_available", OptionKey: "zone"}, nil
+		}
+		if options.Flavor != "" && found && !containsOption(location.Flavors, options.Flavor) {
+			return options, &servitorv1alpha1.PlanRejection{ReasonCode: "option_not_available", OptionKey: "flavor"}, nil
+		}
+	case "classic":
+		location, found := planLocation(catalog.ClassicLocations, options.Datacenter)
+		if options.Datacenter != "" && !found {
+			return options, &servitorv1alpha1.PlanRejection{ReasonCode: "option_not_available", OptionKey: "datacenter"}, nil
+		}
+		if options.MachineType != "" && found && !containsOption(location.Flavors, options.MachineType) {
+			return options, &servitorv1alpha1.PlanRejection{ReasonCode: "option_not_available", OptionKey: "machine-type"}, nil
+		}
+	case "satellite":
+		if options.SatelliteHostProfile != "" && !hasSatelliteProfile(catalog.SatelliteProfile, options.SatelliteHostProfile) {
+			return options, &servitorv1alpha1.PlanRejection{ReasonCode: "option_not_available", OptionKey: "satellite-host-profile"}, nil
+		}
+	}
+	return options, nil, nil
+}
+
+func supportedPlanVersion(versions []inventory.Version, requested string) (string, string, bool) {
+	platform, err := command.InferPlatform(requested)
+	if err != nil {
+		return "", "", false
+	}
+	for _, version := range versions {
+		stream := strings.TrimSuffix(version.Name, "_openshift")
+		if version.Supported && version.Platform == platform && (version.Name == requested || stream == requested) {
+			return version.Name, version.Platform, true
+		}
+	}
+	return "", "", false
+}
+
+func containsOption(options []string, selected string) bool {
+	for _, option := range options {
+		if option == selected {
+			return true
+		}
+	}
+	return false
+}
+
+func planLocation(locations []inventory.Location, selected string) (inventory.Location, bool) {
+	for _, location := range locations {
+		if location.Name == selected {
+			return location, true
+		}
+	}
+	return inventory.Location{}, false
+}
+
+func hasSatelliteProfile(profiles []inventory.Profile, selected string) bool {
+	for _, profile := range profiles {
+		if profile.Name == selected {
+			return true
+		}
+	}
+	return false
 }
 
 func runApply(ctx context.Context, uid, operation string, options servitorv1alpha1.ResolvedOptions, backendFile, recoveryFile, resultFile, reportFile, ictPath, terraformPath string) error {

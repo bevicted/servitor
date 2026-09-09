@@ -63,6 +63,8 @@ spec:
         - /operation/ict-result.json
         - -report
         - /operation/report.json
+        - -planning-inventory-config
+        - /etc/servitor/ict/config.yaml
       env:
         - name: ICT_CONFIG
           value: /etc/servitor/ict/config.yaml

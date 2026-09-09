@@ -16,6 +16,43 @@ import (
 	"github.com/bevicted/servitor/internal/pipeline"
 )
 
+func planningValidationFixture(t *testing.T, directory string) (string, string) {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/iam/identity/token":
+			_, _ = w.Write([]byte(`{"access_token":"synthetic-token"}`))
+		case "/iam/identity/userinfo":
+			_, _ = w.Write([]byte(`{"account_id":"account-1"}`))
+		case "/rm/v2/resource_groups":
+			_, _ = w.Write([]byte(`{"resources":[{"name":"New Group","state":"ACTIVE"}]}`))
+		case "/containers/v1/versions":
+			_, _ = w.Write([]byte(`{"openshift":[{"major":4,"minor":22,"default":true}],"kubernetes":[{"major":1,"minor":31,"default":true}]}`))
+		case "/containers/v2/vpc/getZones":
+			_, _ = w.Write([]byte(`[{"name":"us-south-1"}]`))
+		case "/containers/v2/getFlavors":
+			_, _ = w.Write([]byte(`[{"name":"bx2.4x16"}]`))
+		default:
+			t.Fatalf("unexpected planning validation request %s", r.URL.RequestURI())
+		}
+	}))
+	t.Cleanup(server.Close)
+	configPath := filepath.Join(directory, "planning-config.yaml")
+	config := `version: 1
+targets:
+  target:
+    providers: [vpc-gen2]
+    endpoints:
+      IAM: ` + server.URL + `/iam
+      ResourceManagement: ` + server.URL + `/rm
+      ContainerService: ` + server.URL + `/containers
+`
+	if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return configPath, "synthetic-key"
+}
+
 func TestRunPlanUsesInitializedWorkspaceAndSanitizesOversizedPlan(t *testing.T) {
 	directory := t.TempDir()
 	workspace := filepath.Join(directory, "workspace")
@@ -63,8 +100,9 @@ func TestRunPlanUsesInitializedWorkspaceAndSanitizesOversizedPlan(t *testing.T) 
 	if err := os.WriteFile(terraform, []byte("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$TRACE_FILE\"\n[ \"$1\" = \"-chdir=$WORKSPACE\" ] && [ \"$2\" = show ] && [ \"$3\" = -json ] && [ \"$4\" = .cluster/create.tfplan ] || exit 3\ncat \"$PLAN_SHOW\"\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	options := servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Provider: "vpc-gen2", Version: "4.22"}, Platform: "openshift"}
-	if err := runPlan(context.Background(), "uid", "plan-a", options, backendFile, resultFile, reportFile, ict, terraform); err != nil {
+	planningConfig, apiKey := planningValidationFixture(t, directory)
+	options := servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Target: "target", Provider: "vpc-gen2", Version: "4.22", ResourceGroup: "New Group"}, Platform: "openshift"}
+	if err := runPlan(context.Background(), "uid", "plan-a", options, backendFile, resultFile, reportFile, ict, terraform, planningConfig, apiKey); err != nil {
 		t.Fatal(err)
 	}
 	trace, err := os.ReadFile(filepath.Join(directory, "terraform.args"))
@@ -79,7 +117,7 @@ func TestRunPlanUsesInitializedWorkspaceAndSanitizesOversizedPlan(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := string(ictTrace); !strings.Contains(got, "--prefix\nservitor\n") || !strings.Contains(got, "--provider\nvpc-gen2\n") || !strings.Contains(got, "--platform\nopenshift\n") || !strings.Contains(got, "--version\n4.22\n") || strings.Contains(got, "--name\n") || strings.Contains(got, "--owner\n") {
+	if got := string(ictTrace); !strings.Contains(got, "--prefix\nservitor\n") || !strings.Contains(got, "--provider\nvpc-gen2\n") || !strings.Contains(got, "--platform\nopenshift\n") || !strings.Contains(got, "--version\n4.22_openshift\n") || strings.Contains(got, "--name\n") || strings.Contains(got, "--owner\n") {
 		t.Fatalf("ICT plan arguments = %q, want derived OpenShift platform, fixed provider, and generated-name prefix", got)
 	}
 	report, err := os.ReadFile(reportFile)
@@ -153,7 +191,8 @@ func TestRunPlanRejectsInconsistentRecoveryValues(t *testing.T) {
 				t.Fatal(err)
 			}
 			reportFile := filepath.Join(directory, "report.json")
-			err := runPlan(context.Background(), "uid", "plan-a", servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Provider: "vpc-gen2", Version: "4.22"}, Platform: "openshift"}, filepath.Join(directory, "backend.json"), filepath.Join(directory, "result.json"), reportFile, ict, terraform)
+			planningConfig, apiKey := planningValidationFixture(t, directory)
+			err := runPlan(context.Background(), "uid", "plan-a", servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Target: "target", Provider: "vpc-gen2", Version: "4.22"}, Platform: "openshift"}, filepath.Join(directory, "backend.json"), filepath.Join(directory, "result.json"), reportFile, ict, terraform, planningConfig, apiKey)
 			if err == nil || !strings.Contains(err.Error(), test.want) {
 				t.Fatalf("runPlan error = %v, want %q", err, test.want)
 			}
@@ -161,6 +200,57 @@ func TestRunPlanRejectsInconsistentRecoveryValues(t *testing.T) {
 				t.Fatalf("inconsistent recovery values wrote report: %v", err)
 			}
 		})
+	}
+}
+
+func TestRunPlanRejectsInvalidSelectionBeforeICTAndRedactsDiscoveryFailure(t *testing.T) {
+	directory := t.TempDir()
+	configPath, apiKey := planningValidationFixture(t, directory)
+	ictTrace := filepath.Join(directory, "ict.trace")
+	ict := filepath.Join(directory, "ict")
+	if err := os.WriteFile(ict, []byte("#!/bin/sh\nprintf invoked > \"$ICT_TRACE_FILE\"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("ICT_TRACE_FILE", ictTrace)
+	reportPath := filepath.Join(directory, "rejection.json")
+	if err := runPlan(context.Background(), "uid", "plan-rejected", servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Target: "target", Provider: "vpc-gen2", Version: "4.99"}}, filepath.Join(directory, "backend.json"), filepath.Join(directory, "result.json"), reportPath, ict, filepath.Join(directory, "terraform"), configPath, apiKey); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(ictTrace); !os.IsNotExist(err) {
+		t.Fatalf("invalid preflight invoked ICT: %v", err)
+	}
+	data, err := os.ReadFile(reportPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	report, err := pipeline.DecodeReport(data, "uid", "plan-rejected")
+	if err != nil || report.PlanRejection == nil || report.PlanRejection.ReasonCode != "version_not_supported" || report.PlanRejection.OptionKey != "version" {
+		t.Fatalf("invalid preflight report = %+v, err=%v", report, err)
+	}
+
+	failure := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "synthetic private service detail", http.StatusBadGateway)
+	}))
+	defer failure.Close()
+	failureConfig := filepath.Join(directory, "failure-config.yaml")
+	contents := `version: 1
+targets:
+  target:
+    providers: [vpc-gen2]
+    endpoints:
+      IAM: ` + failure.URL + `/iam
+      ResourceManagement: ` + failure.URL + `/rm
+      ContainerService: ` + failure.URL + `/containers
+`
+	if err := os.WriteFile(failureConfig, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err = runPlan(context.Background(), "uid", "plan-failed", servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Target: "target", Provider: "vpc-gen2", Version: "4.22"}}, filepath.Join(directory, "backend.json"), filepath.Join(directory, "result.json"), filepath.Join(directory, "failed-report.json"), ict, filepath.Join(directory, "terraform"), failureConfig, "synthetic-secret")
+	if err == nil || !strings.Contains(err.Error(), "inventory discovery failed") || strings.Contains(err.Error(), failure.URL) || strings.Contains(err.Error(), "synthetic private service detail") || strings.Contains(err.Error(), "synthetic-secret") {
+		t.Fatalf("planning service failure leaked or became an input rejection: %v", err)
+	}
+	if _, err := os.Stat(ictTrace); !os.IsNotExist(err) {
+		t.Fatalf("service failure invoked ICT: %v", err)
 	}
 }
 
@@ -252,8 +342,9 @@ func TestRunPlanPassesKubernetesPlatformToICT(t *testing.T) {
 	if err := os.WriteFile(terraform, []byte("#!/bin/sh\ncat \"$PLAN_SHOW\"\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	options := servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Provider: "vpc-gen2", Version: "1.31"}, Platform: "kubernetes"}
-	if err := runPlan(context.Background(), "uid", "plan-kubernetes", options, filepath.Join(directory, "backend.json"), resultFile, filepath.Join(directory, "report.json"), ict, terraform); err != nil {
+	planningConfig, apiKey := planningValidationFixture(t, directory)
+	options := servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Target: "target", Provider: "vpc-gen2", Version: "1.31"}, Platform: "kubernetes"}
+	if err := runPlan(context.Background(), "uid", "plan-kubernetes", options, filepath.Join(directory, "backend.json"), resultFile, filepath.Join(directory, "report.json"), ict, terraform, planningConfig, apiKey); err != nil {
 		t.Fatal(err)
 	}
 	trace, err := os.ReadFile(filepath.Join(directory, "ict.args"))

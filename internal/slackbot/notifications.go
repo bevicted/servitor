@@ -95,8 +95,14 @@ func statusNotices(cluster *servitorv1alpha1.ServitorCluster) []statusNotice {
 		}
 		texts = readyNoticeTexts(cluster.Status.Ready, expiry, time.Now().UTC())
 	case servitorv1alpha1.PhaseCleanupPending:
-		if cluster.Status.Cleanup == nil || cluster.Status.Cleanup.Reason != servitorv1alpha1.CleanupReasonRejected {
-			texts = []string{"Cleaning up..."}
+		if cluster.Status.PlanRejection != nil {
+			texts = []string{planRejectionText(*cluster.Status.PlanRejection) + "\nCleaning up..."}
+		} else if cluster.Status.Cleanup == nil || cluster.Status.Cleanup.Reason != servitorv1alpha1.CleanupReasonRejected {
+			if cluster.Status.Cleanup != nil && cluster.Status.Cleanup.Reason == servitorv1alpha1.CleanupReasonPlanningFailed {
+				texts = []string{"Planning failed. Cleaning up..."}
+			} else {
+				texts = []string{"Cleaning up..."}
+			}
 		}
 	case servitorv1alpha1.PhaseCleanupComplete:
 		texts = []string{"Cleanup complete."}
@@ -115,6 +121,20 @@ func statusNotices(cluster *servitorv1alpha1.ServitorCluster) []statusNotice {
 		notices = append(notices, statusNotice{id: "extension:" + uid + ":" + extension.RequestedExpiry.UTC().Format(time.RFC3339Nano), text: extensionNoticeText(extension, time.Now().UTC())})
 	}
 	return notices
+}
+
+func planRejectionText(rejection servitorv1alpha1.PlanRejection) string {
+	key := "`" + rejection.OptionKey + "`"
+	switch rejection.ReasonCode {
+	case "target_not_configured":
+		return "Cannot plan this request: " + key + " is not configured. Correct " + key + " and create a new request."
+	case "provider_not_supported":
+		return "Cannot plan this request: " + key + " is not supported for the selected target. Correct " + key + " and create a new request."
+	case "version_not_supported":
+		return "Cannot plan this request: " + key + " is not supported. Correct " + key + " and create a new request."
+	default:
+		return "Cannot plan this request: " + key + " is not currently available. Correct " + key + " and create a new request."
+	}
 }
 
 func phaseNotices(uid, phase string, texts []string) []statusNotice {

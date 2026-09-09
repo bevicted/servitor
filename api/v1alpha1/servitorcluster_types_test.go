@@ -64,6 +64,15 @@ func TestServitorClusterDeepCopyPreservesLeaseStatus(t *testing.T) {
 	}
 }
 
+func TestServitorClusterDeepCopyDoesNotAliasPlanRejection(t *testing.T) {
+	cluster := &ServitorCluster{Status: ServitorClusterStatus{PlanRejection: &PlanRejection{ReasonCode: "version_not_supported", OptionKey: "version"}}}
+	copy := cluster.DeepCopy()
+	copy.Status.PlanRejection.OptionKey = "provider"
+	if cluster.Status.PlanRejection.OptionKey != "version" {
+		t.Fatalf("DeepCopy() aliases plan rejection: %+v", cluster.Status.PlanRejection)
+	}
+}
+
 func TestServitorClusterDeepCopyDoesNotAliasSummaryActions(t *testing.T) {
 	cluster := &ServitorCluster{Status: ServitorClusterStatus{
 		Review: &ReviewSummary{Resources: []SummaryResource{{Actions: []string{"create"}}}},

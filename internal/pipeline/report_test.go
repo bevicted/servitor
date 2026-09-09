@@ -64,6 +64,25 @@ func TestReadReportAcceptsOnlyExactBoundedIdentity(t *testing.T) {
 	}
 }
 
+func TestDecodeReportAcceptsOnlyPlanOnlyRejection(t *testing.T) {
+	rejection := Report{Version: 1, ClusterUID: "uid", OperationID: "plan-a", PlanRejection: &servitorv1alpha1.PlanRejection{ReasonCode: "version_not_supported", OptionKey: "version"}}
+	data, err := json.Marshal(rejection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decoded, err := DecodeReport(data, "uid", "plan-a"); err != nil || decoded.PlanRejection == nil || decoded.PlanRejection.OptionKey != "version" {
+		t.Fatalf("plan rejection = %+v, err=%v", decoded, err)
+	}
+	rejection.ResolvedOptions.Provider = "vpc-gen2"
+	data, err = json.Marshal(rejection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DecodeReport(data, "uid", "plan-a"); err == nil {
+		t.Fatal("accepted planning rejection with success payload")
+	}
+}
+
 func TestDecodeReportRejectsUnsafeRecoveryMetadata(t *testing.T) {
 	for _, test := range []struct {
 		name   string
