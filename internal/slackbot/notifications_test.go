@@ -22,10 +22,12 @@ func TestStatusNotifierDeliversTransitionOnceAcrossRestart(t *testing.T) {
 	if err := servitorv1alpha1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
 	}
-	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "slack-owner", Namespace: "servitor", UID: "uid"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseAwaitingApproval}}
+	now := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
+	deadline := metav1.NewTime(now.Add(time.Hour))
+	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "slack-owner", Namespace: "servitor", UID: "uid"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseAwaitingApproval, ReviewDeadline: &deadline}}
 	kube := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(cluster).Build()
 	responses := &memoryResponder{}
-	notifier := &StatusNotifier{Client: kube, Namespace: "servitor", Responder: responses, Receipts: state.NewEventStore(kube, "servitor")}
+	notifier := &StatusNotifier{Client: kube, Namespace: "servitor", Responder: responses, Receipts: state.NewEventStore(kube, "servitor"), Clock: func() time.Time { return now }}
 	if err := notifier.notify(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -35,6 +37,47 @@ func TestStatusNotifierDeliversTransitionOnceAcrossRestart(t *testing.T) {
 	}
 	if len(responses.responses) != 2 || responses.responses[0].ThreadTimestamp != "root" || responses.responses[1].ThreadTimestamp != "root" {
 		t.Fatalf("responses=%+v", responses.responses)
+	}
+}
+
+func TestReviewNoticesUsePersistedDeadlineAndSkipExpiredDelivery(t *testing.T) {
+	now := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
+	deadline := metav1.NewTime(now.Add(17 * time.Minute))
+	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "slack-owner", Namespace: "servitor", UID: "uid"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseAwaitingApproval, ReviewDeadline: &deadline}}
+	notices := statusNoticesAt(cluster, now)
+	if len(notices) < 2 {
+		t.Fatalf("review notices=%+v, want multipart review", notices)
+	}
+	want := "Reply with exact `yes` in this thread before 2026-09-08 00:17:00 UTC to approve or `no` to reject the configuration."
+	if text := joinNotices(notices); !strings.Contains(text, want) {
+		t.Fatalf("review notice missing persisted deadline %q: %s", want, text)
+	}
+	if notices := statusNoticesAt(cluster, deadline.Time); len(notices) != 0 {
+		t.Fatalf("expired review notices=%+v, want none", notices)
+	}
+
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := servitorv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	kube := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(cluster).Build()
+	responses := &memoryResponder{}
+	calls := 0
+	notifier := &StatusNotifier{Client: kube, Namespace: "servitor", Responder: responses, Receipts: state.NewEventStore(kube, "servitor"), Clock: func() time.Time {
+		calls++
+		if calls == 1 {
+			return now
+		}
+		return deadline.Time
+	}}
+	if err := notifier.notify(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(responses.responses) != 0 {
+		t.Fatalf("delayed review delivery sent an expired prompt: %+v", responses.responses)
 	}
 }
 
@@ -92,11 +135,13 @@ func TestStatusNotifierDeliversObservableCleanupCompletion(t *testing.T) {
 }
 
 func TestStatusNoticesIncludePersistedReviewAndReadySummaries(t *testing.T) {
+	reviewNow := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
 	expiry := metav1.NewTime(time.Date(2026, 9, 8, 4, 0, 0, 0, time.UTC))
-	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "slack-owner", Namespace: "servitor", UID: "uid"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseAwaitingApproval, ResolvedOptions: &servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Target: "target", Provider: "vpc-gen2", Version: "4.22", ResourceGroup: "Default", Zone: "us-south-1", Flavor: "bx2.4x16", WorkerCount: 2}, Platform: "openshift", ClusterName: "cluster", Region: "us-south"}, Review: &servitorv1alpha1.ReviewSummary{Resources: []servitorv1alpha1.SummaryResource{{Role: "Cluster<@U1>", Actions: []string{"create", "update```"}}}}}}
-	review := statusNotices(cluster)
+	deadline := metav1.NewTime(reviewNow.Add(time.Hour))
+	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "slack-owner", Namespace: "servitor", UID: "uid"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseAwaitingApproval, ResolvedOptions: &servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Target: "target", Provider: "vpc-gen2", Version: "4.22", ResourceGroup: "Default", Zone: "us-south-1", Flavor: "bx2.4x16", WorkerCount: 2}, Platform: "openshift", ClusterName: "cluster", Region: "us-south"}, Review: &servitorv1alpha1.ReviewSummary{Resources: []servitorv1alpha1.SummaryResource{{Role: "Cluster<@U1>", Actions: []string{"create", "update```"}}}}, ReviewDeadline: &deadline}}
+	review := statusNoticesAt(cluster, reviewNow)
 	reviewText := joinNotices(review)
-	for _, wanted := range []string{"Cluster request", "Name:", "Target:", "Platform:", "Provider:", "Location:", "Resource group:", "Worker:", "Network:", "Plan ready for review.", "Resource", "Action", "Cluster U1", "create/update"} {
+	for _, wanted := range []string{"Cluster request", "Name:", "Target:", "Platform:", "Provider:", "Location:", "Resource group:", "Worker:", "Network:", "Plan ready for review.", "Resource", "Action", "Cluster U1", "create/update", "Reply with exact `yes` in this thread before " + deadline.Time.UTC().Format("2006-01-02 15:04:05 UTC") + " to approve or `no` to reject the configuration."} {
 		if !strings.Contains(reviewText, wanted) {
 			t.Fatalf("review notice missing %q: %s", wanted, reviewText)
 		}

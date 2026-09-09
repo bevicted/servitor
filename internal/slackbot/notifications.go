@@ -11,6 +11,7 @@ import (
 	servitorv1alpha1 "github.com/bevicted/servitor/api/v1alpha1"
 	"github.com/bevicted/servitor/internal/lifecycle"
 	"github.com/bevicted/servitor/internal/state"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -23,6 +24,7 @@ type StatusNotifier struct {
 	Responder Responder
 	Receipts  *state.EventStore
 	Interval  time.Duration
+	Clock     func() time.Time
 }
 
 func (n *StatusNotifier) NeedLeaderElection() bool { return true }
@@ -54,12 +56,15 @@ func (n *StatusNotifier) notify(ctx context.Context) error {
 	}
 	for i := range clusters.Items {
 		cluster := &clusters.Items[i]
-		for _, notice := range statusNotices(cluster) {
+		for _, notice := range statusNoticesAt(cluster, n.now()) {
 			seen, err := n.Receipts.Seen(ctx, notice.id)
 			if err != nil {
 				return err
 			}
 			if seen {
+				continue
+			}
+			if notice.reviewDeadline != nil && !n.now().Before(notice.reviewDeadline.Time) {
 				continue
 			}
 			if err := n.Responder.Reply(ctx, Response{Channel: cluster.Spec.Slack.ChannelID, ThreadTimestamp: cluster.Spec.Slack.ThreadTimestamp, Text: notice.text}); err != nil {
@@ -73,9 +78,24 @@ func (n *StatusNotifier) notify(ctx context.Context) error {
 	return nil
 }
 
-type statusNotice struct{ id, text string }
+type statusNotice struct {
+	id             string
+	text           string
+	reviewDeadline *metav1.Time
+}
+
+func (n *StatusNotifier) now() time.Time {
+	if n.Clock != nil {
+		return n.Clock().UTC()
+	}
+	return time.Now().UTC()
+}
 
 func statusNotices(cluster *servitorv1alpha1.ServitorCluster) []statusNotice {
+	return statusNoticesAt(cluster, time.Now().UTC())
+}
+
+func statusNoticesAt(cluster *servitorv1alpha1.ServitorCluster, now time.Time) []statusNotice {
 	if cluster.Spec.Slack.ChannelID == "" || cluster.Spec.Slack.ThreadTimestamp == "" {
 		return nil
 	}
@@ -87,7 +107,9 @@ func statusNotices(cluster *servitorv1alpha1.ServitorCluster) []statusNotice {
 	var texts []string
 	switch phase {
 	case servitorv1alpha1.PhaseAwaitingApproval:
-		texts = reviewNoticeTexts(cluster.Status.ResolvedOptions, cluster.Status.Review)
+		if cluster.Status.ReviewDeadline != nil && now.Before(cluster.Status.ReviewDeadline.Time) {
+			texts = reviewNoticeTexts(cluster.Status.ResolvedOptions, cluster.Status.Review, cluster.Status.ReviewDeadline.Time)
+		}
 	case servitorv1alpha1.PhaseReady:
 		expiry := time.Time{}
 		if cluster.Status.LeaseExpiresAt != nil {
@@ -114,6 +136,11 @@ func statusNotices(cluster *servitorv1alpha1.ServitorCluster) []statusNotice {
 		}
 	}
 	notices := phaseNotices(uid, phase, texts)
+	if phase == servitorv1alpha1.PhaseAwaitingApproval && cluster.Status.ReviewDeadline != nil {
+		for index := range notices {
+			notices[index].reviewDeadline = cluster.Status.ReviewDeadline
+		}
+	}
 	if cleanup := cluster.Status.Cleanup; cleanup != nil && cleanup.RetryCount > 0 {
 		notices = append(notices, statusNotice{id: fmt.Sprintf("cleanup-retry:%s:%d", uid, cleanup.RetryCount), text: fmt.Sprintf("Cleanup retry %d is scheduled.", cleanup.RetryCount)})
 	}
@@ -145,7 +172,7 @@ func phaseNotices(uid, phase string, texts []string) []statusNotice {
 	return notices
 }
 
-func reviewNoticeTexts(options *servitorv1alpha1.ResolvedOptions, review *servitorv1alpha1.ReviewSummary) []string {
+func reviewNoticeTexts(options *servitorv1alpha1.ResolvedOptions, review *servitorv1alpha1.ReviewSummary, deadline time.Time) []string {
 	rows := make([][]string, 0)
 	if review != nil {
 		rows = make([][]string, 0, len(review.Resources))
@@ -155,7 +182,8 @@ func reviewNoticeTexts(options *servitorv1alpha1.ResolvedOptions, review *servit
 	}
 	create, change, destroy := actionTotals(rows)
 	texts := statusTableChunks("Cluster request", nil, reviewConfigRows(options), "")
-	return append(texts, statusTableChunks(fmt.Sprintf("Plan ready for review.\nPlan: %d create, %d change, %d destroy\nPlanned resources:", create, change, destroy), []string{"Resource", "Action"}, rows, "\nReply with exact `yes` in this thread to approve or `no` to reject the configuration.")...)
+	deadlineText := deadline.UTC().Format("2006-01-02 15:04:05.999999999 UTC")
+	return append(texts, statusTableChunks(fmt.Sprintf("Plan ready for review.\nPlan: %d create, %d change, %d destroy\nPlanned resources:", create, change, destroy), []string{"Resource", "Action"}, rows, "\nReply with exact `yes` in this thread before "+deadlineText+" to approve or `no` to reject the configuration.")...)
 }
 
 func reviewConfigRows(options *servitorv1alpha1.ResolvedOptions) [][]string {

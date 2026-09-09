@@ -224,30 +224,70 @@ func (b Bot) create(ctx context.Context, message Message, text string, respond f
 	return true
 }
 
+type reviewDecisionOutcome string
+
+const (
+	reviewDecisionRecorded reviewDecisionOutcome = "recorded"
+	reviewDecisionExpired  reviewDecisionOutcome = "expired"
+	reviewDecisionInvalid  reviewDecisionOutcome = "invalid"
+	reviewDecisionStale    reviewDecisionOutcome = "stale"
+)
+
 func (b Bot) confirm(ctx context.Context, message Message, thread string) {
 	cluster, err := b.ownerCluster(ctx, message.User)
-	if err != nil || !ownsThread(cluster, message, thread, true) || cluster.Status.Phase != servitorv1alpha1.PhaseAwaitingApproval {
+	if err != nil || !ownsThread(cluster, message, thread, true) {
 		return
 	}
 	approval := "approved"
 	if message.Text == "no" {
 		approval = "rejected"
 	}
-	if err := b.updateIntent(ctx, cluster.Name, func(current *servitorv1alpha1.ServitorCluster) error {
-		if !ownsThread(current, message, thread, true) || current.Status.Phase != servitorv1alpha1.PhaseAwaitingApproval {
-			return nil
-		}
-		current.Spec.Lifecycle.Approval = approval
-		return nil
-	}); err != nil {
+	outcome, err := b.recordReviewDecision(ctx, cluster.Name, message, thread, approval)
+	if err != nil {
 		b.logf("record review decision: %v", err)
 		return
 	}
-	response := "Plan approved.\nCreating... This may take 30m-90m."
-	if approval == "rejected" {
-		response = "Plan rejected.\nCleaning up..."
+	switch outcome {
+	case reviewDecisionRecorded:
+		if approval == "rejected" {
+			b.respond(ctx, message.Channel, thread, "Plan rejected.\nCleaning up...")
+			return
+		}
+		// Only the controller can authorize and dispatch an apply. Recording an
+		// approval is not evidence that creation has started.
+		b.respond(ctx, message.Channel, thread, "Plan approved.")
+	case reviewDecisionExpired:
+		b.respond(ctx, message.Channel, thread, "The review deadline has passed. No decision was recorded; cleanup will begin.")
+	case reviewDecisionInvalid:
+		b.respond(ctx, message.Channel, thread, "This plan is no longer awaiting review. No decision was recorded.")
+	case reviewDecisionStale:
+		b.respond(ctx, message.Channel, thread, "A review decision has already been recorded. No decision was recorded.")
 	}
-	b.respond(ctx, message.Channel, thread, response)
+}
+
+func (b Bot) recordReviewDecision(ctx context.Context, name string, message Message, thread, approval string) (reviewDecisionOutcome, error) {
+	outcome := reviewDecisionInvalid
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		current := &servitorv1alpha1.ServitorCluster{}
+		if err := b.Client.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: name}, current); err != nil {
+			return err
+		}
+		switch {
+		case !ownsThread(current, message, thread, true), current.Status.Phase != servitorv1alpha1.PhaseAwaitingApproval, current.Status.ReviewDeadline == nil:
+			outcome = reviewDecisionInvalid
+			return nil
+		case !b.now().Before(current.Status.ReviewDeadline.Time):
+			outcome = reviewDecisionExpired
+			return nil
+		case current.Spec.Lifecycle.Approval != "":
+			outcome = reviewDecisionStale
+			return nil
+		}
+		current.Spec.Lifecycle.Approval = approval
+		outcome = reviewDecisionRecorded
+		return b.Client.Update(ctx, current)
+	})
+	return outcome, err
 }
 
 func (b Bot) cleanup(ctx context.Context, message Message, thread string, acknowledge bool) {
@@ -572,7 +612,7 @@ func helpOverview() []string {
 	return []string{"Servitor provisions one temporary IBM Cloud cluster per Slack user.\n\nCommands\n```\nDM\n  help [command]          print help\n  list                    list clusters\n\nConfigured channel\n  @servitor help [command]  print help\n  @servitor create [safe options]  provision a new cluster\n  @servitor done            release your resources\n  @servitor extend [N[h]]   extend your lease\n  @servitor list            list clusters\n\nLifecycle thread\n  yes                       approve the cluster plan\n  no                        reject the cluster plan\n  done                      release your resources\n  extend [N[h]]             extend your lease\n```"}
 }
 func createHelp(defaults command.CreateDefaults) []string {
-	return []string{"`create` starts planning from the configured channel root. Configured defaults: version " + safeHelpCell(defaults.Version) + ", target " + safeHelpCell(defaults.Target) + ", provider " + safeHelpCell(defaults.Provider) + ". `--provider` chooses infrastructure; version chooses Kubernetes or OpenShift. Cluster names are generated internally.\n\nUse `key=value`, `--key=value`, or `--key value`; forms can be mixed. A current common-option inventory also recognizes unique bare values, for example `create target=synthetic-target vpc-gen2 us-south-1 bx2.4x16 resource-group=\"Platform Team\"`. Unknown or colliding shorthand must use a key such as `flavor=value`; worker counts and uncommon Satellite values stay keyed. Use `roks` (also `openshift` or `default_openshift`) for the cloud default OpenShift stream, or `iks` (also `kubernetes`, `k8s`, or `default_kubernetes`) for Kubernetes. A compatible numeric stream can refine an alias: `create roks 4.17`. These reserved aliases require a key when used as resource names.\n\nReview the resolved stream and configuration in its thread, then reply with exact `yes` or `no` within five minutes.", "Safe create options\n```\nCommon\n  --target --provider --version --resource-group --worker-count\n\nVPC Gen 2\n  --zone --flavor --vpc-id --subnet-id --public-gateway-id\n\nClassic\n  --datacenter --machine-type --public-vlan-id --private-vlan-id\n\nSatellite\n  --satellite-zone --satellite-managed-from --satellite-location-id\n  --satellite-host-image --satellite-host-profile --satellite-ssh-key-id\n  --satellite-worker-instance-id --satellite-worker-operating-system\n```"}
+	return []string{"`create` starts planning from the configured channel root. Configured defaults: version " + safeHelpCell(defaults.Version) + ", target " + safeHelpCell(defaults.Target) + ", provider " + safeHelpCell(defaults.Provider) + ". `--provider` chooses infrastructure; version chooses Kubernetes or OpenShift. Cluster names are generated internally.\n\nUse `key=value`, `--key=value`, or `--key value`; forms can be mixed. A current common-option inventory also recognizes unique bare values, for example `create target=synthetic-target vpc-gen2 us-south-1 bx2.4x16 resource-group=\"Platform Team\"`. Unknown or colliding shorthand must use a key such as `flavor=value`; worker counts and uncommon Satellite values stay keyed. Use `roks` (also `openshift` or `default_openshift`) for the cloud default OpenShift stream, or `iks` (also `kubernetes`, `k8s`, or `default_kubernetes`) for Kubernetes. A compatible numeric stream can refine an alias: `create roks 4.17`. These reserved aliases require a key when used as resource names.\n\nReview the resolved stream and configuration in its thread. The review prompt shows the persisted approval deadline; reply with exact `yes` or `no` before that deadline.", "Safe create options\n```\nCommon\n  --target --provider --version --resource-group --worker-count\n\nVPC Gen 2\n  --zone --flavor --vpc-id --subnet-id --public-gateway-id\n\nClassic\n  --datacenter --machine-type --public-vlan-id --private-vlan-id\n\nSatellite\n  --satellite-zone --satellite-managed-from --satellite-location-id\n  --satellite-host-image --satellite-host-profile --satellite-ssh-key-id\n  --satellite-worker-instance-id --satellite-worker-operating-system\n```"}
 }
 func safeHelpCell(value string) string {
 	value = strings.Map(func(character rune) rune {

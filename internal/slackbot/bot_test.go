@@ -11,12 +11,16 @@ import (
 
 	servitorv1alpha1 "github.com/bevicted/servitor/api/v1alpha1"
 	"github.com/bevicted/servitor/internal/command"
+	"github.com/bevicted/servitor/internal/controller"
 	"github.com/bevicted/servitor/internal/inventory"
 	"github.com/bevicted/servitor/internal/state"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -303,18 +307,20 @@ func TestHandleCommandProgressAndPersistenceOrdering(t *testing.T) {
 	})
 }
 
-func TestReviewDecisionIsAcknowledgedImmediately(t *testing.T) {
+func TestReviewDecisionRecordsIntentWithoutClaimingCreation(t *testing.T) {
+	now := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
+	deadline := metav1.NewTime(now.Add(10 * time.Minute))
 	for _, test := range []struct{ command, approval, response string }{
-		{"yes", "approved", "Plan approved.\nCreating... This may take 30m-90m."},
+		{"yes", "approved", "Plan approved."},
 		{"no", "rejected", "Plan rejected.\nCleaning up..."},
 	} {
 		t.Run(test.command, func(t *testing.T) {
-			cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: ownerClusterName("U1"), Namespace: "servitor"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 14400}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseAwaitingApproval, LifecycleSnapshot: &servitorv1alpha1.LifecycleSnapshot{InitialLeaseSeconds: 14400}}}
+			cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: ownerClusterName("U1"), Namespace: "servitor"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 14400}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseAwaitingApproval, LifecycleSnapshot: &servitorv1alpha1.LifecycleSnapshot{InitialLeaseSeconds: 14400}, ReviewDeadline: &deadline}}
 			bot, responses := botForTest(t, cluster)
 			if err := bot.Handle(context.Background(), Envelope{ID: test.command, Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: test.command, Timestamp: "reply", ThreadTimestamp: "root"}}); err != nil {
 				t.Fatal(err)
 			}
-			if len(responses.responses) != 1 || responses.responses[0].Text != test.response {
+			if len(responses.responses) != 1 || responses.responses[0].Text != test.response || strings.Contains(responses.responses[0].Text, "Creating...") {
 				t.Fatalf("responses=%+v", responses.responses)
 			}
 			if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: cluster.Name}, cluster); err != nil {
@@ -327,9 +333,175 @@ func TestReviewDecisionIsAcknowledgedImmediately(t *testing.T) {
 	}
 }
 
+func TestReviewDecisionRejectsExpiredAndInvalidReviews(t *testing.T) {
+	now := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
+	for _, test := range []struct {
+		name     string
+		deadline time.Time
+		phase    string
+		response string
+	}{
+		{name: "at deadline", deadline: now, phase: servitorv1alpha1.PhaseAwaitingApproval, response: "The review deadline has passed. No decision was recorded; cleanup will begin."},
+		{name: "after review", deadline: now.Add(time.Hour), phase: servitorv1alpha1.PhaseCleanupPending, response: "This plan is no longer awaiting review. No decision was recorded."},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			deadline := metav1.NewTime(test.deadline)
+			cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: ownerClusterName("U1"), Namespace: "servitor"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 14400}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: test.phase, ReviewDeadline: &deadline}}
+			bot, responses := botForTest(t, cluster)
+			if err := bot.Handle(context.Background(), Envelope{ID: test.name, Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "yes", Timestamp: "reply", ThreadTimestamp: "root"}}); err != nil {
+				t.Fatal(err)
+			}
+			if len(responses.responses) != 1 || responses.responses[0].Text != test.response || strings.Contains(responses.responses[0].Text, "Creating...") {
+				t.Fatalf("responses=%+v", responses.responses)
+			}
+			if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: cluster.Name}, cluster); err != nil {
+				t.Fatal(err)
+			}
+			if cluster.Spec.Lifecycle.Approval != "" {
+				t.Fatalf("invalid review recorded approval=%q", cluster.Spec.Lifecycle.Approval)
+			}
+		})
+	}
+}
+
+func TestReviewDecisionRechecksStateAfterConflict(t *testing.T) {
+	now := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
+	deadline := metav1.NewTime(now.Add(time.Hour))
+	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: ownerClusterName("U1"), Namespace: "servitor"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 14400}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseAwaitingApproval, ReviewDeadline: &deadline}}
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := servitorv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	conflicted := false
+	kube := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(cluster).WithInterceptorFuncs(interceptor.Funcs{Update: func(ctx context.Context, underlying client.WithWatch, object client.Object, options ...client.UpdateOption) error {
+		if !conflicted {
+			conflicted = true
+			current := &servitorv1alpha1.ServitorCluster{}
+			if err := underlying.Get(ctx, types.NamespacedName{Namespace: "servitor", Name: cluster.Name}, current); err != nil {
+				return err
+			}
+			current.Status.Phase = servitorv1alpha1.PhaseCleanupPending
+			if err := underlying.Update(ctx, current); err != nil {
+				return err
+			}
+			return apierrors.NewConflict(schema.GroupResource{Group: "servitor.bevicted.github.io", Resource: "servitorclusters"}, current.Name, errors.New("review expired"))
+		}
+		return underlying.Update(ctx, object, options...)
+	}}).Build()
+	responses := &memoryResponder{}
+	bot := Bot{ChannelID: "C1", SelfUserID: "BOT", Namespace: "servitor", Client: kube, Events: state.NewEventStore(kube, "servitor"), Responder: responses, Clock: func() time.Time { return now }}
+	if err := bot.Handle(context.Background(), Envelope{ID: "conflict", Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "yes", Timestamp: "reply", ThreadTimestamp: "root"}}); err != nil {
+		t.Fatal(err)
+	}
+	if len(responses.responses) != 1 || responses.responses[0].Text != "This plan is no longer awaiting review. No decision was recorded." || strings.Contains(responses.responses[0].Text, "Creating...") {
+		t.Fatalf("responses=%+v", responses.responses)
+	}
+	if err := kube.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: cluster.Name}, cluster); err != nil {
+		t.Fatal(err)
+	}
+	if cluster.Status.Phase != servitorv1alpha1.PhaseCleanupPending || cluster.Spec.Lifecycle.Approval != "" {
+		t.Fatalf("conflict retry recorded invalid intent: %+v", cluster)
+	}
+}
+
+func TestUnauthorizedAndUnrelatedReviewThreadMessagesRemainSilent(t *testing.T) {
+	now := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
+	deadline := metav1.NewTime(now.Add(time.Hour))
+	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: ownerClusterName("U1"), Namespace: "servitor"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 14400}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseAwaitingApproval, ReviewDeadline: &deadline}}
+	bot, responses := botForTest(t, cluster)
+	for _, message := range []Message{
+		{Channel: "C1", ChannelType: "channel", User: "U2", Text: "yes", Timestamp: "reply", ThreadTimestamp: "root"},
+		{Channel: "C1", ChannelType: "channel", User: "U1", Text: "sounds good", Timestamp: "reply", ThreadTimestamp: "root"},
+	} {
+		if err := bot.Handle(context.Background(), Envelope{ID: message.User + message.Text, Message: message}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(responses.responses) != 0 {
+		t.Fatalf("unauthorized or unrelated review responses=%+v", responses.responses)
+	}
+	if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: cluster.Name}, cluster); err != nil {
+		t.Fatal(err)
+	}
+	if cluster.Spec.Lifecycle.Approval != "" {
+		t.Fatalf("unauthorized decision recorded approval=%q", cluster.Spec.Lifecycle.Approval)
+	}
+}
+
+func TestReviewDecisionControllerInterleavingsDoNotClaimExpiredApply(t *testing.T) {
+	now := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
+	for _, test := range []struct {
+		name         string
+		deadline     time.Time
+		wantPhase    string
+		wantResponse []string
+	}{
+		{name: "timely approval reaches controller apply", deadline: now.Add(time.Minute), wantPhase: servitorv1alpha1.PhaseApplying, wantResponse: []string{"Plan approved."}},
+		{name: "expired approval reaches cleanup", deadline: now, wantPhase: servitorv1alpha1.PhaseCleanupPending, wantResponse: []string{"The review deadline has passed. No decision was recorded; cleanup will begin.", "Cleaning up..."}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			deadline := metav1.NewTime(test.deadline)
+			cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: ownerClusterName("U1"), Namespace: "servitor", UID: "uid", Generation: 1, Finalizers: []string{servitorv1alpha1.CleanupFinalizer}}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 14400, RetrySeconds: []int64{60}}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseAwaitingApproval, ResolvedOptions: &servitorv1alpha1.ResolvedOptions{}, LifecycleSnapshot: &servitorv1alpha1.LifecycleSnapshot{InitialLeaseSeconds: 14400, RetrySeconds: []int64{60}}, ReviewDeadline: &deadline, ReviewGeneration: 1}}
+			scheme := runtime.NewScheme()
+			if err := corev1.AddToScheme(scheme); err != nil {
+				t.Fatal(err)
+			}
+			if err := servitorv1alpha1.AddToScheme(scheme); err != nil {
+				t.Fatal(err)
+			}
+			kube := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&servitorv1alpha1.ServitorCluster{}).WithRuntimeObjects(cluster).Build()
+			responses := &memoryResponder{}
+			bot := Bot{ChannelID: "C1", SelfUserID: "BOT", Namespace: "servitor", Client: kube, Events: state.NewEventStore(kube, "servitor"), Responder: responses, Clock: func() time.Time { return now }}
+			if err := bot.Handle(context.Background(), Envelope{ID: test.name, Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "yes", Timestamp: "reply", ThreadTimestamp: "root"}}); err != nil {
+				t.Fatal(err)
+			}
+			stored := &servitorv1alpha1.ServitorCluster{}
+			if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: cluster.Name}, stored); err != nil {
+				t.Fatal(err)
+			}
+			// The Kubernetes fake does not advance generation for spec updates.
+			// Model the API-server generation that the controller authorization uses.
+			if stored.Spec.Lifecycle.Approval != "" {
+				stored.Generation++
+				if err := bot.Client.Update(context.Background(), stored); err != nil {
+					t.Fatal(err)
+				}
+			}
+			reconciler := &controller.Reconciler{Client: bot.Client, Config: controller.Config{Namespace: "servitor"}, Now: func() time.Time { return now }}
+			if _, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "servitor", Name: cluster.Name}}); err != nil {
+				t.Fatal(err)
+			}
+			if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: cluster.Name}, stored); err != nil {
+				t.Fatal(err)
+			}
+			if stored.Status.Phase != test.wantPhase {
+				t.Fatalf("phase=%q, want %q", stored.Status.Phase, test.wantPhase)
+			}
+			notifier := &StatusNotifier{Client: bot.Client, Namespace: "servitor", Responder: responses, Receipts: state.NewEventStore(bot.Client, "servitor"), Clock: func() time.Time { return now }}
+			if err := notifier.notify(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			var transcript []string
+			for _, response := range responses.responses {
+				transcript = append(transcript, response.Text)
+				if strings.Contains(response.Text, "Creating...") {
+					t.Fatalf("transcript falsely claimed creation: %q", transcript)
+				}
+			}
+			if !reflect.DeepEqual(transcript, test.wantResponse) {
+				t.Fatalf("transcript=%q, want %q", transcript, test.wantResponse)
+			}
+		})
+	}
+}
+
 func TestThreadOwnerMutatesOnlySpecIntent(t *testing.T) {
 	expiry := metav1.NewTime(time.Date(2026, 9, 8, 4, 0, 0, 0, time.UTC))
-	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: ownerClusterName("U1"), Namespace: "servitor"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 14400}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseAwaitingApproval, LifecycleSnapshot: &servitorv1alpha1.LifecycleSnapshot{InitialLeaseSeconds: 14400}}}
+	deadline := metav1.NewTime(time.Date(2026, 9, 8, 1, 0, 0, 0, time.UTC))
+	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: ownerClusterName("U1"), Namespace: "servitor"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 14400}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseAwaitingApproval, LifecycleSnapshot: &servitorv1alpha1.LifecycleSnapshot{InitialLeaseSeconds: 14400}, ReviewDeadline: &deadline}}
 	bot, _ := botForTest(t, cluster)
 	if err := bot.Handle(context.Background(), Envelope{ID: "yes", Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "yes", Timestamp: "reply", ThreadTimestamp: "root"}}); err != nil {
 		t.Fatal(err)
