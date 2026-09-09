@@ -16,6 +16,9 @@ spec:
     - { name: cos-secret, type: string }
     - { name: ibm-secret, type: string }
   stepTemplate:
+    env:
+      - name: HOME
+        value: /tekton/home
     securityContext:
       allowPrivilegeEscalation: false
       capabilities: { drop: ["ALL"] }
