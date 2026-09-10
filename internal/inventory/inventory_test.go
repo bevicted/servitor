@@ -6,13 +6,15 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
 
 func TestDiscoverUsesConfiguredBasesAndCompleteScopedCatalog(t *testing.T) {
 	var requests []string
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests = append(requests, r.Method+" "+r.URL.RequestURI())
 		if r.URL.Path != "/iam/base/identity/token" && r.Header.Get("Authorization") != "Bearer synthetic-token" {
 			t.Fatalf("authorization for %s = %q", r.URL.Path, r.Header.Get("Authorization"))
@@ -61,7 +63,7 @@ func TestDiscoverUsesConfiguredBasesAndCompleteScopedCatalog(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	config := Config{Version: CatalogVersion, Targets: map[string]TargetConfig{"target-a": {Providers: []string{"vpc-gen2", "classic", "satellite"}, Regions: []string{"us-south"}, Endpoints: map[string]string{"IAM": server.URL + "/iam/base", "ResourceManagement": server.URL + "/rm/private", "ContainerService": server.URL + "/containers/global", "VPC": server.URL + "/vpc/regional"}}}}
+	config := Config{Version: CatalogVersion, Targets: map[string]TargetConfig{"target-a": {Providers: []string{"vpc-gen2", "classic", "satellite"}, DefaultRegion: "us-south", Endpoints: Endpoints{IAM: server.URL + "/iam/base", ResourceManagement: server.URL + "/rm/private", ContainerService: server.URL + "/containers/global", VPC: server.URL + "/vpc/regional"}}}}
 	catalog, err := Discover(context.Background(), config, "target-a", "synthetic-key", server.Client())
 	if err != nil {
 		t.Fatal(err)
@@ -81,7 +83,7 @@ func TestDiscoverUsesConfiguredBasesAndCompleteScopedCatalog(t *testing.T) {
 
 func TestSatelliteProfilesStopWhenFinalPageOmitsNext(t *testing.T) {
 	requests := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests++
 		if r.URL.Path != "/vpc/private/instance/profiles" || r.URL.Query().Get("version") != vpcAPIVersion || r.URL.Query().Get("generation") != "2" {
 			t.Fatalf("VPC profile request = %s", r.URL.RequestURI())
@@ -97,7 +99,7 @@ func TestSatelliteProfilesStopWhenFinalPageOmitsNext(t *testing.T) {
 	}))
 	defer server.Close()
 
-	profiles, err := (discovery{client: server.Client(), target: TargetConfig{Regions: []string{"region-a"}, Endpoints: map[string]string{"VPC": server.URL + "/vpc/private"}}}).satelliteProfiles(context.Background(), "synthetic-token")
+	profiles, err := (discovery{client: server.Client(), target: TargetConfig{DefaultRegion: "region-a", Endpoints: Endpoints{VPC: server.URL + "/vpc/private"}}}).satelliteProfiles(context.Background(), "synthetic-token")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,36 +108,21 @@ func TestSatelliteProfilesStopWhenFinalPageOmitsNext(t *testing.T) {
 	}
 }
 
-func TestSatelliteProfilesUseConfiguredRegionalBases(t *testing.T) {
-	var requests []string
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Query().Get("version") != vpcAPIVersion || r.URL.Query().Get("generation") != "2" {
+func TestSatelliteProfilesUseConfiguredDefaultRegionalBase(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("version") != vpcAPIVersion || r.URL.Query().Get("generation") != "2" || r.URL.Path != "/vpc/us-east/instance/profiles" {
 			t.Fatalf("VPC profile request = %s", r.URL.RequestURI())
 		}
-		requests = append(requests, r.URL.RequestURI())
-		switch r.URL.Path {
-		case "/vpc/us-south/instance/profiles":
-			_, _ = w.Write([]byte(`{"profiles":[{"name":"south-profile"}]}`))
-		case "/vpc/us-east/instance/profiles":
-			_, _ = w.Write([]byte(`{"profiles":[{"name":"east-profile"}]}`))
-		default:
-			t.Fatalf("unexpected regional VPC request: %s", r.URL.RequestURI())
-		}
+		_, _ = w.Write([]byte(`{"profiles":[{"name":"east-profile"}]}`))
 	}))
 	defer server.Close()
 
-	target := TargetConfig{Providers: []string{"satellite"}, Regions: []string{"us-south", "us-east"}, Endpoints: map[string]string{"IAM": server.URL + "/iam", "ResourceManagement": server.URL + "/rm", "ContainerService": server.URL + "/containers", "VPC": server.URL + "/vpc/{region}"}}
-	if err := target.validate(); err != nil {
-		t.Fatalf("regional VPC template was rejected: %v", err)
-	}
+	target := TargetConfig{DefaultRegion: "us-east", Endpoints: Endpoints{VPC: server.URL + "/vpc/{region}"}}
 	profiles, err := (discovery{client: server.Client(), target: target}).satelliteProfiles(context.Background(), "synthetic-token")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := requests, []string{"/vpc/us-south/instance/profiles?generation=2&version=2026-08-04", "/vpc/us-east/instance/profiles?generation=2&version=2026-08-04"}; strings.Join(got, "\n") != strings.Join(want, "\n") {
-		t.Fatalf("regional VPC trace = %v, want %v", got, want)
-	}
-	if got, want := profiles, []Profile{{Region: "us-east", Name: "east-profile"}, {Region: "us-south", Name: "south-profile"}}; len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+	if got, want := profiles, []Profile{{Region: "us-east", Name: "east-profile"}}; len(got) != len(want) || got[0] != want[0] {
 		t.Fatalf("regional profiles = %+v, want %+v", got, want)
 	}
 }
@@ -160,7 +147,7 @@ func TestAuthenticationRedirectsFailWithoutFollowingAPIKey(t *testing.T) {
 			}))
 			defer server.Close()
 
-			_, err := Discover(context.Background(), Config{Version: CatalogVersion, Targets: map[string]TargetConfig{"target-a": {Providers: []string{"vpc-gen2"}, Endpoints: map[string]string{"IAM": server.URL + "/iam/private", "ResourceManagement": server.URL + "/rm", "ContainerService": server.URL + "/containers"}}}}, "target-a", "synthetic-key", server.Client())
+			_, err := Discover(context.Background(), Config{Version: CatalogVersion, Targets: map[string]TargetConfig{"target-a": {Providers: []string{"vpc-gen2"}, Endpoints: Endpoints{IAM: server.URL + "/iam/private", ResourceManagement: server.URL + "/rm", ContainerService: server.URL + "/containers"}}}}, "target-a", "synthetic-key", server.Client())
 			if err == nil || err.Error() != "inventory authentication failed" {
 				t.Fatalf("authentication redirect error = %v", err)
 			}
@@ -207,7 +194,7 @@ func TestDiscoverFailsClosedForMalformedAndOversizedResponses(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	config := Config{Version: CatalogVersion, Targets: map[string]TargetConfig{"target-a": {Providers: []string{"vpc-gen2"}, Endpoints: map[string]string{"IAM": server.URL + "/iam", "ResourceManagement": server.URL + "/rm", "ContainerService": server.URL + "/containers"}}}}
+	config := Config{Version: CatalogVersion, Targets: map[string]TargetConfig{"target-a": {Providers: []string{"vpc-gen2"}, Endpoints: Endpoints{IAM: server.URL + "/iam", ResourceManagement: server.URL + "/rm", ContainerService: server.URL + "/containers"}}}}
 	_, err := Discover(context.Background(), config, "target-a", "synthetic-key", server.Client())
 	if err == nil || strings.Contains(err.Error(), "secret-token") || strings.Contains(err.Error(), server.URL) {
 		t.Fatalf("unsafe oversized response error: %v", err)
@@ -216,15 +203,62 @@ func TestDiscoverFailsClosedForMalformedAndOversizedResponses(t *testing.T) {
 
 func TestLoadConfigEnforcesPipelineTargetIdentity(t *testing.T) {
 	configFor := func(target string) []byte {
-		return []byte("version: 1\ntargets:\n  \"" + target + "\":\n    providers: [vpc-gen2]\n    endpoints: {IAM: https://iam.example.invalid, ResourceManagement: https://rm.example.invalid, ContainerService: https://containers.example.invalid}\n")
+		return []byte("version: 1\ntargets:\n  \"" + target + "\":\n    providers: [vpc-gen2]\n    default_region: us-south\n    endpoints:\n      iam: https://iam.example.invalid\n      container_service: https://containers.example.invalid\n      global_tagging: https://tagging.example.invalid\n      resource_management: https://rm.example.invalid\n      resource_controller: https://controller.example.invalid\n      vpc: \"https://vpc.{region}.example.invalid\"\n")
 	}
 	valid := strings.Repeat("a", 63)
 	if _, err := LoadConfig(configFor(valid)); err != nil {
 		t.Fatalf("rejected valid target identity: %v", err)
 	}
-	for _, target := range []string{"Target", "target_name", strings.Repeat("a", 64), "-target", "target-"} {
+	for _, target := range []string{"Target", "1target", "target_name", strings.Repeat("a", 64), "-target", "target-"} {
 		if _, err := LoadConfig(configFor(target)); err == nil {
 			t.Fatalf("accepted target identity %q that cannot label an inventory PipelineRun", target)
+		}
+	}
+}
+
+func TestLoadConfigAcceptsICTSchemaAndRevisionsEveryField(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("testdata", "ict-config.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	config, err := LoadConfig(data)
+	if err != nil {
+		t.Fatalf("ICT schema fixture was rejected: %v", err)
+	}
+	target := config.Targets["synthetic-target"]
+	if target.DefaultRegion != "us-south" || target.Endpoints.IAM != "https://iam.example.invalid/private" || target.Endpoints.ContainerService != "https://containers.example.invalid/global" || target.Endpoints.ResourceManagement != "https://resource-manager.example.invalid/v2" {
+		t.Fatalf("ICT lower-snake endpoints or default region were not retained: %+v", target)
+	}
+	baseline, err := Revision(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changedRegion := target
+	changedRegion.DefaultRegion = "eu-gb"
+	changedEndpoint := target
+	changedEndpoint.Endpoints.IAM = "https://replacement.example.invalid/private"
+	for name, candidate := range map[string]TargetConfig{"default region": changedRegion, "endpoint": changedEndpoint} {
+		revision, err := Revision(candidate)
+		if err != nil || revision == baseline {
+			t.Fatalf("%s revision = %q, %v; want a changed revision", name, revision, err)
+		}
+	}
+}
+
+func TestLoadConfigRejectsInvalidICTSchema(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("testdata", "ict-config.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, invalid := range [][]byte{
+		[]byte(strings.Replace(string(data), "    default_region: us-south\n", "", 1)),
+		[]byte(strings.Replace(string(data), "      global_tagging: https://tagging.example.invalid\n", "", 1)),
+		[]byte(strings.Replace(string(data), "      iam:", "      IAM:", 1)),
+		[]byte(string(data) + "unknown: true\n"),
+		[]byte(strings.Replace(string(data), "      vpc: https://vpc.{region}.example.invalid/private", "      vpc: https://vpc.example.invalid/private", 1)),
+	} {
+		if _, err := LoadConfig(invalid); err == nil {
+			t.Fatalf("accepted invalid ICT configuration: %s", invalid)
 		}
 	}
 }

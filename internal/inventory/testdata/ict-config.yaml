@@ -1,0 +1,14 @@
+version: 1
+targets:
+  synthetic-target:
+    providers: [vpc-gen2, classic, satellite]
+    default_region: us-south
+    endpoints:
+      iam: https://iam.example.invalid/private
+      container_service: https://containers.example.invalid/global
+      global_tagging: https://tagging.example.invalid
+      resource_management: https://resource-manager.example.invalid/v2
+      resource_controller: https://resource-controller.example.invalid
+      vpc: https://vpc.{region}.example.invalid/private
+      satellite: https://satellite.example.invalid
+      satellite_config: https://satellite-config.example.invalid

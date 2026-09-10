@@ -156,7 +156,7 @@ func TestMaintainerRefreshCompletesPartialRegistrationWithoutReplayDispatch(t *t
 	if err := corev1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
 	}
-	config := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "targets", Namespace: "servitor"}, Data: map[string]string{"config.yaml": "version: 1\ntargets:\n  target-a:\n    providers: [vpc-gen2]\n    endpoints:\n      IAM: https://iam.example.invalid\n      ResourceManagement: https://resource-manager.example.invalid\n      ContainerService: https://containers.example.invalid\n  target-b:\n    providers: [vpc-gen2]\n    endpoints:\n      IAM: https://iam.example.invalid\n      ResourceManagement: https://resource-manager.example.invalid\n      ContainerService: https://containers.example.invalid\n"}}
+	config := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "targets", Namespace: "servitor"}, Data: map[string]string{"config.yaml": "version: 1\ntargets:\n  target-a:\n    providers: [vpc-gen2]\n    default_region: us-south\n    endpoints:\n      iam: https://iam.example.invalid\n      container_service: https://containers.example.invalid\n      global_tagging: https://tagging.example.invalid\n      resource_management: https://resource-manager.example.invalid\n      resource_controller: https://resource-controller.example.invalid\n      vpc: https://vpc.{region}.example.invalid\n  target-b:\n    providers: [vpc-gen2]\n    default_region: us-south\n    endpoints:\n      iam: https://iam.example.invalid\n      container_service: https://containers.example.invalid\n      global_tagging: https://tagging.example.invalid\n      resource_management: https://resource-manager.example.invalid\n      resource_controller: https://resource-controller.example.invalid\n      vpc: https://vpc.{region}.example.invalid\n"}}
 	blockedName := state.NewInventoryStore(nil, "servitor").Name("target-b")
 	blocked := false
 	kube := fake.NewClientBuilder().WithScheme(scheme).WithObjects(config).WithInterceptorFuncs(interceptor.Funcs{Create: func(ctx context.Context, underlying client.WithWatch, object client.Object, options ...client.CreateOption) error {
@@ -217,7 +217,7 @@ func TestMaintainerRefreshCrashReplayRegistersMissingTargets(t *testing.T) {
 	if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: bot.Namespace, Name: bot.InventoryConfigMap}, config); err != nil {
 		t.Fatal(err)
 	}
-	config.Data[bot.InventoryConfigKey] += "  target-b:\n    providers: [vpc-gen2]\n    endpoints:\n      IAM: https://iam.example.invalid\n      ResourceManagement: https://resource-manager.example.invalid\n      ContainerService: https://containers.example.invalid\n"
+	config.Data[bot.InventoryConfigKey] += "  target-b:\n    providers: [vpc-gen2]\n    default_region: us-south\n    endpoints:\n      iam: https://iam.example.invalid\n      container_service: https://containers.example.invalid\n      global_tagging: https://tagging.example.invalid\n      resource_management: https://resource-manager.example.invalid\n      resource_controller: https://resource-controller.example.invalid\n      vpc: https://vpc.{region}.example.invalid\n"
 	if err := bot.Client.Update(context.Background(), config); err != nil {
 		t.Fatal(err)
 	}

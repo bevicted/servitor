@@ -218,7 +218,7 @@ func TestInventoryRefreshFailsExpiredActiveRun(t *testing.T) {
 func TestInventoryRefreshNoopSyncDoesNotRewriteWatchedState(t *testing.T) {
 	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
 	refresher, kube, _ := newInventoryHarness(t, &now, targetConfigYAML("vpc-gen2"))
-	target := inventory.TargetConfig{Providers: []string{"vpc-gen2"}, Endpoints: inventoryEndpoints()}
+	target := inventory.TargetConfig{Providers: []string{"vpc-gen2"}, DefaultRegion: "us-south", Endpoints: inventoryEndpoints()}
 	revision, err := inventory.Revision(target)
 	if err != nil {
 		t.Fatal(err)
@@ -295,7 +295,7 @@ func TestInventoryRefreshRetainsLastGoodAndInvalidatesChangedTarget(t *testing.T
 	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
 	refresher, kube, _ := newInventoryHarness(t, &now, targetConfigYAML("vpc-gen2"))
 	store := state.NewInventoryStore(kube, "servitor")
-	target := inventory.TargetConfig{Providers: []string{"vpc-gen2"}, Endpoints: inventoryEndpoints()}
+	target := inventory.TargetConfig{Providers: []string{"vpc-gen2"}, DefaultRegion: "us-south", Endpoints: inventoryEndpoints()}
 	revision, err := inventory.Revision(target)
 	if err != nil {
 		t.Fatal(err)
@@ -534,18 +534,21 @@ func reportCatalog(target, group string) inventory.Catalog {
 	return inventory.Catalog{Version: inventory.CatalogVersion, Target: target, Providers: []string{"vpc-gen2"}, Versions: []inventory.Version{{Name: "4.22_openshift", Platform: "openshift", Default: true, Supported: true}}, ResourceGroups: []string{group}, VPCLocations: []inventory.Location{{Name: "us-south-1", Flavors: []string{"bx2.4x16"}}}}
 }
 
-func inventoryEndpoints() map[string]string {
-	return map[string]string{"IAM": "https://iam.example.invalid", "ContainerService": "https://containers.example.invalid", "ResourceManagement": "https://resource-manager.example.invalid"}
+func inventoryEndpoints() inventory.Endpoints {
+	return inventory.Endpoints{
+		IAM: "https://iam.example.invalid", ContainerService: "https://containers.example.invalid", GlobalTagging: "https://tagging.example.invalid",
+		ResourceManagement: "https://resource-manager.example.invalid", ResourceController: "https://resource-controller.example.invalid", VPC: "https://vpc.{region}.example.invalid",
+	}
 }
 
 func targetConfigYAML(provider string) string {
-	return "version: 1\ntargets:\n  target-a:\n    providers: [" + provider + "]\n    endpoints:\n      IAM: https://iam.example.invalid\n      ContainerService: https://containers.example.invalid\n      ResourceManagement: https://resource-manager.example.invalid\n"
+	return "version: 1\ntargets:\n  target-a:\n    providers: [" + provider + "]\n    default_region: us-south\n    endpoints:\n      iam: https://iam.example.invalid\n      container_service: https://containers.example.invalid\n      global_tagging: https://tagging.example.invalid\n      resource_management: https://resource-manager.example.invalid\n      resource_controller: https://resource-controller.example.invalid\n      vpc: https://vpc.{region}.example.invalid\n"
 }
 
 func otherTargetConfigYAML() string {
-	return "version: 1\ntargets:\n  target-b:\n    providers: [vpc-gen2]\n    endpoints:\n      IAM: https://iam.example.invalid\n      ContainerService: https://containers.example.invalid\n      ResourceManagement: https://resource-manager.example.invalid\n"
+	return "version: 1\ntargets:\n  target-b:\n    providers: [vpc-gen2]\n    default_region: us-south\n    endpoints:\n      iam: https://iam.example.invalid\n      container_service: https://containers.example.invalid\n      global_tagging: https://tagging.example.invalid\n      resource_management: https://resource-manager.example.invalid\n      resource_controller: https://resource-controller.example.invalid\n      vpc: https://vpc.{region}.example.invalid\n"
 }
 
 func multiTargetConfigYAML() string {
-	return "version: 1\ntargets:\n  target-a:\n    providers: [vpc-gen2]\n    endpoints:\n      IAM: https://iam.example.invalid\n      ContainerService: https://containers.example.invalid\n      ResourceManagement: https://resource-manager.example.invalid\n  target-b:\n    providers: [vpc-gen2]\n    endpoints:\n      IAM: https://iam.example.invalid\n      ContainerService: https://containers.example.invalid\n      ResourceManagement: https://resource-manager.example.invalid\n"
+	return "version: 1\ntargets:\n  target-a:\n    providers: [vpc-gen2]\n    default_region: us-south\n    endpoints:\n      iam: https://iam.example.invalid\n      container_service: https://containers.example.invalid\n      global_tagging: https://tagging.example.invalid\n      resource_management: https://resource-manager.example.invalid\n      resource_controller: https://resource-controller.example.invalid\n      vpc: https://vpc.{region}.example.invalid\n  target-b:\n    providers: [vpc-gen2]\n    default_region: us-south\n    endpoints:\n      iam: https://iam.example.invalid\n      container_service: https://containers.example.invalid\n      global_tagging: https://tagging.example.invalid\n      resource_management: https://resource-manager.example.invalid\n      resource_controller: https://resource-controller.example.invalid\n      vpc: https://vpc.{region}.example.invalid\n"
 }

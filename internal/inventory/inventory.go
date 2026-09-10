@@ -32,11 +32,23 @@ type Config struct {
 	Targets map[string]TargetConfig `yaml:"targets"`
 }
 
-// TargetConfig identifies the configured providers and their private service bases.
+// TargetConfig is one target from the mounted ICT configuration.
 type TargetConfig struct {
-	Providers []string          `yaml:"providers"`
-	Regions   []string          `yaml:"regions,omitempty"`
-	Endpoints map[string]string `yaml:"endpoints"`
+	Providers     []string  `yaml:"providers"`
+	DefaultRegion string    `yaml:"default_region"`
+	Endpoints     Endpoints `yaml:"endpoints"`
+}
+
+// Endpoints is the ICT v1 endpoint schema. YAML names intentionally match ICT.
+type Endpoints struct {
+	IAM                string `yaml:"iam"`
+	ContainerService   string `yaml:"container_service"`
+	GlobalTagging      string `yaml:"global_tagging"`
+	ResourceManagement string `yaml:"resource_management"`
+	ResourceController string `yaml:"resource_controller"`
+	VPC                string `yaml:"vpc"`
+	Satellite          string `yaml:"satellite"`
+	SatelliteConfig    string `yaml:"satellite_config"`
 }
 
 // Catalog is the complete bounded common-option catalog for one target.
@@ -85,7 +97,7 @@ func LoadConfig(data []byte) (Config, error) {
 		return Config{}, errors.New("inventory configuration is incomplete")
 	}
 	for name, target := range config.Targets {
-		if !safeTargetIdentity(name) || target.validate() != nil {
+		if !safeICTTargetName(name) || target.validate() != nil {
 			return Config{}, errors.New("inventory configuration is incomplete")
 		}
 	}
@@ -103,7 +115,7 @@ func Revision(target TargetConfig) (string, error) {
 }
 
 func (t TargetConfig) validate() error {
-	if len(t.Providers) == 0 || len(t.Endpoints) == 0 || len(t.Providers) > 3 || len(t.Regions) > 32 {
+	if !safeICTRegion(t.DefaultRegion) || len(t.Providers) == 0 || len(t.Providers) > 3 {
 		return errors.New("incomplete target")
 	}
 	seen := map[string]bool{}
@@ -113,48 +125,76 @@ func (t TargetConfig) validate() error {
 		}
 		seen[provider] = true
 	}
-	for _, key := range []string{"IAM", "ContainerService", "ResourceManagement"} {
-		if err := validBase(t.Endpoints[key]); err != nil {
+	for _, endpoint := range []string{t.Endpoints.IAM, t.Endpoints.ContainerService, t.Endpoints.GlobalTagging, t.Endpoints.ResourceManagement, t.Endpoints.ResourceController, t.Endpoints.Satellite, t.Endpoints.SatelliteConfig} {
+		if endpoint != "" {
+			if err := validBase(endpoint); err != nil {
+				return err
+			}
+		}
+	}
+	if t.Endpoints.VPC != "" {
+		if err := validVPCTemplate(t.Endpoints.VPC); err != nil {
 			return err
 		}
 	}
-	if seen["satellite"] && len(t.Regions) == 0 {
-		return errors.New("satellite target is incomplete")
+	for _, endpoint := range []string{t.Endpoints.IAM, t.Endpoints.ContainerService, t.Endpoints.GlobalTagging, t.Endpoints.ResourceManagement, t.Endpoints.ResourceController} {
+		if endpoint == "" {
+			return errors.New("incomplete target")
+		}
 	}
-	regions := map[string]bool{}
-	for _, region := range t.Regions {
-		if !safeName(region) || regions[region] {
-			return errors.New("invalid region")
-		}
-		regions[region] = true
-		if seen["satellite"] {
-			if _, err := t.regionalVPCBase(region); err != nil {
-				return errors.New("satellite target is incomplete")
-			}
-		}
+	if (seen["vpc-gen2"] || seen["satellite"]) && t.Endpoints.VPC == "" {
+		return errors.New("incomplete target")
+	}
+	if seen["satellite"] && (t.Endpoints.Satellite == "" || t.Endpoints.SatelliteConfig == "") {
+		return errors.New("incomplete target")
 	}
 	return nil
 }
 
-func (t TargetConfig) regionalVPCBase(region string) (string, error) {
-	base := t.Endpoints["VPC"]
-	if strings.Contains(base, "{region}") {
-		base = strings.ReplaceAll(base, "{region}", region)
-	} else if len(t.Regions) != 1 {
-		return "", errors.New("regional VPC endpoint is incomplete")
-	}
+func (t TargetConfig) regionalVPCBase() (string, error) {
+	base := strings.ReplaceAll(t.Endpoints.VPC, "{region}", t.DefaultRegion)
 	if err := validBase(base); err != nil {
 		return "", err
 	}
 	return base, nil
 }
 
+func validVPCTemplate(value string) error {
+	base := strings.Replace(value, "{region}", "us-south", 1)
+	if strings.Count(value, "{region}") != 1 || strings.ContainsAny(base, "{}") {
+		return errors.New("invalid endpoint")
+	}
+	return validBase(base)
+}
+
 func validBase(value string) error {
-	base, err := url.Parse(value)
-	if err != nil || base.Scheme == "" || base.Host == "" || base.User != nil || base.RawQuery != "" || base.Fragment != "" || strings.TrimSpace(value) != value || strings.ContainsAny(value, "{}") {
+	base, err := url.ParseRequestURI(value)
+	if err != nil || base.Scheme != "https" || base.Host == "" || base.User != nil || base.RawQuery != "" || base.Fragment != "" {
 		return errors.New("invalid endpoint")
 	}
 	return nil
+}
+
+func safeICTTargetName(value string) bool {
+	return safeTargetIdentity(value) && value[0] >= 'a' && value[0] <= 'z'
+}
+
+func safeICTRegion(value string) bool {
+	parts := strings.Split(value, "-")
+	if len(parts) < 2 {
+		return false
+	}
+	for _, part := range parts {
+		if part == "" {
+			return false
+		}
+		for _, char := range part {
+			if char < 'a' || char > 'z' {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // Discover reads all catalog pages through configured private service bases.
@@ -401,41 +441,40 @@ func (d discovery) classicLocations(ctx context.Context, token string) ([]Locati
 
 func (d discovery) satelliteProfiles(ctx context.Context, token string) ([]Profile, error) {
 	profiles := []Profile{}
-	for _, region := range d.target.Regions {
-		base, err := d.target.regionalVPCBase(region)
-		if err != nil {
+	region := d.target.DefaultRegion
+	base, err := d.target.regionalVPCBase()
+	if err != nil {
+		return nil, errors.New("Satellite host profile discovery failed")
+	}
+	values := url.Values{"version": {vpcAPIVersion}, "generation": {"2"}}
+	for {
+		var response struct {
+			Profiles []struct {
+				Name string `json:"name"`
+			} `json:"profiles"`
+			Next struct {
+				Href string `json:"href"`
+			} `json:"next"`
+		}
+		if err := d.requestBase(ctx, base, http.MethodGet, "instance/profiles?"+values.Encode(), nil, token, &response); err != nil {
 			return nil, errors.New("Satellite host profile discovery failed")
 		}
-		values := url.Values{"version": {vpcAPIVersion}, "generation": {"2"}}
-		for {
-			var response struct {
-				Profiles []struct {
-					Name string `json:"name"`
-				} `json:"profiles"`
-				Next struct {
-					Href string `json:"href"`
-				} `json:"next"`
-			}
-			if err := d.requestBase(ctx, base, http.MethodGet, "instance/profiles?"+values.Encode(), nil, token, &response); err != nil {
+		for _, profile := range response.Profiles {
+			if !safeValue(profile.Name) {
 				return nil, errors.New("Satellite host profile discovery failed")
 			}
-			for _, profile := range response.Profiles {
-				if !safeValue(profile.Name) {
-					return nil, errors.New("Satellite host profile discovery failed")
-				}
-				profiles = append(profiles, Profile{Region: region, Name: profile.Name})
-			}
-			if response.Next.Href == "" {
-				break
-			}
-			next, err := url.Parse(response.Next.Href)
-			if err != nil || next.RawQuery == "" {
-				return nil, errors.New("Satellite host profile pagination failed")
-			}
-			values, err = url.ParseQuery(next.RawQuery)
-			if err != nil || values.Get("version") != vpcAPIVersion || values.Get("generation") != "2" {
-				return nil, errors.New("Satellite host profile pagination failed")
-			}
+			profiles = append(profiles, Profile{Region: region, Name: profile.Name})
+		}
+		if response.Next.Href == "" {
+			break
+		}
+		next, err := url.Parse(response.Next.Href)
+		if err != nil || next.RawQuery == "" {
+			return nil, errors.New("Satellite host profile pagination failed")
+		}
+		values, err = url.ParseQuery(next.RawQuery)
+		if err != nil || values.Get("version") != vpcAPIVersion || values.Get("generation") != "2" {
+			return nil, errors.New("Satellite host profile pagination failed")
 		}
 	}
 	sort.Slice(profiles, func(i, j int) bool {
@@ -448,7 +487,20 @@ func (d discovery) satelliteProfiles(ctx context.Context, token string) ([]Profi
 }
 
 func (d discovery) request(ctx context.Context, service, method, relative string, form url.Values, token string, output any) error {
-	return d.requestBase(ctx, d.target.Endpoints[service], method, relative, form, token, output)
+	return d.requestBase(ctx, d.target.Endpoints.base(service), method, relative, form, token, output)
+}
+
+func (e Endpoints) base(service string) string {
+	switch service {
+	case "IAM":
+		return e.IAM
+	case "ContainerService":
+		return e.ContainerService
+	case "ResourceManagement":
+		return e.ResourceManagement
+	default:
+		return ""
+	}
 }
 
 func (d discovery) requestBase(ctx context.Context, baseValue, method, relative string, form url.Values, token string, output any) error {

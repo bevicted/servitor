@@ -29,7 +29,7 @@ import (
 
 func planningValidationFixture(t *testing.T, directory string) (string, string) {
 	t.Helper()
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/iam/identity/token":
 			_, _ = w.Write([]byte(`{"access_token":"synthetic-token"}`))
@@ -48,15 +48,22 @@ func planningValidationFixture(t *testing.T, directory string) (string, string) 
 		}
 	}))
 	t.Cleanup(server.Close)
+	previousTransport := http.DefaultTransport
+	http.DefaultTransport = server.Client().Transport
+	t.Cleanup(func() { http.DefaultTransport = previousTransport })
 	configPath := filepath.Join(directory, "planning-config.yaml")
 	config := `version: 1
 targets:
   target:
     providers: [vpc-gen2]
+    default_region: us-south
     endpoints:
-      IAM: ` + server.URL + `/iam
-      ResourceManagement: ` + server.URL + `/rm
-      ContainerService: ` + server.URL + `/containers
+      iam: ` + server.URL + `/iam
+      container_service: ` + server.URL + `/containers
+      global_tagging: https://tagging.example.invalid
+      resource_management: ` + server.URL + `/rm
+      resource_controller: https://resource-controller.example.invalid
+      vpc: https://vpc.{region}.example.invalid
 `
 	if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
 		t.Fatal(err)
@@ -70,7 +77,7 @@ func (planningSlackResponder) Reply(context.Context, slackbot.Response) error { 
 
 func TestValidatePlanOptionsScopesSatelliteProfileToSelectedRegion(t *testing.T) {
 	var profileRequests []string
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/iam/identity/token":
 			_, _ = w.Write([]byte(`{"access_token":"synthetic-token"}`))
@@ -91,18 +98,25 @@ func TestValidatePlanOptionsScopesSatelliteProfileToSelectedRegion(t *testing.T)
 		}
 	}))
 	defer server.Close()
+	previousTransport := http.DefaultTransport
+	http.DefaultTransport = server.Client().Transport
+	t.Cleanup(func() { http.DefaultTransport = previousTransport })
 
 	configPath := filepath.Join(t.TempDir(), "satellite-config.yaml")
 	config := `version: 1
 targets:
   target:
     providers: [satellite]
-    regions: [us-south, us-east]
+    default_region: us-south
     endpoints:
-      IAM: ` + server.URL + `/iam
-      ResourceManagement: ` + server.URL + `/rm
-      ContainerService: ` + server.URL + `/containers
-      VPC: ` + server.URL + `/vpc/{region}
+      iam: ` + server.URL + `/iam
+      container_service: ` + server.URL + `/containers
+      global_tagging: https://tagging.example.invalid
+      resource_management: ` + server.URL + `/rm
+      resource_controller: https://resource-controller.example.invalid
+      vpc: ` + server.URL + `/vpc/{region}
+      satellite: https://satellite.example.invalid
+      satellite_config: https://satellite-config.example.invalid
 `
 	if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
 		t.Fatal(err)
@@ -112,7 +126,7 @@ targets:
 	if err != nil || rejection == nil || rejection.OptionKey != "satellite-host-profile" {
 		t.Fatalf("cross-region profile validation = %+v, err=%v", rejection, err)
 	}
-	if got, want := profileRequests, []string{"/vpc/us-south/instance/profiles", "/vpc/us-east/instance/profiles"}; !reflect.DeepEqual(got, want) {
+	if got, want := profileRequests, []string{"/vpc/us-south/instance/profiles"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("regional profile trace = %v, want %v", got, want)
 	}
 }
@@ -355,19 +369,26 @@ func TestRunPlanRejectsInvalidSelectionBeforeICTAndRedactsDiscoveryFailure(t *te
 		t.Fatalf("invalid preflight report = %+v, err=%v", report, err)
 	}
 
-	failure := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	failure := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "synthetic private service detail", http.StatusBadGateway)
 	}))
 	defer failure.Close()
+	previousFailureTransport := http.DefaultTransport
+	http.DefaultTransport = failure.Client().Transport
+	t.Cleanup(func() { http.DefaultTransport = previousFailureTransport })
 	failureConfig := filepath.Join(directory, "failure-config.yaml")
 	contents := `version: 1
 targets:
   target:
     providers: [vpc-gen2]
+    default_region: us-south
     endpoints:
-      IAM: ` + failure.URL + `/iam
-      ResourceManagement: ` + failure.URL + `/rm
-      ContainerService: ` + failure.URL + `/containers
+      iam: ` + failure.URL + `/iam
+      container_service: ` + failure.URL + `/containers
+      global_tagging: https://tagging.example.invalid
+      resource_management: ` + failure.URL + `/rm
+      resource_controller: https://resource-controller.example.invalid
+      vpc: https://vpc.{region}.example.invalid
 `
 	if err := os.WriteFile(failureConfig, []byte(contents), 0o600); err != nil {
 		t.Fatal(err)
@@ -509,7 +530,7 @@ func TestRunPlanPassesKubernetesPlatformToICT(t *testing.T) {
 }
 
 func TestRunInventoryWritesIsolatedValidatedReport(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/iam/identity/token":
 			_, _ = w.Write([]byte(`{"access_token":"synthetic-token"}`))
@@ -528,6 +549,9 @@ func TestRunInventoryWritesIsolatedValidatedReport(t *testing.T) {
 		}
 	}))
 	defer server.Close()
+	previousTransport := http.DefaultTransport
+	http.DefaultTransport = server.Client().Transport
+	t.Cleanup(func() { http.DefaultTransport = previousTransport })
 	directory := t.TempDir()
 	configPath := filepath.Join(directory, "config.yaml")
 	reportPath := filepath.Join(directory, "report.json")
@@ -535,10 +559,14 @@ func TestRunInventoryWritesIsolatedValidatedReport(t *testing.T) {
 targets:
   target-a:
     providers: [vpc-gen2]
+    default_region: us-south
     endpoints:
-      IAM: ` + server.URL + `/iam
-      ResourceManagement: ` + server.URL + `/rm
-      ContainerService: ` + server.URL + `/containers
+      iam: ` + server.URL + `/iam
+      container_service: ` + server.URL + `/containers
+      global_tagging: https://tagging.example.invalid
+      resource_management: ` + server.URL + `/rm
+      resource_controller: https://resource-controller.example.invalid
+      vpc: https://vpc.{region}.example.invalid
 `
 	if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
 		t.Fatal(err)

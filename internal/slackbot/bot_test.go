@@ -901,14 +901,14 @@ func TestCreateBareValuesRequireCurrentInventoryButKeysProceed(t *testing.T) {
 
 func botWithPublishedInventory(t *testing.T, expired bool) (Bot, *memoryResponder) {
 	t.Helper()
-	configData := "version: 1\ntargets:\n  target-a:\n    providers: [vpc-gen2]\n    endpoints:\n      IAM: https://iam.example.invalid\n      ResourceManagement: https://resource-manager.example.invalid\n      ContainerService: https://containers.example.invalid\n"
+	configData := "version: 1\ntargets:\n  target-a:\n    providers: [vpc-gen2]\n    default_region: us-south\n    endpoints:\n      iam: https://iam.example.invalid\n      container_service: https://containers.example.invalid\n      global_tagging: https://tagging.example.invalid\n      resource_management: https://resource-manager.example.invalid\n      resource_controller: https://resource-controller.example.invalid\n      vpc: https://vpc.{region}.example.invalid\n"
 	configMap := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "targets", Namespace: "servitor"}, Data: map[string]string{"config.yaml": configData}}
 	bot, responses := botForTest(t, configMap)
 	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
 	bot.Clock = func() time.Time { return now }
 	bot.Defaults = command.CreateDefaults{Target: "target-a", Provider: "vpc-gen2", Zone: "us-south-1"}
 	bot.InventoryConfigMap, bot.InventoryConfigKey, bot.InventoryMaximumAge = "targets", "config.yaml", time.Hour
-	target := inventory.TargetConfig{Providers: []string{"vpc-gen2"}, Endpoints: map[string]string{"IAM": "https://iam.example.invalid", "ResourceManagement": "https://resource-manager.example.invalid", "ContainerService": "https://containers.example.invalid"}}
+	target := inventory.TargetConfig{Providers: []string{"vpc-gen2"}, DefaultRegion: "us-south", Endpoints: inventory.Endpoints{IAM: "https://iam.example.invalid", ContainerService: "https://containers.example.invalid", GlobalTagging: "https://tagging.example.invalid", ResourceManagement: "https://resource-manager.example.invalid", ResourceController: "https://resource-controller.example.invalid", VPC: "https://vpc.{region}.example.invalid"}}
 	revision, err := inventory.Revision(target)
 	if err != nil {
 		t.Fatal(err)
