@@ -141,7 +141,18 @@ func TestInventoryRefreshRetriesTerminalRunUntilTaskStatusIsObserved(t *testing.
 		t.Fatalf("terminal run failed before TaskRun cache caught up: %+v, %v", current, err)
 	}
 
-	completeInventoryRun(t, kube, current.ActiveRunID, "late-task")
+	lateTask := &tektonv1.TaskRun{ObjectMeta: metav1.ObjectMeta{Name: "late-task", Namespace: "servitor"}, Status: tektonv1.TaskRunStatus{TaskRunStatusFields: tektonv1.TaskRunStatusFields{PodName: "inventory-pod", Steps: []tektonv1.StepState{{Name: "report", Container: "step-report"}}}}}
+	if err := kube.Create(context.Background(), lateTask); err != nil {
+		t.Fatal(err)
+	}
+	result, err = refresher.Sync(context.Background())
+	if err != nil || result.RequeueAfter != time.Second {
+		t.Fatalf("incomplete TaskRun retry = %v, %v", result, err)
+	}
+	lateTask.Status.Status.Conditions = duckv1.Conditions{{Type: apis.ConditionSucceeded, Status: corev1.ConditionTrue}}
+	if err := kube.Status().Update(context.Background(), lateTask); err != nil {
+		t.Fatal(err)
+	}
 	logs.err = apierrors.NewBadRequest("container log is not available yet")
 	result, err = refresher.Sync(context.Background())
 	if err != nil || result.RequeueAfter != time.Second {
@@ -568,7 +579,7 @@ func completeInventoryRun(t *testing.T, kube client.Client, runName, taskName st
 	if err := kube.Status().Update(context.Background(), run); err != nil {
 		t.Fatal(err)
 	}
-	task := &tektonv1.TaskRun{ObjectMeta: metav1.ObjectMeta{Name: taskName, Namespace: "servitor"}, Status: tektonv1.TaskRunStatus{TaskRunStatusFields: tektonv1.TaskRunStatusFields{PodName: "inventory-pod", Steps: []tektonv1.StepState{{Name: "report", Container: "step-report"}}}}}
+	task := &tektonv1.TaskRun{ObjectMeta: metav1.ObjectMeta{Name: taskName, Namespace: "servitor"}, Status: tektonv1.TaskRunStatus{Status: duckv1.Status{Conditions: duckv1.Conditions{{Type: apis.ConditionSucceeded, Status: corev1.ConditionTrue}}}, TaskRunStatusFields: tektonv1.TaskRunStatusFields{PodName: "inventory-pod", Steps: []tektonv1.StepState{{Name: "report", Container: "step-report"}}}}}
 	if err := kube.Create(context.Background(), task); err != nil {
 		t.Fatal(err)
 	}

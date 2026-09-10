@@ -240,21 +240,28 @@ func (r *InventoryReconciler) observeInventoryRun(ctx context.Context, store *st
 	}
 	taskName := pipeline.InventoryReportTaskRunName(run)
 	if taskName == "" {
-		return retryInventoryObservation(current, now), nil
+		return r.retryInventoryObservation(ctx, store, current, now)
 	}
 	task := &tektonv1.TaskRun{}
 	if err := r.Get(ctx, types.NamespacedName{Namespace: r.Config.Namespace, Name: taskName}, task); apierrors.IsNotFound(err) {
-		return retryInventoryObservation(current, now), nil
+		return r.retryInventoryObservation(ctx, store, current, now)
 	} else if err != nil {
 		return nil, err
 	}
+	taskDone, taskSucceeded := inventoryTaskRunSucceeded(task)
+	if !taskDone {
+		return r.retryInventoryObservation(ctx, store, current, now)
+	}
+	if !taskSucceeded {
+		return r.failInventoryRun(ctx, store, current.Target, current.ActiveRunID, current.Revision, now)
+	}
 	container := pipeline.InventoryReportContainer(task)
 	if task.Status.PodName == "" || container == "" {
-		return retryInventoryObservation(current, now), nil
+		return r.retryInventoryObservation(ctx, store, current, now)
 	}
 	report, err := pipeline.ReadInventoryReport(ctx, r.Logs, r.Config.Namespace, task.Status.PodName, container, current.Target, current.ActiveRunID, current.Revision)
 	if retryableInventoryLogError(err) {
-		return retryInventoryObservation(current, now), nil
+		return r.retryInventoryObservation(ctx, store, current, now)
 	}
 	if err != nil {
 		return r.failInventoryRun(ctx, store, current.Target, current.ActiveRunID, current.Revision, now)
@@ -286,16 +293,36 @@ func (r *InventoryReconciler) observeInventoryRun(ctx context.Context, store *st
 	return &wake, nil
 }
 
+func inventoryTaskRunSucceeded(task *tektonv1.TaskRun) (done, succeeded bool) {
+	for _, condition := range task.Status.Conditions {
+		if string(condition.Type) != "Succeeded" {
+			continue
+		}
+		switch condition.Status {
+		case corev1.ConditionTrue:
+			return true, true
+		case corev1.ConditionFalse:
+			return true, false
+		default:
+			return false, false
+		}
+	}
+	return false, false
+}
+
 func retryableInventoryLogError(err error) bool {
 	return pipeline.IsLogReadError(err) && (apierrors.IsNotFound(err) || apierrors.IsBadRequest(err) || apierrors.IsTimeout(err) || apierrors.IsServerTimeout(err) || apierrors.IsServiceUnavailable(err) || apierrors.IsTooManyRequests(err))
 }
 
-func retryInventoryObservation(current state.InventoryState, now time.Time) *time.Time {
-	wake := now.Add(time.Second)
-	if current.RunDeadlineAt != nil && current.RunDeadlineAt.Time.Before(wake) {
-		return &current.RunDeadlineAt.Time
+func (r *InventoryReconciler) retryInventoryObservation(ctx context.Context, store *state.InventoryStore, current state.InventoryState, now time.Time) (*time.Time, error) {
+	if current.RunDeadlineAt == nil {
+		return r.failInventoryRun(ctx, store, current.Target, current.ActiveRunID, current.Revision, now)
 	}
-	return &wake
+	wake := now.Add(time.Second)
+	if current.RunDeadlineAt.Time.Before(wake) {
+		return &current.RunDeadlineAt.Time, nil
+	}
+	return &wake, nil
 }
 
 func (r *InventoryReconciler) failInventoryRun(ctx context.Context, store *state.InventoryStore, target, runID, revision string, now time.Time) (*time.Time, error) {
