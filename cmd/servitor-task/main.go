@@ -98,7 +98,7 @@ func main() {
 	flag.StringVar(&inventoryRevision, "inventory-revision", "", "target configuration revision")
 	flag.StringVar(&inventoryReport, "inventory-report", "", "task-local inventory report JSON")
 	flag.StringVar(&emitInventoryReport, "emit-inventory-report", "", "emit one validated task-local inventory report JSON document")
-	flag.StringVar(&apiKeyEnv, "ibm-api-key-env", "IBMCLOUD_API_KEY", "environment variable containing the IBM API key")
+	flag.StringVar(&apiKeyEnv, "ibm-api-key-env", "IC_API_KEY", "environment variable containing the IBM API key")
 	flag.StringVar(&ictPath, "ict", "ict", "ICT executable")
 	flag.StringVar(&terraformPath, "terraform", "terraform", "Terraform executable")
 	flag.Parse()
