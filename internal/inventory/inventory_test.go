@@ -81,6 +81,18 @@ func TestDiscoverUsesConfiguredBasesAndCompleteScopedCatalog(t *testing.T) {
 	}
 }
 
+func TestSupportedReleaseAcceptsIBMDateFormats(t *testing.T) {
+	for _, value := range []string{"2999-01-01", "2999-01-01T00:00:00Z", "2999-01-01T00:00:00+0000"} {
+		supported, err := supportedRelease(value)
+		if err != nil || !supported {
+			t.Fatalf("supportedRelease(%q) = %v, %v", value, supported, err)
+		}
+	}
+	if _, err := supportedRelease("not-a-date"); err == nil {
+		t.Fatal("malformed end-of-service date accepted")
+	}
+}
+
 func TestSatelliteProfilesStopWhenFinalPageOmitsNext(t *testing.T) {
 	requests := 0
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

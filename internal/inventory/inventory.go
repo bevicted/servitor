@@ -348,11 +348,14 @@ func supportedRelease(endOfService string) (bool, error) {
 	if endOfService == "" {
 		return true, nil
 	}
-	deadline, err := time.Parse("2006-01-02", endOfService)
-	if err != nil {
-		return false, err
+	var deadline time.Time
+	var err error
+	for _, layout := range []string{"2006-01-02", time.RFC3339, "2006-01-02T15:04:05-0700"} {
+		if deadline, err = time.Parse(layout, endOfService); err == nil {
+			return time.Now().Before(deadline.Add(24 * time.Hour)), nil
+		}
 	}
-	return time.Now().Before(deadline.Add(24 * time.Hour)), nil
+	return false, err
 }
 
 func (d discovery) vpcLocations(ctx context.Context, token string) ([]Location, error) {
