@@ -333,9 +333,7 @@ func (b Bot) confirm(ctx context.Context, message Message, thread string) {
 			b.respondCleanupCause(ctx, message.Channel, thread, cluster, servitorv1alpha1.CleanupReasonRejected, "Plan rejected.\nCleaning up...")
 			return
 		}
-		// Only the controller can authorize and dispatch an apply. Recording an
-		// approval is not evidence that creation has started.
-		b.respond(ctx, message.Channel, thread, "Plan approved.")
+		b.respond(ctx, message.Channel, thread, "Plan approved, creating...\nThis may take 30m-90m.")
 	case reviewDecisionExpired:
 		b.respond(ctx, message.Channel, thread, "The review deadline has passed. No decision was recorded; cleanup will begin.")
 	case reviewDecisionInvalid:

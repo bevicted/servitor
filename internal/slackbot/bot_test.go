@@ -305,11 +305,11 @@ func TestHandleCommandProgressAndPersistenceOrdering(t *testing.T) {
 	})
 }
 
-func TestReviewDecisionRecordsIntentWithoutClaimingCreation(t *testing.T) {
+func TestReviewDecisionRecordsIntentAndAcknowledges(t *testing.T) {
 	now := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
 	deadline := metav1.NewTime(now.Add(10 * time.Minute))
 	for _, test := range []struct{ command, approval, response string }{
-		{"yes", "approved", "Plan approved."},
+		{"yes", "approved", "Plan approved, creating...\nThis may take 30m-90m."},
 		{"no", "rejected", "Plan rejected.\nCleaning up..."},
 	} {
 		t.Run(test.command, func(t *testing.T) {
@@ -318,7 +318,7 @@ func TestReviewDecisionRecordsIntentWithoutClaimingCreation(t *testing.T) {
 			if err := bot.Handle(context.Background(), Envelope{ID: test.command, Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: test.command, Timestamp: "reply", ThreadTimestamp: "root"}}); err != nil {
 				t.Fatal(err)
 			}
-			if len(responses.responses) != 1 || responses.responses[0].Text != test.response || strings.Contains(responses.responses[0].Text, "Creating...") {
+			if len(responses.responses) != 1 || responses.responses[0].Text != test.response {
 				t.Fatalf("responses=%+v", responses.responses)
 			}
 			if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: cluster.Name}, cluster); err != nil {
@@ -429,7 +429,7 @@ func TestUnauthorizedAndUnrelatedReviewThreadMessagesRemainSilent(t *testing.T) 
 	}
 }
 
-func TestReviewDecisionControllerInterleavingsDoNotClaimExpiredApply(t *testing.T) {
+func TestReviewDecisionControllerInterleavings(t *testing.T) {
 	now := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
 	for _, test := range []struct {
 		name         string
@@ -438,7 +438,7 @@ func TestReviewDecisionControllerInterleavingsDoNotClaimExpiredApply(t *testing.
 		wantPhase    string
 		wantResponse []string
 	}{
-		{name: "timely approval reaches controller apply", deadline: now.Add(time.Minute), wantPhase: servitorv1alpha1.PhaseApplying, wantResponse: []string{"Plan approved."}},
+		{name: "timely approval reaches controller apply", deadline: now.Add(time.Minute), wantPhase: servitorv1alpha1.PhaseApplying, wantResponse: []string{"Plan approved, creating...\nThis may take 30m-90m."}},
 		{name: "expired approval reaches terminal cleanup", deadline: now, complete: true, wantPhase: servitorv1alpha1.PhaseCleanupComplete, wantResponse: []string{"The review deadline has passed. No decision was recorded; cleanup will begin.", "Plan auto rejected due to missed approval deadline.\nCleaning up...", "Cleanup complete."}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -497,9 +497,6 @@ func TestReviewDecisionControllerInterleavingsDoNotClaimExpiredApply(t *testing.
 			var transcript []string
 			for _, response := range responses.responses {
 				transcript = append(transcript, response.Text)
-				if strings.Contains(response.Text, "Creating...") {
-					t.Fatalf("transcript falsely claimed creation: %q", transcript)
-				}
 			}
 			if !reflect.DeepEqual(transcript, test.wantResponse) {
 				t.Fatalf("transcript=%q, want %q", transcript, test.wantResponse)

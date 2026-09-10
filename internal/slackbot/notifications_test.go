@@ -45,13 +45,13 @@ func TestStatusNotifierDeliversTransitionOnceAcrossRestart(t *testing.T) {
 
 func TestReviewNoticesUsePersistedDeadlineAndSkipExpiredDelivery(t *testing.T) {
 	now := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
-	deadline := metav1.NewTime(now.Add(17 * time.Minute))
+	deadline := metav1.NewTime(now.Add(17*time.Minute + 29*time.Second))
 	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "slack-owner", Namespace: "servitor", UID: "uid"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseAwaitingApproval, ReviewDeadline: &deadline}}
 	notices := statusNoticesAt(cluster, now)
 	if len(notices) < 2 {
 		t.Fatalf("review notices=%+v, want multipart review", notices)
 	}
-	want := "Reply with exact `yes` in this thread before 2026-09-08 00:17:00 UTC to approve or `no` to reject the configuration."
+	want := "Reply with exact `yes` in this thread before 2026-09-08 00:17:29 UTC (~17m) to approve or `no` to reject the configuration."
 	if text := joinNotices(notices); !strings.Contains(text, want) {
 		t.Fatalf("review notice missing persisted deadline %q: %s", want, text)
 	}
@@ -144,7 +144,7 @@ func TestStatusNoticesIncludePersistedReviewAndReadySummaries(t *testing.T) {
 	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "slack-owner", Namespace: "servitor", UID: "uid"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseAwaitingApproval, ResolvedOptions: &servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Target: "target", Provider: "vpc-gen2", Version: "4.22", ResourceGroup: "Default", Zone: "us-south-1", Flavor: "bx2.4x16", WorkerCount: 2}, Platform: "openshift", ClusterName: "cluster", Region: "us-south"}, Review: &servitorv1alpha1.ReviewSummary{Resources: []servitorv1alpha1.SummaryResource{{Role: "Cluster<@U1>", Actions: []string{"create", "update```"}}}}, ReviewDeadline: &deadline}}
 	review := statusNoticesAt(cluster, reviewNow)
 	reviewText := joinNotices(review)
-	for _, wanted := range []string{"Cluster request", "Name:", "Target:", "Platform:", "Provider:", "Location:", "Resource group:", "Worker:", "Network:", "Plan ready for review.", "Resource", "Action", "Cluster U1", "create/update", "Reply with exact `yes` in this thread before " + deadline.Time.UTC().Format("2006-01-02 15:04:05 UTC") + " to approve or `no` to reject the configuration."} {
+	for _, wanted := range []string{"Cluster request", "Name:", "Target:", "Platform:", "Provider:", "Location:", "Resource group:", "Worker:", "Network:", "Plan ready for review.", "Resource", "Action", "Cluster U1", "create/update", "Reply with exact `yes` in this thread before " + deadline.Time.UTC().Format("2006-01-02 15:04:05 UTC") + " (~60m) to approve or `no` to reject the configuration."} {
 		if !strings.Contains(reviewText, wanted) {
 			t.Fatalf("review notice missing %q: %s", wanted, reviewText)
 		}

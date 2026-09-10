@@ -123,7 +123,7 @@ func statusNoticesAt(cluster *servitorv1alpha1.ServitorCluster, now time.Time) [
 	switch phase {
 	case servitorv1alpha1.PhaseAwaitingApproval:
 		if cluster.Status.ReviewDeadline != nil && now.Before(cluster.Status.ReviewDeadline.Time) {
-			texts = reviewNoticeTexts(cluster.Status.ResolvedOptions, cluster.Status.Review, cluster.Status.ReviewDeadline.Time)
+			texts = reviewNoticeTexts(cluster.Status.ResolvedOptions, cluster.Status.Review, cluster.Status.ReviewDeadline.Time, now)
 		}
 	case servitorv1alpha1.PhaseReady:
 		expiry := time.Time{}
@@ -214,7 +214,7 @@ func phaseNotices(uid, phase string, texts []string) []statusNotice {
 	return notices
 }
 
-func reviewNoticeTexts(options *servitorv1alpha1.ResolvedOptions, review *servitorv1alpha1.ReviewSummary, deadline time.Time) []string {
+func reviewNoticeTexts(options *servitorv1alpha1.ResolvedOptions, review *servitorv1alpha1.ReviewSummary, deadline, now time.Time) []string {
 	rows := make([][]string, 0)
 	if review != nil {
 		rows = make([][]string, 0, len(review.Resources))
@@ -225,7 +225,8 @@ func reviewNoticeTexts(options *servitorv1alpha1.ResolvedOptions, review *servit
 	create, change, destroy := actionTotals(rows)
 	texts := statusTableChunks("Cluster request", nil, reviewConfigRows(options), "")
 	deadlineText := deadline.UTC().Format("2006-01-02 15:04:05.999999999 UTC")
-	return append(texts, statusTableChunks(fmt.Sprintf("Plan ready for review.\nPlan: %d create, %d change, %d destroy\nPlanned resources:", create, change, destroy), []string{"Resource", "Action"}, rows, "\nReply with exact `yes` in this thread before "+deadlineText+" to approve or `no` to reject the configuration.")...)
+	remainingMinutes := deadline.Sub(now).Round(time.Minute) / time.Minute
+	return append(texts, statusTableChunks(fmt.Sprintf("Plan ready for review.\nPlan: %d create, %d change, %d destroy\nPlanned resources:", create, change, destroy), []string{"Resource", "Action"}, rows, fmt.Sprintf("\nReply with exact `yes` in this thread before %s (~%dm) to approve or `no` to reject the configuration.", deadlineText, remainingMinutes))...)
 }
 
 func reviewConfigRows(options *servitorv1alpha1.ResolvedOptions) [][]string {
