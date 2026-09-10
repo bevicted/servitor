@@ -240,15 +240,17 @@ func (r *InventoryReconciler) observeInventoryRun(ctx context.Context, store *st
 	}
 	taskName := pipeline.InventoryReportTaskRunName(run)
 	if taskName == "" {
-		return r.failInventoryRun(ctx, store, current.Target, current.ActiveRunID, current.Revision, now)
+		return retryInventoryObservation(current, now), nil
 	}
 	task := &tektonv1.TaskRun{}
-	if err := r.Get(ctx, types.NamespacedName{Namespace: r.Config.Namespace, Name: taskName}, task); err != nil {
-		return r.failInventoryRun(ctx, store, current.Target, current.ActiveRunID, current.Revision, now)
+	if err := r.Get(ctx, types.NamespacedName{Namespace: r.Config.Namespace, Name: taskName}, task); apierrors.IsNotFound(err) {
+		return retryInventoryObservation(current, now), nil
+	} else if err != nil {
+		return nil, err
 	}
 	container := pipeline.InventoryReportContainer(task)
 	if task.Status.PodName == "" || container == "" {
-		return r.failInventoryRun(ctx, store, current.Target, current.ActiveRunID, current.Revision, now)
+		return retryInventoryObservation(current, now), nil
 	}
 	report, err := pipeline.ReadInventoryReport(ctx, r.Logs, r.Config.Namespace, task.Status.PodName, container, current.Target, current.ActiveRunID, current.Revision)
 	if err != nil {
@@ -279,6 +281,14 @@ func (r *InventoryReconciler) observeInventoryRun(ctx context.Context, store *st
 	}
 	wake := published.Add(r.refreshInterval())
 	return &wake, nil
+}
+
+func retryInventoryObservation(current state.InventoryState, now time.Time) *time.Time {
+	wake := now.Add(time.Second)
+	if current.RunDeadlineAt != nil && current.RunDeadlineAt.Time.Before(wake) {
+		return &current.RunDeadlineAt.Time
+	}
+	return &wake
 }
 
 func (r *InventoryReconciler) failInventoryRun(ctx context.Context, store *state.InventoryStore, target, runID, revision string, now time.Time) (*time.Time, error) {

@@ -105,6 +105,47 @@ func TestInventoryRefreshPublishesHourlyAndAdoptsPersistedRun(t *testing.T) {
 	}
 }
 
+func TestInventoryRefreshRetriesTerminalRunUntilTaskStatusIsObserved(t *testing.T) {
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	refresher, kube, logs := newInventoryHarness(t, &now, targetConfigYAML("vpc-gen2"))
+	if _, err := refresher.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	store := state.NewInventoryStore(kube, "servitor")
+	current, err := store.Get(context.Background(), "target-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := &tektonv1.PipelineRun{}
+	if err := kube.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: current.ActiveRunID}, run); err != nil {
+		t.Fatal(err)
+	}
+	run.Status.Status.Conditions = duckv1.Conditions{{Type: apis.ConditionSucceeded, Status: corev1.ConditionTrue}}
+	run.Status.ChildReferences = []tektonv1.ChildStatusReference{{TypeMeta: runtime.TypeMeta{Kind: "TaskRun"}, Name: "late-task", PipelineTaskName: "inventory"}}
+	if err := kube.Status().Update(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := refresher.Sync(context.Background())
+	if err != nil || result.RequeueAfter != time.Second {
+		t.Fatalf("terminal observation retry = %v, %v", result, err)
+	}
+	current, err = store.Get(context.Background(), "target-a")
+	if err != nil || current.ActiveRunID == "" || current.Disposition != state.InventoryRunning {
+		t.Fatalf("terminal run failed before TaskRun cache caught up: %+v, %v", current, err)
+	}
+
+	completeInventoryRun(t, kube, current.ActiveRunID, "late-task")
+	logs.data = inventoryReportBytes(t, "target-a", current.ActiveRunID, current.Revision, "Group One")
+	if _, err := refresher.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	current, err = store.Get(context.Background(), "target-a")
+	if err != nil || current.Disposition != state.InventorySucceeded || current.Catalog == nil {
+		t.Fatalf("retried terminal run was not published: %+v, %v", current, err)
+	}
+}
+
 func TestInventoryRefreshReplacesRunStillDeletingWithNewPersistedAttempt(t *testing.T) {
 	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
 	refresher, kube, logs := newInventoryHarness(t, &now, targetConfigYAML("vpc-gen2"))
