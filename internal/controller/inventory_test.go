@@ -28,7 +28,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
-type inventoryLogs struct{ data []byte }
+type inventoryLogs struct {
+	data []byte
+	err  error
+}
 
 type inventoryBotResponder struct{ responses []slackbot.Response }
 
@@ -38,6 +41,9 @@ func (r *inventoryBotResponder) Reply(_ context.Context, response slackbot.Respo
 }
 
 func (l *inventoryLogs) ReadContainerLog(context.Context, string, string, string) (io.ReadCloser, error) {
+	if l.err != nil {
+		return nil, l.err
+	}
 	return io.NopCloser(bytes.NewReader(l.data)), nil
 }
 
@@ -136,6 +142,12 @@ func TestInventoryRefreshRetriesTerminalRunUntilTaskStatusIsObserved(t *testing.
 	}
 
 	completeInventoryRun(t, kube, current.ActiveRunID, "late-task")
+	logs.err = apierrors.NewBadRequest("container log is not available yet")
+	result, err = refresher.Sync(context.Background())
+	if err != nil || result.RequeueAfter != time.Second {
+		t.Fatalf("report log retry = %v, %v", result, err)
+	}
+	logs.err = nil
 	logs.data = inventoryReportBytes(t, "target-a", current.ActiveRunID, current.Revision, "Group One")
 	if _, err := refresher.Sync(context.Background()); err != nil {
 		t.Fatal(err)

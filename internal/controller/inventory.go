@@ -253,6 +253,9 @@ func (r *InventoryReconciler) observeInventoryRun(ctx context.Context, store *st
 		return retryInventoryObservation(current, now), nil
 	}
 	report, err := pipeline.ReadInventoryReport(ctx, r.Logs, r.Config.Namespace, task.Status.PodName, container, current.Target, current.ActiveRunID, current.Revision)
+	if retryableInventoryLogError(err) {
+		return retryInventoryObservation(current, now), nil
+	}
 	if err != nil {
 		return r.failInventoryRun(ctx, store, current.Target, current.ActiveRunID, current.Revision, now)
 	}
@@ -281,6 +284,10 @@ func (r *InventoryReconciler) observeInventoryRun(ctx context.Context, store *st
 	}
 	wake := published.Add(r.refreshInterval())
 	return &wake, nil
+}
+
+func retryableInventoryLogError(err error) bool {
+	return pipeline.IsLogReadError(err) && (apierrors.IsNotFound(err) || apierrors.IsBadRequest(err) || apierrors.IsTimeout(err) || apierrors.IsServerTimeout(err) || apierrors.IsServiceUnavailable(err) || apierrors.IsTooManyRequests(err))
 }
 
 func retryInventoryObservation(current state.InventoryState, now time.Time) *time.Time {

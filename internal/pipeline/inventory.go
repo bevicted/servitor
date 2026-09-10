@@ -72,12 +72,12 @@ func ReadInventoryReport(ctx context.Context, reader LogReader, namespace, podNa
 	}
 	stream, err := reader.ReadContainerLog(ctx, namespace, podName, container)
 	if err != nil {
-		return InventoryReport{}, fmt.Errorf("%w: inventory report", errReadReportLog)
+		return InventoryReport{}, fmt.Errorf("%w: %w", errReadReportLog, err)
 	}
 	defer func() { _ = stream.Close() }()
 	data, err := io.ReadAll(io.LimitReader(stream, MaxInventoryReportBytes+1))
 	if err != nil {
-		return InventoryReport{}, fmt.Errorf("%w: inventory report", errReadReportLog)
+		return InventoryReport{}, fmt.Errorf("%w: %w", errReadReportLog, err)
 	}
 	return DecodeInventoryReport(data, target, runID, revision)
 }
