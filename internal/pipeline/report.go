@@ -102,6 +102,12 @@ type LogReader interface {
 	ReadContainerLog(context.Context, string, string, string) (io.ReadCloser, error)
 }
 
+// ReportLogReader supports isolated allocation reports and complete inventory reports.
+type ReportLogReader interface {
+	LogReader
+	InventoryLogReader
+}
+
 // ReadReport reads and validates a report log with a hard byte limit.
 func ReadReport(ctx context.Context, reader LogReader, namespace, podName, container, uid, operation string) (Report, error) {
 	if podName == "" || container == "" {

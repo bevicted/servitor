@@ -72,15 +72,15 @@ func main() {
 	if err != nil {
 		fail(err)
 	}
+	logs := controller.NewPodLogReader(kubernetes.NewForConfigOrDie(restConfig))
 	reconciler := &controller.Reconciler{
-		Client: manager.GetClient(), Scheme: manager.GetScheme(), Logs: controller.NewPodLogReader(kubernetes.NewForConfigOrDie(restConfig)),
-		Config: controllerSettings,
+		Client: manager.GetClient(), Scheme: manager.GetScheme(), Logs: logs, Config: controllerSettings,
 	}
 	if err := reconciler.SetupWithManager(manager); err != nil {
 		fail(fmt.Errorf("configure controller: %w", err))
 	}
 	inventorySettings := inventoryControllerConfig(operator)
-	inventoryReconciler := &controller.InventoryReconciler{Client: manager.GetClient(), Logs: reconciler.Logs, Config: inventorySettings}
+	inventoryReconciler := &controller.InventoryReconciler{Client: manager.GetClient(), Logs: logs, Config: inventorySettings}
 	if err := inventoryReconciler.SetupWithManager(manager); err != nil {
 		fail(fmt.Errorf("configure inventory refresh: %w", err))
 	}

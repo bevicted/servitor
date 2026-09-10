@@ -19,6 +19,10 @@ func (l testLogs) ReadContainerLog(context.Context, string, string, string) (io.
 	return io.NopCloser(bytes.NewReader(l.data)), l.err
 }
 
+func (l testLogs) ReadInventoryContainerLog(context.Context, string, string, string) (io.ReadCloser, error) {
+	return io.NopCloser(bytes.NewReader(l.data)), l.err
+}
+
 func validReport(t *testing.T) []byte {
 	t.Helper()
 	data, err := json.Marshal(Report{Version: 1, ClusterUID: "uid", OperationID: "plan-a", ResolvedOptions: servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Provider: "vpc-gen2", Version: "4.22"}, ClusterName: "cluster"}, Recovery: validRecovery()})

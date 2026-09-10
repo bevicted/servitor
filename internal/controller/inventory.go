@@ -45,7 +45,7 @@ type InventoryConfig struct {
 type InventoryReconciler struct {
 	client.Client
 	Config InventoryConfig
-	Logs   pipeline.LogReader
+	Logs   pipeline.InventoryLogReader
 	Now    func() time.Time
 }
 

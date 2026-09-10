@@ -65,12 +65,17 @@ func DecodeInventoryReport(data []byte, target, runID, revision string) (Invento
 	return report, nil
 }
 
+// InventoryLogReader reads the complete designated inventory report container log.
+type InventoryLogReader interface {
+	ReadInventoryContainerLog(context.Context, string, string, string) (io.ReadCloser, error)
+}
+
 // ReadInventoryReport reads only the designated report container with the inventory byte limit.
-func ReadInventoryReport(ctx context.Context, reader LogReader, namespace, podName, container, target, runID, revision string) (InventoryReport, error) {
+func ReadInventoryReport(ctx context.Context, reader InventoryLogReader, namespace, podName, container, target, runID, revision string) (InventoryReport, error) {
 	if podName == "" || container == "" {
 		return InventoryReport{}, errors.New("inventory report Pod or container is invalid")
 	}
-	stream, err := reader.ReadContainerLog(ctx, namespace, podName, container)
+	stream, err := reader.ReadInventoryContainerLog(ctx, namespace, podName, container)
 	if err != nil {
 		return InventoryReport{}, fmt.Errorf("%w: %w", errReadReportLog, err)
 	}

@@ -729,8 +729,14 @@ func (p podLogs) ReadContainerLog(ctx context.Context, namespace, pod, container
 	return p.client.CoreV1().Pods(namespace).GetLogs(pod, &corev1.PodLogOptions{Container: container, TailLines: &tailLines}).Stream(ctx)
 }
 
-// NewPodLogReader adapts the Kubernetes API to the bounded report reader.
-func NewPodLogReader(client kubernetes.Interface) pipeline.LogReader { return podLogs{client: client} }
+func (p podLogs) ReadInventoryContainerLog(ctx context.Context, namespace, pod, container string) (io.ReadCloser, error) {
+	return p.client.CoreV1().Pods(namespace).GetLogs(pod, &corev1.PodLogOptions{Container: container}).Stream(ctx)
+}
+
+// NewPodLogReader adapts the Kubernetes API to the bounded report readers.
+func NewPodLogReader(client kubernetes.Interface) pipeline.ReportLogReader {
+	return podLogs{client: client}
+}
 
 func (r *Reconciler) SetupWithManager(manager ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(manager).For(&servitorv1alpha1.ServitorCluster{}).Watches(&tektonv1.PipelineRun{}, handler.EnqueueRequestsFromMapFunc(r.mapPipelineRun)).Complete(r)

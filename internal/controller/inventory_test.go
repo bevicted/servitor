@@ -40,7 +40,7 @@ func (r *inventoryBotResponder) Reply(_ context.Context, response slackbot.Respo
 	return nil
 }
 
-func (l *inventoryLogs) ReadContainerLog(context.Context, string, string, string) (io.ReadCloser, error) {
+func (l *inventoryLogs) ReadInventoryContainerLog(context.Context, string, string, string) (io.ReadCloser, error) {
 	if l.err != nil {
 		return nil, l.err
 	}
