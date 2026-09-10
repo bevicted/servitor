@@ -12,9 +12,12 @@ import (
 	"strings"
 )
 
-// Runner executes commands and preserves bounded output. Log receives sanitized failure diagnostics.
+// Runner executes commands and preserves bounded output. Stdout and Stderr
+// optionally stream subprocess output verbatim; Log receives sanitized failure diagnostics.
 type Runner struct {
 	MaxOutput int
+	Stdout    io.Writer
+	Stderr    io.Writer
 	Log       io.Writer
 }
 
@@ -62,8 +65,8 @@ func (r Runner) Run(ctx context.Context, name string, args ...string) (Result, e
 	var stdout, stderr boundedBuffer
 	stdout.limit = limit
 	stderr.limit = limit
-	stdoutDone := copyOutput(&stdout, stdoutReader)
-	stderrDone := copyOutput(&stderr, stderrReader)
+	stdoutDone := copyOutput(&capturingWriter{capture: &stdout, stream: r.Stdout}, stdoutReader)
+	stderrDone := copyOutput(&capturingWriter{capture: &stderr, stream: r.Stderr}, stderrReader)
 	waitDone := make(chan error, 1)
 	go func() {
 		state, waitErr := process.Wait()
@@ -125,6 +128,25 @@ func copyOutput(destination io.Writer, source *os.File) <-chan error {
 		done <- err
 	}()
 	return done
+}
+
+type capturingWriter struct {
+	capture *boundedBuffer
+	stream  io.Writer
+}
+
+func (w *capturingWriter) Write(contents []byte) (int, error) {
+	captured, err := w.capture.Write(contents)
+	if err != nil {
+		return captured, err
+	}
+	if w.stream != nil {
+		streamed, streamErr := w.stream.Write(contents)
+		if streamErr != nil || streamed != len(contents) {
+			w.stream = nil
+		}
+	}
+	return len(contents), nil
 }
 
 type boundedBuffer struct {

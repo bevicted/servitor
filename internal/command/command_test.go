@@ -19,13 +19,17 @@ func TestRunnerUsesArgumentVectorAndBoundsOutput(t *testing.T) {
 		return
 	}
 	t.Setenv("SERVITOR_COMMAND_HELPER", "1")
-	runner := Runner{MaxOutput: 8}
+	var stdout, stderr bytes.Buffer
+	runner := Runner{MaxOutput: 8, Stdout: &stdout, Stderr: &stderr}
 	result, err := runner.Run(context.Background(), os.Args[0], "-test.run=TestRunnerUsesArgumentVectorAndBoundsOutput", "--", "literal;not-a-shell-command")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if result.Stdout != "xxxxxxxx\n[output truncated]" || result.Stderr != "yyyyyyyy\n[output truncated]" || !result.StdoutTruncated || !result.StderrTruncated {
 		t.Errorf("result = %#v", result)
+	}
+	if !strings.HasPrefix(stdout.String(), strings.Repeat("x", 32)) || stderr.String() != strings.Repeat("y", 32) {
+		t.Errorf("streamed output = stdout:%q stderr:%q", stdout.String(), stderr.String())
 	}
 }
 

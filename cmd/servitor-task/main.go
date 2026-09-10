@@ -258,7 +258,7 @@ func runPlan(ctx context.Context, uid, operation string, options servitorv1alpha
 		return errors.New("resolved platform does not match version")
 	}
 	args := append([]string{"plan", operation, "--backend-config", backendFile, "--result-file", resultFile, "--prefix", "servitor"}, optionArgs(options)...)
-	if _, err := (command.Runner{MaxOutput: 64 * 1024, Log: os.Stderr}).Run(ctx, ictPath, args...); err != nil {
+	if _, err := (command.Runner{MaxOutput: 64 * 1024, Stdout: os.Stdout, Stderr: os.Stderr, Log: os.Stderr}).Run(ctx, ictPath, args...); err != nil {
 		return err
 	}
 	result, err := readJSON[ictPlanResult](resultFile)
@@ -435,7 +435,7 @@ func runApply(ctx context.Context, uid, operation string, options servitorv1alph
 	if err != nil {
 		return err
 	}
-	if _, err := (command.Runner{MaxOutput: 64 * 1024, Log: os.Stderr}).Run(ctx, ictPath, "apply", operation, "--context-file", contextFile, "--backend-config", backendFile, "--result-file", resultFile, "--auto-approve"); err != nil {
+	if _, err := (command.Runner{MaxOutput: 64 * 1024, Stdout: os.Stdout, Stderr: os.Stderr, Log: os.Stderr}).Run(ctx, ictPath, "apply", operation, "--context-file", contextFile, "--backend-config", backendFile, "--result-file", resultFile, "--auto-approve"); err != nil {
 		return err
 	}
 	result, err := readJSON[ictOperationResult](resultFile)
@@ -458,7 +458,7 @@ func runDestroy(ctx context.Context, uid, operation string, options servitorv1al
 	if err != nil {
 		return err
 	}
-	if _, err := (command.Runner{MaxOutput: 64 * 1024, Log: os.Stderr}).Run(ctx, ictPath, "destroy", operation, "--context-file", contextFile, "--backend-config", backendFile, "--result-file", resultFile); err != nil {
+	if _, err := (command.Runner{MaxOutput: 64 * 1024, Stdout: os.Stdout, Stderr: os.Stderr, Log: os.Stderr}).Run(ctx, ictPath, "destroy", operation, "--context-file", contextFile, "--backend-config", backendFile, "--result-file", resultFile); err != nil {
 		return err
 	}
 	result, err := readJSON[ictOperationResult](resultFile)
