@@ -100,9 +100,12 @@ func TestSatelliteProfilesStopWhenFinalPageOmitsNext(t *testing.T) {
 		if r.URL.Path != "/vpc/private/instance/profiles" || r.URL.Query().Get("version") != vpcAPIVersion || r.URL.Query().Get("generation") != "2" {
 			t.Fatalf("VPC profile request = %s", r.URL.RequestURI())
 		}
+		if requests == 2 && (r.URL.Query().Get("start") != "next" || r.URL.Query().Get("limit") != "50") {
+			t.Fatalf("VPC profile cursor = %s", r.URL.RequestURI())
+		}
 		switch requests {
 		case 1:
-			_, _ = w.Write([]byte(`{"profiles":[{"name":"bx2-4x16"}],"next":{"href":"https://untrusted.invalid/instance/profiles?version=2026-08-04&generation=2&start=next"}}`))
+			_, _ = w.Write([]byte(`{"profiles":[{"name":"bx2-4x16"}],"next":{"href":"https://untrusted.invalid/instance/profiles?limit=50&start=next"}}`))
 		case 2:
 			_, _ = w.Write([]byte(`{"profiles":[{"name":"cx2-4x8"}]}`))
 		default:

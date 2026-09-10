@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"path"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -475,9 +476,22 @@ func (d discovery) satelliteProfiles(ctx context.Context, token string) ([]Profi
 		if err != nil || next.RawQuery == "" {
 			return nil, errors.New("Satellite host profile pagination failed")
 		}
-		values, err = url.ParseQuery(next.RawQuery)
-		if err != nil || values.Get("version") != vpcAPIVersion || values.Get("generation") != "2" {
+		nextValues, err := url.ParseQuery(next.RawQuery)
+		if err != nil || len(nextValues["start"]) != 1 || len(nextValues["start"][0]) > 2048 {
 			return nil, errors.New("Satellite host profile pagination failed")
+		}
+		for key, entries := range nextValues {
+			if (key != "start" && key != "limit") || len(entries) != 1 || entries[0] == "" {
+				return nil, errors.New("Satellite host profile pagination failed")
+			}
+		}
+		values.Set("start", nextValues.Get("start"))
+		if limit := nextValues.Get("limit"); limit != "" {
+			count, err := strconv.Atoi(limit)
+			if err != nil || count < 1 || count > 1000 {
+				return nil, errors.New("Satellite host profile pagination failed")
+			}
+			values.Set("limit", limit)
 		}
 	}
 	sort.Slice(profiles, func(i, j int) bool {
