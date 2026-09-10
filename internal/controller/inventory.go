@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/bevicted/servitor/internal/inventory"
@@ -204,6 +205,7 @@ func (r *InventoryReconciler) refreshTarget(ctx context.Context, store *state.In
 
 func (r *InventoryReconciler) observeInventoryRun(ctx context.Context, store *state.InventoryStore, current state.InventoryState, now time.Time) (*time.Time, error) {
 	if current.RunDeadlineAt != nil && !now.Before(current.RunDeadlineAt.Time) {
+		log.Print("inventory refresh failed at run deadline")
 		return r.failInventoryRun(ctx, store, current.Target, current.ActiveRunID, current.Revision, now)
 	}
 	run := &tektonv1.PipelineRun{}
@@ -222,6 +224,7 @@ func (r *InventoryReconciler) observeInventoryRun(ctx context.Context, store *st
 		return nil, err
 	}
 	if !pipeline.MatchingInventoryRun(run, current.Target, current.ActiveRunID) {
+		log.Print("inventory refresh failed at run identity validation")
 		return r.failInventoryRun(ctx, store, current.Target, current.ActiveRunID, current.Revision, now)
 	}
 	done, success := pipeline.Succeeded(run)
@@ -233,6 +236,7 @@ func (r *InventoryReconciler) observeInventoryRun(ctx context.Context, store *st
 		return &wake, nil
 	}
 	if !success {
+		log.Print("inventory refresh failed at PipelineRun execution")
 		return r.failInventoryRun(ctx, store, current.Target, current.ActiveRunID, current.Revision, now)
 	}
 	if r.Logs == nil {
@@ -253,6 +257,7 @@ func (r *InventoryReconciler) observeInventoryRun(ctx context.Context, store *st
 		return r.retryInventoryObservation(ctx, store, current, now)
 	}
 	if !taskSucceeded {
+		log.Print("inventory refresh failed at TaskRun execution")
 		return r.failInventoryRun(ctx, store, current.Target, current.ActiveRunID, current.Revision, now)
 	}
 	container := pipeline.InventoryReportContainer(task)
@@ -264,6 +269,11 @@ func (r *InventoryReconciler) observeInventoryRun(ctx context.Context, store *st
 		return r.retryInventoryObservation(ctx, store, current, now)
 	}
 	if err != nil {
+		if pipeline.IsLogReadError(err) {
+			log.Print("inventory refresh failed while reading report logs")
+		} else {
+			log.Print("inventory refresh failed at report validation")
+		}
 		return r.failInventoryRun(ctx, store, current.Target, current.ActiveRunID, current.Revision, now)
 	}
 	published := now
