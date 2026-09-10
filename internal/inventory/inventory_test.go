@@ -27,7 +27,7 @@ func TestDiscoverUsesConfiguredBasesAndCompleteScopedCatalog(t *testing.T) {
 			}
 			_, _ = w.Write([]byte(`{"access_token":"synthetic-token"}`))
 		case "/iam/base/identity/userinfo":
-			_, _ = w.Write([]byte(`{"account_id":"account-1"}`))
+			_, _ = w.Write([]byte(`{"account":{"bss":"account-1"}}`))
 		case "/rm/private/v2/resource_groups":
 			if r.URL.Query().Get("account_id") != "account-1" || r.URL.Query().Get("limit") != "100" {
 				t.Fatalf("resource group scope = %q", r.URL.RawQuery)

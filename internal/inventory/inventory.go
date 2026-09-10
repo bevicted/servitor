@@ -260,7 +260,7 @@ func (d discovery) authenticate(ctx context.Context, apiKey string) (string, str
 	var user struct {
 		AccountID string `json:"account_id"`
 		Account   struct {
-			BSSAccount string `json:"bss_account"`
+			BSSAccount string `json:"bss"`
 		} `json:"account"`
 	}
 	if err := d.request(ctx, "IAM", http.MethodGet, "identity/userinfo", nil, token.AccessToken, &user); err != nil {
