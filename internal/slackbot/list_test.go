@@ -11,9 +11,10 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-func TestClusterListMessagesEmptyState(t *testing.T) {
+func TestClusterListMessagesRendersEmptyTable(t *testing.T) {
 	messages := clusterListMessages(nil, "Ucaller", time.Now())
-	if len(messages) != 1 || messages[0] != listEmptyMessage {
+	const expected = "`*` marks your allocation.\n```\n  cluster  state  location  expires\n```"
+	if len(messages) != 1 || messages[0] != expected {
 		t.Fatalf("empty list messages = %q", messages)
 	}
 }

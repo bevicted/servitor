@@ -745,7 +745,7 @@ func TestHandleListReportsEmptyAndLifecycleStatesInDMAndChannel(t *testing.T) {
 
 	t.Run("empty", func(t *testing.T) {
 		bot, responses := botForTest(t)
-		run(t, bot, responses, []string{listEmptyMessage})
+		run(t, bot, responses, []string{listLegend, "cluster", "state", "location", "expires"})
 	})
 
 	t.Run("all lifecycle phases", func(t *testing.T) {

@@ -14,7 +14,6 @@ import (
 
 const (
 	listSafeCellLimit = 160
-	listEmptyMessage  = "No cluster allocations found."
 	listLegend        = "`*` marks your allocation."
 )
 
@@ -32,9 +31,6 @@ type clusterListRow struct {
 // clusterListMessages renders only status data held by namespaced CRs. Slack
 // owner identities remain a caller marker and are never resolved or displayed.
 func clusterListMessages(clusters []servitorv1alpha1.ServitorCluster, caller string, now time.Time) []string {
-	if len(clusters) == 0 {
-		return []string{listEmptyMessage}
-	}
 	owners := make([]string, 0, len(clusters))
 	for _, cluster := range clusters {
 		owners = append(owners, cluster.Spec.Slack.OwnerID)
