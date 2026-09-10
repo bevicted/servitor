@@ -22,7 +22,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 )
 
-const inventoryFailureRetry = 5 * time.Minute
+const (
+	inventoryFailureRetry      = 5 * time.Minute
+	inventoryReportGracePeriod = 10 * time.Second
+)
 
 var errStaleInventoryRun = errors.New("inventory run is no longer active")
 
@@ -252,7 +255,7 @@ func (r *InventoryReconciler) observeInventoryRun(ctx context.Context, store *st
 	} else if err != nil {
 		return nil, err
 	}
-	taskDone, taskSucceeded := inventoryTaskRunSucceeded(task)
+	taskDone, taskSucceeded, taskCompletedAt := inventoryTaskRunSucceeded(task)
 	if !taskDone {
 		return r.retryInventoryObservation(ctx, store, current, now)
 	}
@@ -265,7 +268,7 @@ func (r *InventoryReconciler) observeInventoryRun(ctx context.Context, store *st
 		return r.retryInventoryObservation(ctx, store, current, now)
 	}
 	report, err := pipeline.ReadInventoryReport(ctx, r.Logs, r.Config.Namespace, task.Status.PodName, container, current.Target, current.ActiveRunID, current.Revision)
-	if retryableInventoryLogError(err) {
+	if retryableInventoryLogError(err) || (err != nil && !taskCompletedAt.IsZero() && now.Before(taskCompletedAt.Add(inventoryReportGracePeriod))) {
 		return r.retryInventoryObservation(ctx, store, current, now)
 	}
 	if err != nil {
@@ -303,21 +306,21 @@ func (r *InventoryReconciler) observeInventoryRun(ctx context.Context, store *st
 	return &wake, nil
 }
 
-func inventoryTaskRunSucceeded(task *tektonv1.TaskRun) (done, succeeded bool) {
+func inventoryTaskRunSucceeded(task *tektonv1.TaskRun) (done, succeeded bool, completedAt time.Time) {
 	for _, condition := range task.Status.Conditions {
 		if string(condition.Type) != "Succeeded" {
 			continue
 		}
 		switch condition.Status {
 		case corev1.ConditionTrue:
-			return true, true
+			return true, true, condition.LastTransitionTime.Inner.Time
 		case corev1.ConditionFalse:
-			return true, false
+			return true, false, condition.LastTransitionTime.Inner.Time
 		default:
-			return false, false
+			return false, false, time.Time{}
 		}
 	}
-	return false, false
+	return false, false, time.Time{}
 }
 
 func retryableInventoryLogError(err error) bool {

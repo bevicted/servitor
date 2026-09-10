@@ -149,9 +149,13 @@ func TestInventoryRefreshRetriesTerminalRunUntilTaskStatusIsObserved(t *testing.
 	if err != nil || result.RequeueAfter != time.Second {
 		t.Fatalf("incomplete TaskRun retry = %v, %v", result, err)
 	}
-	lateTask.Status.Status.Conditions = duckv1.Conditions{{Type: apis.ConditionSucceeded, Status: corev1.ConditionTrue}}
+	lateTask.Status.Status.Conditions = duckv1.Conditions{{Type: apis.ConditionSucceeded, Status: corev1.ConditionTrue, LastTransitionTime: apis.VolatileTime{Inner: metav1.NewTime(now)}}}
 	if err := kube.Status().Update(context.Background(), lateTask); err != nil {
 		t.Fatal(err)
+	}
+	result, err = refresher.Sync(context.Background())
+	if err != nil || result.RequeueAfter != time.Second {
+		t.Fatalf("incomplete report retry = %v, %v", result, err)
 	}
 	logs.err = apierrors.NewBadRequest("container log is not available yet")
 	result, err = refresher.Sync(context.Background())
@@ -166,6 +170,37 @@ func TestInventoryRefreshRetriesTerminalRunUntilTaskStatusIsObserved(t *testing.
 	current, err = store.Get(context.Background(), "target-a")
 	if err != nil || current.Disposition != state.InventorySucceeded || current.Catalog == nil {
 		t.Fatalf("retried terminal run was not published: %+v, %v", current, err)
+	}
+}
+
+func TestInventoryRefreshFailsInvalidReportAfterGracePeriod(t *testing.T) {
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	refresher, kube, logs := newInventoryHarness(t, &now, targetConfigYAML("vpc-gen2"))
+	if _, err := refresher.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	store := state.NewInventoryStore(kube, "servitor")
+	current, err := store.Get(context.Background(), "target-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	completeInventoryRun(t, kube, current.ActiveRunID, "invalid-report-task")
+	task := &tektonv1.TaskRun{}
+	if err := kube.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: "invalid-report-task"}, task); err != nil {
+		t.Fatal(err)
+	}
+	task.Status.Status.Conditions[0].LastTransitionTime = apis.VolatileTime{Inner: metav1.NewTime(now)}
+	if err := kube.Status().Update(context.Background(), task); err != nil {
+		t.Fatal(err)
+	}
+	logs.data = []byte("{")
+	now = now.Add(inventoryReportGracePeriod)
+	if _, err := refresher.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	current, err = store.Get(context.Background(), "target-a")
+	if err != nil || current.Disposition != state.InventoryFailed || current.ActiveRunID != "" {
+		t.Fatalf("invalid report did not fail after grace period: %+v, %v", current, err)
 	}
 }
 
