@@ -13,7 +13,7 @@ import (
 
 func TestClusterListMessagesRendersEmptyTable(t *testing.T) {
 	messages := clusterListMessages(nil, "Ucaller", time.Now())
-	const expected = "`*` marks your allocation.\n```\n  cluster  state  location  expires\n```"
+	const expected = "`*` marks your allocations.\n```\n  cluster  state  location  expires\n```"
 	if len(messages) != 1 || messages[0] != expected {
 		t.Fatalf("empty list messages = %q", messages)
 	}
@@ -50,7 +50,7 @@ func TestClusterListFormatsLeasePresentationBoundaries(t *testing.T) {
 	clusters := []servitorv1alpha1.ServitorCluster{
 		{ObjectMeta: metav1.ObjectMeta{Name: "minute", Namespace: "servitor"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "Ucaller"}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseReady, LeaseExpiresAt: &minuteExpiry}},
 		{ObjectMeta: metav1.ObjectMeta{Name: "expired", Namespace: "servitor"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "Uother"}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseReady, LeaseExpiresAt: &expiredExpiry}},
-		{ObjectMeta: metav1.ObjectMeta{Name: "unavailable", Namespace: "servitor"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "Uunknown"}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseReady}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "no-expiry", Namespace: "servitor"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "Uunknown"}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseReady}},
 	}
 	bot, responses := botForTest(t, &clusters[0], &clusters[1], &clusters[2])
 	if err := bot.Handle(context.Background(), Envelope{ID: "list-boundaries", Message: Message{Channel: "C1", ChannelType: "channel", User: "Ucaller", Text: "<@BOT> list", Timestamp: "123"}}); err != nil {
@@ -61,7 +61,7 @@ func TestClusterListFormatsLeasePresentationBoundaries(t *testing.T) {
 		messages = append(messages, response.Text)
 	}
 	text := strings.Join(messages, "\n")
-	for _, want := range []string{"2026-09-08 00:59:59 UTC (59m)", "2026-09-08 00:00:00 UTC (expired)", "unavailable"} {
+	for _, want := range []string{"2026-09-08 00:59:59 UTC (59m)", "2026-09-08 00:00:00 UTC (expired)", "never"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("list missing %q: %s", want, text)
 		}

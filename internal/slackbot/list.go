@@ -14,7 +14,7 @@ import (
 
 const (
 	listSafeCellLimit = 160
-	listLegend        = "`*` marks your allocation."
+	listLegend        = "`*` marks your allocations."
 )
 
 var listStatuses = map[string]string{
@@ -132,7 +132,12 @@ func listStatusCell(value string) string {
 	}
 	return "-"
 }
-func listExpiry(value, now time.Time) string { return lifecycle.FormatLeaseExpiry(value, now) }
+func listExpiry(value, now time.Time) string {
+	if value.IsZero() {
+		return "never"
+	}
+	return lifecycle.FormatLeaseExpiry(value, now)
+}
 func listSafeCell(value string) string {
 	value = strings.Map(func(character rune) rune {
 		if unicode.IsControl(character) || character == '`' || character == '@' || character == '<' || character == '>' {
