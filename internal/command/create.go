@@ -85,7 +85,7 @@ func (o ExplicitCreateOptions) WorkerCount() (int, error) {
 	}
 	count, err := strconv.Atoi(value)
 	if err != nil || count < 1 || count > 100 {
-		return 0, fmt.Errorf("--worker-count must be an integer from 1 through 100")
+		return 0, fmt.Errorf("worker-count must be an integer from 1 through 100")
 	}
 	return count, nil
 }
@@ -101,44 +101,38 @@ func ParseCreateOptions(text string) (ExplicitCreateOptions, error) {
 	}
 	seen, values := map[string]bool{}, map[string][]string{}
 	var bare []string
-	for i := 1; i < len(words); {
-		if !strings.HasPrefix(words[i], "-") && !strings.Contains(words[i], "=") {
-			if canonical, alias, ok := versionSyntax(words[i]); ok {
+	for _, word := range words[1:] {
+		key, value, assigned := strings.Cut(word, "=")
+		if !assigned {
+			if strings.HasPrefix(word, "-") {
+				return ExplicitCreateOptions{}, fmt.Errorf("create options must use key=value")
+			}
+			if canonical, alias, ok := versionSyntax(word); ok {
 				if err := addVersion(values, canonical, alias); err != nil {
 					return ExplicitCreateOptions{}, err
 				}
-				i++
 				continue
 			}
-			bare = append(bare, words[i])
-			i++
+			bare = append(bare, word)
 			continue
 		}
-		flag, value, joined := strings.Cut(words[i], "=")
-		if joined && !strings.HasPrefix(flag, "--") {
-			flag = "--" + flag
+		if strings.HasPrefix(key, "-") {
+			return ExplicitCreateOptions{}, fmt.Errorf("create options must use key=value without leading dashes")
 		}
+		flag := "--" + key
 		if forbiddenCreateFlags[flag] {
-			return ExplicitCreateOptions{}, fmt.Errorf("%s is not permitted", flag)
+			return ExplicitCreateOptions{}, fmt.Errorf("%s is not permitted", key)
 		}
 		if !createFlags[flag] {
-			return ExplicitCreateOptions{}, fmt.Errorf("unknown create flag %q", flag)
+			return ExplicitCreateOptions{}, fmt.Errorf("unknown create option %q", key)
 		}
-		if !joined {
-			if i+1 == len(words) || strings.HasPrefix(words[i+1], "--") {
-				return ExplicitCreateOptions{}, fmt.Errorf("%s requires a value", flag)
-			}
-			value, i = words[i+1], i+2
-		} else {
-			if value == "" {
-				return ExplicitCreateOptions{}, fmt.Errorf("%s requires a value", flag)
-			}
-			i++
+		if value == "" {
+			return ExplicitCreateOptions{}, fmt.Errorf("%s requires a value", key)
 		}
 		if flag == "--version" {
 			canonical, alias, ok := versionSyntax(value)
 			if !ok {
-				return ExplicitCreateOptions{}, fmt.Errorf("--version must be a numeric stream or cloud-default alias")
+				return ExplicitCreateOptions{}, fmt.Errorf("version must be a numeric stream or cloud-default alias")
 			}
 			if err := addVersion(values, canonical, alias); err != nil {
 				return ExplicitCreateOptions{}, err
@@ -146,7 +140,7 @@ func ParseCreateOptions(text string) (ExplicitCreateOptions, error) {
 			continue
 		}
 		if seen[flag] && !repeatableCreateFlags[flag] {
-			return ExplicitCreateOptions{}, fmt.Errorf("%s may only be supplied once", flag)
+			return ExplicitCreateOptions{}, fmt.Errorf("%s may only be supplied once", key)
 		}
 		seen[flag] = true
 		values[flag] = append(values[flag], value)
@@ -181,7 +175,7 @@ func ResolveCreateOptions(options ExplicitCreateOptions, defaults CreateDefaults
 		version = defaults.Version
 	}
 	if version == "" {
-		return CreateRequest{}, fmt.Errorf("create requires --version VERSION")
+		return CreateRequest{}, fmt.Errorf("create requires version=value")
 	}
 	inferredPlatform, err := InferPlatform(version)
 	if err != nil {

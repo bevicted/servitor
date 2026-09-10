@@ -14,7 +14,7 @@ func ResolveBareSelectors(options ExplicitCreateOptions, defaults CreateDefaults
 	bare := append([]string(nil), options.bare...)
 	set := func(flag, value string) error {
 		if one(values, flag) != "" {
-			return fmt.Errorf("%s may only be supplied once", flag)
+			return fmt.Errorf("%s may only be supplied once", strings.TrimPrefix(flag, "--"))
 		}
 		values[flag] = []string{value}
 		return nil
@@ -81,14 +81,14 @@ func MatchBareCreateOptions(options ExplicitCreateOptions, defaults CreateDefaul
 		case "vpc-gen2":
 			if hasLocation(catalog.VPCLocations, value) {
 				if zone != "" && zone != value {
-					return ExplicitCreateOptions{}, fmt.Errorf("--zone may only be supplied once")
+					return ExplicitCreateOptions{}, fmt.Errorf("zone may only be supplied once")
 				}
 				zone = value
 			}
 		case "classic":
 			if hasLocation(catalog.ClassicLocations, value) {
 				if datacenter != "" && datacenter != value {
-					return ExplicitCreateOptions{}, fmt.Errorf("--datacenter may only be supplied once")
+					return ExplicitCreateOptions{}, fmt.Errorf("datacenter may only be supplied once")
 				}
 				datacenter = value
 			}
@@ -108,7 +108,7 @@ func MatchBareCreateOptions(options ExplicitCreateOptions, defaults CreateDefaul
 		}
 		flag := roles[0]
 		if one(values, flag) != "" {
-			return ExplicitCreateOptions{}, fmt.Errorf("%s may only be supplied once", flag)
+			return ExplicitCreateOptions{}, fmt.Errorf("%s may only be supplied once", strings.TrimPrefix(flag, "--"))
 		}
 		values[flag] = []string{value}
 	}

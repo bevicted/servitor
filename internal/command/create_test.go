@@ -63,7 +63,7 @@ func TestExtensionTargetUsesSnapshotDefaultAndKeepsUTC(t *testing.T) {
 }
 
 func TestParseCreateAcceptsEverySafeFlag(t *testing.T) {
-	request, err := ParseCreate(`create --target test --provider vpc-gen2 --version 4.22 --resource-group "Platform Team" --zone us-south-3 --flavor custom --vpc-id vpc-id --subnet-id subnet-one --subnet-id subnet-two --public-gateway-id gateway-one --public-gateway-id gateway-two --datacenter dal10 --machine-type b3c.4x16 --public-vlan-id public-vlan --private-vlan-id private-vlan --satellite-zone us-south-1 --satellite-zone us-south-2 --satellite-managed-from managed-from --satellite-location-id location-id --satellite-host-image image-id --satellite-host-profile bx2-4x16 --satellite-ssh-key-id ssh-key --satellite-worker-instance-id worker-one --satellite-worker-instance-id worker-two --satellite-worker-operating-system RHCOS --worker-count 3`, testCreateDefaults)
+	request, err := ParseCreate(`create target=test provider=vpc-gen2 version=4.22 resource-group="Platform Team" zone=us-south-3 flavor=custom vpc-id=vpc-id subnet-id=subnet-one subnet-id=subnet-two public-gateway-id=gateway-one public-gateway-id=gateway-two datacenter=dal10 machine-type=b3c.4x16 public-vlan-id=public-vlan private-vlan-id=private-vlan satellite-zone=us-south-1 satellite-zone=us-south-2 satellite-managed-from=managed-from satellite-location-id=location-id satellite-host-image=image-id satellite-host-profile=bx2-4x16 satellite-ssh-key-id=ssh-key satellite-worker-instance-id=worker-one satellite-worker-instance-id=worker-two satellite-worker-operating-system=RHCOS worker-count=3`, testCreateDefaults)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,7 +82,7 @@ func TestParseCreateAcceptsEverySafeFlag(t *testing.T) {
 	}
 }
 
-func TestParseCreateOptionsNormalizesMixedAssignments(t *testing.T) {
+func TestParseCreateOptionsNormalizesAssignments(t *testing.T) {
 	want := map[string][]string{
 		"--target":         {"synthetic-target"},
 		"--provider":       {"vpc-gen2"},
@@ -91,23 +91,26 @@ func TestParseCreateOptionsNormalizesMixedAssignments(t *testing.T) {
 		"--worker-count":   {"3"},
 		"--subnet-id":      {"subnet-one", "subnet-two"},
 	}
-	for _, text := range []string{
-		`create target=synthetic-target provider=vpc-gen2 version=4.22 resource-group="Platform \"Team\"=Core" worker-count=3 subnet-id=subnet-one subnet-id=subnet-two`,
-		`create --target=synthetic-target --provider=vpc-gen2 --version=4.22 --resource-group="Platform \"Team\"=Core" --worker-count=3 --subnet-id=subnet-one --subnet-id=subnet-two`,
-		`create --target synthetic-target provider=vpc-gen2 --version 4.22 resource-group="Platform \"Team\"=Core" --worker-count=3 subnet-id=subnet-one --subnet-id subnet-two`,
-	} {
-		options, err := ParseCreateOptions(text)
-		if err != nil {
-			t.Fatalf("ParseCreateOptions(%q): %v", text, err)
-		}
-		if got := options.Values(); !reflect.DeepEqual(got, want) {
-			t.Fatalf("ParseCreateOptions(%q) = %#v\nwant %#v", text, got, want)
+	text := `create target=synthetic-target provider=vpc-gen2 version=4.22 resource-group="Platform \"Team\"=Core" worker-count=3 subnet-id=subnet-one subnet-id=subnet-two`
+	options, err := ParseCreateOptions(text)
+	if err != nil {
+		t.Fatalf("ParseCreateOptions(%q): %v", text, err)
+	}
+	if got := options.Values(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("ParseCreateOptions(%q) = %#v\nwant %#v", text, got, want)
+	}
+}
+
+func TestParseCreateOptionsRejectsLeadingDashForms(t *testing.T) {
+	for _, text := range []string{"create --version=4.22", "create --version 4.22"} {
+		if _, err := ParseCreateOptions(text); err == nil || !strings.Contains(err.Error(), "key=value") {
+			t.Fatalf("ParseCreateOptions(%q) error = %v, want key=value guidance", text, err)
 		}
 	}
 }
 
 func TestParseCreateAssignmentsRetainOneQuotedArgvValue(t *testing.T) {
-	request, err := ParseCreate(`create target=synthetic-target resource-group="Platform Team=Core" --version 4.22`, testCreateDefaults)
+	request, err := ParseCreate(`create target=synthetic-target resource-group="Platform Team=Core" version=4.22`, testCreateDefaults)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,10 +129,10 @@ func TestParseCreateAssignmentErrors(t *testing.T) {
 	tests := []struct {
 		text, want string
 	}{
-		{"create unknown=value", `unknown create flag "--unknown"`},
-		{"create config=value", "--config is not permitted"},
-		{"create target=", "--target requires a value"},
-		{"create target=one --target two", "--target may only be supplied once"},
+		{"create unknown=value", `unknown create option "unknown"`},
+		{"create config=value", "config is not permitted"},
+		{"create target=", "target requires a value"},
+		{"create target=one target=two", "target may only be supplied once"},
 	}
 	for _, test := range tests {
 		t.Run(test.text, func(t *testing.T) {
@@ -143,17 +146,17 @@ func TestParseCreateAssignmentErrors(t *testing.T) {
 func TestParseCreateRejectsInvalidWorkerCount(t *testing.T) {
 	for _, text := range []string{
 		"create worker-count=not-a-number",
-		"create --worker-count 999999999999999999999999999999",
-		"create --worker-count=0",
+		"create worker-count=999999999999999999999999999999",
+		"create worker-count=0",
 		"create worker-count=101",
 	} {
 		t.Run(text, func(t *testing.T) {
-			if _, err := ParseCreateOptions(text); err == nil || err.Error() != "--worker-count must be an integer from 1 through 100" {
+			if _, err := ParseCreateOptions(text); err == nil || err.Error() != "worker-count must be an integer from 1 through 100" {
 				t.Fatalf("ParseCreateOptions(%q) error = %v", text, err)
 			}
 		})
 	}
-	for _, text := range []string{"create worker-count=1", "create --worker-count 100"} {
+	for _, text := range []string{"create worker-count=1", "create worker-count=100"} {
 		options, err := ParseCreateOptions(text)
 		if err != nil {
 			t.Fatal(err)
@@ -174,19 +177,19 @@ func TestParseCreateAppliesAndOverridesConfiguredDefaults(t *testing.T) {
 			want: []string{"--target", "synthetic-target", "--provider", "vpc-gen2", "--platform", "openshift", "--version", "4.22", "--resource-group", "Default", "--zone", "us-south-1", "--flavor", "bx2.4x16", "--vpc-id", "synthetic-vpc-id"},
 		},
 		{
-			name: "OpenShift defaults", text: "create --version 4.22", platform: "openshift",
+			name: "OpenShift defaults", text: "create version=4.22", platform: "openshift",
 			want: []string{"--target", "synthetic-target", "--provider", "vpc-gen2", "--platform", "openshift", "--version", "4.22", "--resource-group", "Default", "--zone", "us-south-1", "--flavor", "bx2.4x16", "--vpc-id", "synthetic-vpc-id"},
 		},
 		{
-			name: "Kubernetes defaults", text: "create --version 1.31", platform: "kubernetes",
+			name: "Kubernetes defaults", text: "create version=1.31", platform: "kubernetes",
 			want: []string{"--target", "synthetic-target", "--provider", "vpc-gen2", "--platform", "kubernetes", "--version", "1.31", "--resource-group", "Default", "--zone", "us-south-1", "--flavor", "bx2.2x8", "--vpc-id", "synthetic-vpc-id"},
 		},
 		{
-			name: "OpenShift overrides", text: "create --version=4.22 --target target --provider classic --resource-group group --zone zone --vpc-id vpc --flavor flavor", platform: "openshift",
+			name: "OpenShift overrides", text: "create version=4.22 target=target provider=classic resource-group=group zone=zone vpc-id=vpc flavor=flavor", platform: "openshift",
 			want: []string{"--target", "target", "--provider", "classic", "--platform", "openshift", "--version", "4.22", "--resource-group", "group", "--zone", "zone", "--flavor", "flavor", "--vpc-id", "vpc"},
 		},
 		{
-			name: "Kubernetes flavor override", text: "create --version 1.31 --flavor kubernetes-flavor", platform: "kubernetes",
+			name: "Kubernetes flavor override", text: "create version=1.31 flavor=kubernetes-flavor", platform: "kubernetes",
 			want: []string{"--target", "synthetic-target", "--provider", "vpc-gen2", "--platform", "kubernetes", "--version", "1.31", "--resource-group", "Default", "--zone", "us-south-1", "--flavor", "kubernetes-flavor", "--vpc-id", "synthetic-vpc-id"},
 		},
 	}
@@ -216,7 +219,7 @@ func TestParseCreateRejectsMalformedConfiguredDefaultVersion(t *testing.T) {
 }
 
 func TestParseCreateExposesNormalizedPresentationFields(t *testing.T) {
-	request, err := ParseCreate("create --version 1.36 --worker-count 2 --subnet-id subnet --public-gateway-id gateway", testCreateDefaults)
+	request, err := ParseCreate("create version=1.36 worker-count=2 subnet-id=subnet public-gateway-id=gateway", testCreateDefaults)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -232,17 +235,17 @@ func TestParseCreateRejectsEveryProhibitedOrAmbiguousInput(t *testing.T) {
 	tests := []struct {
 		name, text string
 	}{
-		{"state ID positional input", "create slack-user --version 4.22"},
-		{"unknown flag", "create --version 4.22 --unknown value"},
-		{"config", "create --version 4.22 --config /secret"},
-		{"owner", "create --version 4.22 --owner user"},
-		{"prefix", "create --version 4.22 --prefix user"},
-		{"auto approve", "create --version 4.22 --auto-approve true"},
-		{"name", "create --version 4.22 --name caller-selected"},
-		{"confirm stdin", "create --version 4.22 --confirm-stdin true"},
-		{"SSH public key path", "create --version 4.22 --satellite-ssh-public-key /secret"},
-		{"uninferable version", "create --version 5.1"},
-		{"removed platform", "create --version 4.22 --platform kubernetes"},
+		{"state ID positional input", "create slack-user version=4.22"},
+		{"unknown flag", "create version=4.22 unknown=value"},
+		{"config", "create version=4.22 config=/secret"},
+		{"owner", "create version=4.22 owner=user"},
+		{"prefix", "create version=4.22 prefix=user"},
+		{"auto approve", "create version=4.22 auto-approve=true"},
+		{"name", "create version=4.22 name=caller-selected"},
+		{"confirm stdin", "create version=4.22 confirm-stdin=true"},
+		{"SSH public key path", "create version=4.22 satellite-ssh-public-key=/secret"},
+		{"uninferable version", "create version=5.1"},
+		{"removed platform", "create version=4.22 platform=kubernetes"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -266,7 +269,7 @@ func TestParseCreateRecognizesCloudDefaultAliasesAndCompatibleNumericStreams(t *
 	}{
 		{"create default_openshift", "default_openshift"}, {"create openshift", "default_openshift"}, {"create roks", "default_openshift"},
 		{"create default_kubernetes", "default_kubernetes"}, {"create kubernetes", "default_kubernetes"}, {"create k8s", "default_kubernetes"}, {"create iks", "default_kubernetes"},
-		{"create roks 4.17", "4.17"}, {"create 4.17 roks", "4.17"}, {"create iks --version 1.34", "1.34"},
+		{"create roks 4.17", "4.17"}, {"create 4.17 roks", "4.17"}, {"create iks version=1.34", "1.34"},
 	} {
 		t.Run(test.text, func(t *testing.T) {
 			options, err := ParseCreateOptions(test.text)
@@ -275,7 +278,7 @@ func TestParseCreateRecognizesCloudDefaultAliasesAndCompatibleNumericStreams(t *
 			}
 		})
 	}
-	for _, text := range []string{"create roks 1.34", "create iks 4.17", "create roks iks", "create 4.17 4.18", "create --version=4.17 --version=4.18"} {
+	for _, text := range []string{"create roks 1.34", "create iks 4.17", "create roks iks", "create 4.17 4.18", "create version=4.17 version=4.18"} {
 		t.Run(text, func(t *testing.T) {
 			if _, err := ParseCreateOptions(text); err == nil {
 				t.Fatalf("ParseCreateOptions(%q) unexpectedly succeeded", text)
@@ -294,8 +297,9 @@ func TestParseCreateRejectsDuplicateAndMissingSingletonValues(t *testing.T) {
 		{"--worker-count", "3"},
 	}
 	for _, test := range singletons {
+		key := strings.TrimPrefix(test.flag, "--")
 		t.Run("duplicate "+test.flag, func(t *testing.T) {
-			text := "create --version 4.22 " + test.flag + " " + test.value + " " + test.flag + " " + test.value
+			text := "create version=4.22 " + key + "=" + test.value + " " + key + "=" + test.value
 			request, err := ParseCreate(text, testCreateDefaults)
 			if err == nil {
 				t.Fatal("error = nil")
@@ -305,9 +309,9 @@ func TestParseCreateRejectsDuplicateAndMissingSingletonValues(t *testing.T) {
 			}
 		})
 		t.Run("missing "+test.flag, func(t *testing.T) {
-			text := "create --version 4.22 " + test.flag
+			text := "create version=4.22 " + key + "="
 			if test.flag == "--version" {
-				text = "create --version"
+				text = "create version="
 			}
 			request, err := ParseCreate(text, testCreateDefaults)
 			if err == nil {
@@ -325,18 +329,18 @@ func TestParseCreateParsesQuotedAndEscapedValuesAndRejectsShellSyntax(t *testing
 		name, text, wantResourceGroup string
 		wantErr                       bool
 	}{
-		{"single quoted", "create --version 4.22 --resource-group 'Platform Team'", "Platform Team", false},
-		{"double quoted escaped quote", `create --version 4.22 --resource-group "Platform \"Team\""`, `Platform "Team"`, false},
-		{"escaped whitespace", `create --version 4.22 --resource-group Platform\ Team`, "Platform Team", false},
-		{"unterminated quote", "create --version 4.22 --resource-group 'Platform Team", "", true},
-		{"unterminated escape", `create --version 4.22 --resource-group Platform\`, "", true},
-		{"semicolon", "create --version 4.22; destroy", "", true},
-		{"pipe", "create --version 4.22 | destroy", "", true},
-		{"ampersand", "create --version 4.22 & destroy", "", true},
-		{"input redirect", "create --version 4.22 < input", "", true},
-		{"output redirect", "create --version 4.22 > output", "", true},
-		{"variable", "create --version $VERSION", "", true},
-		{"backtick", "create --version `version`", "", true},
+		{"single quoted", "create version=4.22 resource-group='Platform Team'", "Platform Team", false},
+		{"double quoted escaped quote", `create version=4.22 resource-group="Platform \"Team\""`, `Platform "Team"`, false},
+		{"escaped whitespace", `create version=4.22 resource-group=Platform\ Team`, "Platform Team", false},
+		{"unterminated quote", "create version=4.22 resource-group='Platform Team", "", true},
+		{"unterminated escape", `create version=4.22 resource-group=Platform\`, "", true},
+		{"semicolon", "create version=4.22; destroy", "", true},
+		{"pipe", "create version=4.22 | destroy", "", true},
+		{"ampersand", "create version=4.22 & destroy", "", true},
+		{"input redirect", "create version=4.22 < input", "", true},
+		{"output redirect", "create version=4.22 > output", "", true},
+		{"variable", "create version=$VERSION", "", true},
+		{"backtick", "create version=`version`", "", true},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

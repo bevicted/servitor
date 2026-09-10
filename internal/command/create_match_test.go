@@ -18,7 +18,7 @@ var matchCatalog = inventory.Catalog{
 }
 
 func TestBareValuesResolveSelectorsBeforeOrderIndependentLocationMatching(t *testing.T) {
-	options, err := ParseCreateOptions("create bx2.4x16 Platform\\ Team vpc-gen2 us-south-1 target-a --version=4.22")
+	options, err := ParseCreateOptions("create bx2.4x16 Platform\\ Team vpc-gen2 us-south-1 target-a version=4.22")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -41,8 +41,8 @@ func TestBareValuesRequireOneExactRoleAndCurrentInventory(t *testing.T) {
 	for _, test := range []struct{ text, want string }{
 		{"create group", "unknown shorthand"},
 		{"create shared", "ambiguous shorthand"},
-		{"create target-a target-a", "--target may only be supplied once"},
-		{"create provider=classic vpc-gen2", "--provider may only be supplied once"},
+		{"create target-a target-a", "target may only be supplied once"},
+		{"create provider=classic vpc-gen2", "provider may only be supplied once"},
 	} {
 		t.Run(test.text, func(t *testing.T) {
 			options, err := ParseCreateOptions(test.text)

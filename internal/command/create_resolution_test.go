@@ -3,7 +3,7 @@ package command
 import "testing"
 
 func TestParseCreateOptionsDoesNotApplyDefaultsUntilResolution(t *testing.T) {
-	options, err := ParseCreateOptions("create --version 4.22")
+	options, err := ParseCreateOptions("create version=4.22")
 	if err != nil {
 		t.Fatal(err)
 	}
