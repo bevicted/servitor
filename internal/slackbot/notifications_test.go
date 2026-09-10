@@ -161,12 +161,12 @@ func TestStatusNoticesIncludePersistedReviewAndReadySummaries(t *testing.T) {
 	cluster.Status.LeaseExtension = &servitorv1alpha1.LeaseExtensionStatus{RequestedExpiry: expiry, PreviousExpiry: &previous, NewExpiry: &expiry, AddedSeconds: int64((2 * time.Hour).Seconds()), Outcome: servitorv1alpha1.ExtensionOutcomeApplied}
 	ready := statusNotices(cluster)
 	readyText := joinNotices(ready)
-	for _, wanted := range []string{"Your cluster is ready.", "Created", "Reused", "Resource", "Name", "ID", "Cluster", "VPC", "Lease extended.", "Previous expiry:", "New expiry:", "Added:", "Remaining lease time is capped at 24 hours.", "extend [N[h]]", "@servitor extend [N[h]]", "`done`", "@servitor done"} {
+	for _, wanted := range []string{"<@U1> your request is complete.", "Created", "Reused", "Resource", "Name", "ID", "Cluster", "VPC", "Lease extended.", "Previous expiry:", "New expiry:", "Added:", "Remaining lease time is capped at 24 hours.", "extend [N[h]]", "@servitor extend [N[h]]", "`done`", "@servitor done"} {
 		if !strings.Contains(readyText, wanted) {
 			t.Fatalf("ready notice missing %q: %s", wanted, readyText)
 		}
 	}
-	for _, forbidden := range []string{"<@", "```id"} {
+	for _, forbidden := range []string{"Your cluster is ready.", "created<@U1>", "```id"} {
 		if strings.Contains(readyText, forbidden) {
 			t.Fatalf("ready notice leaked %q: %s", forbidden, readyText)
 		}

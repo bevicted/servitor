@@ -130,7 +130,7 @@ func statusNoticesAt(cluster *servitorv1alpha1.ServitorCluster, now time.Time) [
 		if cluster.Status.LeaseExpiresAt != nil {
 			expiry = cluster.Status.LeaseExpiresAt.Time
 		}
-		texts = readyNoticeTexts(cluster.Status.Ready, expiry, now)
+		texts = readyNoticeTexts(cluster.Spec.Slack.OwnerID, cluster.Status.Ready, expiry, now)
 	case servitorv1alpha1.PhaseCleanupComplete:
 		texts = []string{"Cleanup complete."}
 	case servitorv1alpha1.PhaseUnresolved:
@@ -378,7 +378,7 @@ func formatAddedDuration(added time.Duration) string {
 	}
 }
 
-func readyNoticeTexts(ready *servitorv1alpha1.ReadySummary, expiry, now time.Time) []string {
+func readyNoticeTexts(ownerID string, ready *servitorv1alpha1.ReadySummary, expiry, now time.Time) []string {
 	created, reused := make([][]string, 0), make([][]string, 0)
 	if ready != nil {
 		for _, resource := range ready.Resources {
@@ -391,7 +391,7 @@ func readyNoticeTexts(ready *servitorv1alpha1.ReadySummary, expiry, now time.Tim
 		}
 	}
 	header := []string{"Resource", "Name", "ID"}
-	texts := statusTableChunks("Your cluster is ready.\n\nCreated", header, created, "")
+	texts := statusTableChunks(fmt.Sprintf("<@%s> your request is complete.\n\nCreated", ownerID), header, created, "")
 	conclusion := "\nThis lease will expire at " + lifecycle.FormatLeaseExpiry(expiry, now) + ".\nUse `extend [N[h]]` in this thread or `@servitor extend [N[h]]` in the configured channel. Use `done` or `@servitor done` to release resources sooner."
 	return append(texts, statusTableChunks("Reused", header, reused, conclusion)...)
 }
