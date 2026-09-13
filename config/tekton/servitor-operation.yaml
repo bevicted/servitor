@@ -3,7 +3,6 @@ kind: Task
 metadata:
   name: servitor-operation
 spec:
-  timeout: 110m
   params:
     - { name: operation-id, type: string }
     - { name: operation-kind, type: string }
@@ -155,7 +154,7 @@ spec:
   tasks:
     - name: operation
       taskRef: { name: servitor-operation }
-      timeout: 115m
+      timeout: 110m
       params:
         - { name: operation-id, value: $(params.operation-id) }
         - { name: operation-kind, value: $(params.operation-kind) }
