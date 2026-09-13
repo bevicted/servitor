@@ -2,6 +2,7 @@ package command
 
 import (
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -98,6 +99,42 @@ func TestParseCreateOptionsNormalizesAssignments(t *testing.T) {
 	}
 	if got := options.Values(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("ParseCreateOptions(%q) = %#v\nwant %#v", text, got, want)
+	}
+}
+
+func TestParseCreateOptionsTreatsAuthAsServitorOnlyDeliveryIntent(t *testing.T) {
+	for _, text := range []string{"create auth version=4.22", "create auth=true version=4.22", "create auth=false version=4.22"} {
+		t.Run(text, func(t *testing.T) {
+			options, err := ParseCreateOptions(text)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := !strings.Contains(text, "auth=false")
+			if options.AuthRequested() != want || len(options.BareValues()) != 0 || len(options.Values()["--auth"]) != 0 {
+				t.Fatalf("options = %#v, auth=%t; want auth=%t without an inventory option", options, options.AuthRequested(), want)
+			}
+			request, err := ParseCreate(text, testCreateDefaults)
+			if err != nil || slices.Contains(request.Args, "--auth") {
+				t.Fatalf("request = %#v, err=%v; auth must not reach ICT argv", request, err)
+			}
+		})
+	}
+	for _, test := range []struct{ text, want string }{
+		{"create auth auth", "auth may only be supplied once"},
+		{"create auth auth=false", "auth may only be supplied once"},
+		{"create auth=false auth=true", "auth may only be supplied once"},
+		{"create auth=maybe", "auth must be true or false"},
+		{"create auth=", "auth must be true or false"},
+	} {
+		t.Run(test.text, func(t *testing.T) {
+			if _, err := ParseCreateOptions(test.text); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("ParseCreateOptions(%q) error = %v, want %q", test.text, err, test.want)
+			}
+		})
+	}
+	options, err := ParseCreateOptions("create resource-group=auth version=4.22")
+	if err != nil || options.AuthRequested() || options.Values()["--resource-group"][0] != "auth" {
+		t.Fatalf("explicit auth-named resource = %#v, %v", options, err)
 	}
 }
 

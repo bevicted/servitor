@@ -262,6 +262,7 @@ func (b Bot) create(ctx context.Context, message Message, text string, respond f
 		respond(rejectedText(err.Error()))
 		return true
 	}
+	authRequested := options.AuthRequested()
 	if b.Client == nil || b.Namespace == "" {
 		respond(rejectedText("Create is unavailable. Inspect the allocation CR status and private cluster logs."))
 		return true
@@ -278,6 +279,19 @@ func (b Bot) create(ctx context.Context, message Message, text string, respond f
 		respond(rejectedText("Unable to check an existing allocation. No operation was started."))
 		return false
 	}
+	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: b.Namespace}, Spec: servitorv1alpha1.ServitorClusterSpec{
+		Slack:       servitorv1alpha1.SlackIdentity{OwnerID: message.User, ChannelID: message.Channel, ThreadTimestamp: message.Timestamp},
+		UserOptions: userOptions,
+		Lifecycle:   servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: int64(b.lease() / time.Second), RetrySeconds: seconds(b.RetryIntervals)},
+	}}
+	publicAuthEligible := b.publicAuthEligible(cluster)
+	if authRequested && publicAuthEligible {
+		if _, _, valid := splitSlackTimestamp(message.Timestamp); !valid {
+			respond(rejectedText("Unable to record the authentication request."))
+			return true
+		}
+		cluster.Spec.Lifecycle.AuthRequestTimestamp = message.Timestamp
+	}
 	// Delivery precedes CR creation. A controller can therefore never begin
 	// planning an allocation the user was not told was accepted.
 	if b.Responder == nil {
@@ -288,11 +302,6 @@ func (b Bot) create(ctx context.Context, message Message, text string, respond f
 		b.logf("deliver create acceptance: %v", err)
 		return false
 	}
-	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: b.Namespace}, Spec: servitorv1alpha1.ServitorClusterSpec{
-		Slack:       servitorv1alpha1.SlackIdentity{OwnerID: message.User, ChannelID: message.Channel, ThreadTimestamp: message.Timestamp},
-		UserOptions: userOptions,
-		Lifecycle:   servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: int64(b.lease() / time.Second), RetrySeconds: seconds(b.RetryIntervals)},
-	}}
 	if err := b.Client.Create(ctx, cluster); err != nil {
 		if apierrors.IsAlreadyExists(err) {
 			if getErr := b.Client.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: name}, existing); getErr == nil {
@@ -303,6 +312,9 @@ func (b Bot) create(ctx context.Context, message Message, text string, respond f
 		b.logf("create allocation: %v", err)
 		respond(rejectedText("Unable to record the create request. No operation was started."))
 		return false
+	}
+	if authRequested && !publicAuthEligible {
+		respond("VPN-backed authentication is not implemented yet")
 	}
 	return true
 }
@@ -937,7 +949,7 @@ func helpOverview(maintainer bool) []string {
 	return []string{text + "```"}
 }
 func createHelp(defaults command.CreateDefaults) []string {
-	return []string{"`create` starts planning from the configured channel root. Configured defaults: version " + safeHelpCell(defaults.Version) + ", target " + safeHelpCell(defaults.Target) + ", provider " + safeHelpCell(defaults.Provider) + ". `provider=value` chooses infrastructure; version chooses Kubernetes or OpenShift. Cluster names are generated internally.\n\nSpecify options only as `key=value`. A current common-option inventory also recognizes unique bare values, for example `create target=synthetic-target vpc-gen2 us-south-1 bx2.4x16 resource-group=\"Platform Team\"`. Unknown or colliding shorthand must use a key such as `flavor=value`; worker counts and uncommon Satellite values stay keyed. Use `roks` (also `openshift` or `default_openshift`) for the cloud default OpenShift stream, or `iks` (also `kubernetes`, `k8s`, or `default_kubernetes`) for Kubernetes. A compatible numeric stream can refine an alias: `create roks 4.17`. These reserved aliases require a key when used as resource names.\n\nReview the resolved stream and configuration in its thread. The review prompt shows the persisted approval deadline; reply with exact `yes` or `no` before that deadline.", "Safe create options\n```\nCommon\n  target= provider= version= resource-group= worker-count=\n\nVPC Gen 2\n  zone= flavor= vpc-id= subnet-id= public-gateway-id=\n\nClassic\n  datacenter= machine-type= public-vlan-id= private-vlan-id=\n\nSatellite\n  satellite-zone= satellite-managed-from= satellite-location-id=\n  satellite-host-image= satellite-host-profile= satellite-ssh-key-id=\n  satellite-worker-instance-id= satellite-worker-operating-system=\n```"}
+	return []string{"`create` starts planning from the configured channel root. Configured defaults: version " + safeHelpCell(defaults.Version) + ", target " + safeHelpCell(defaults.Target) + ", provider " + safeHelpCell(defaults.Provider) + ". `provider=value` chooses infrastructure; version chooses Kubernetes or OpenShift. Cluster names are generated internally.\n\nSpecify provisioning options as `key=value`. A current common-option inventory also recognizes unique bare values, for example `create target=synthetic-target vpc-gen2 us-south-1 bx2.4x16 resource-group=\"Platform Team\"`. `auth`, `auth=true`, and `auth=false` control only public kubeconfig delivery; the default is no delivery. Public `auth` queues one owner-DM delivery after Ready. Private-only and Satellite auth opt-ins continue creating the cluster but report that VPN-backed authentication is not implemented yet. Unknown or colliding shorthand must use a key such as `flavor=value`; worker counts and uncommon Satellite values stay keyed. Use `roks` (also `openshift` or `default_openshift`) for the cloud default OpenShift stream, or `iks` (also `kubernetes`, `k8s`, or `default_kubernetes`) for Kubernetes. A compatible numeric stream can refine an alias: `create roks 4.17`. These reserved aliases require a key when used as resource names.\n\nReview the resolved stream and configuration in its thread. The review prompt shows the persisted approval deadline; reply with exact `yes` or `no` before that deadline.", "Safe create options\n```\nCommon\n  target= provider= version= resource-group= worker-count=\n  auth | auth=true | auth=false (public delivery only)\n\nVPC Gen 2\n  zone= flavor= vpc-id= subnet-id= public-gateway-id=\n\nClassic\n  datacenter= machine-type= public-vlan-id= private-vlan-id=\n\nSatellite\n  satellite-zone= satellite-managed-from= satellite-location-id=\n  satellite-host-image= satellite-host-profile= satellite-ssh-key-id=\n  satellite-worker-instance-id= satellite-worker-operating-system=\n```"}
 }
 func safeHelpCell(value string) string {
 	value = strings.Map(func(character rune) rune {

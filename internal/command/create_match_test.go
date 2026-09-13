@@ -36,6 +36,21 @@ func TestBareValuesResolveSelectorsBeforeOrderIndependentLocationMatching(t *tes
 	}
 }
 
+func TestAuthIsConsumedBeforeInventoryMatching(t *testing.T) {
+	options, err := ParseCreateOptions("create auth bx2.4x16 Platform\\ Team vpc-gen2 us-south-1 target-a version=4.22")
+	if err != nil {
+		t.Fatal(err)
+	}
+	options, _, err = ResolveBareSelectors(options, matchDefaults, map[string]inventory.TargetConfig{"target-a": {Providers: []string{"vpc-gen2", "classic", "satellite"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	options, err = MatchBareCreateOptions(options, matchDefaults, matchCatalog)
+	if err != nil || !options.AuthRequested() || len(options.Values()["--auth"]) != 0 {
+		t.Fatalf("matched options = %#v, auth=%t, err=%v", options, options.AuthRequested(), err)
+	}
+}
+
 func TestBareValuesRequireOneExactRoleAndCurrentInventory(t *testing.T) {
 	targets := map[string]inventory.TargetConfig{"target-a": {Providers: []string{"vpc-gen2", "classic", "satellite"}}}
 	for _, test := range []struct{ text, want string }{

@@ -82,6 +82,68 @@ func TestCreateAcknowledgesBeforeCreatingOneDeterministicCluster(t *testing.T) {
 		t.Fatalf("clusters=%d", len(clusters.Items))
 	}
 }
+func TestCreateAuthOptInQueuesOnlyEligiblePublicRequests(t *testing.T) {
+	for _, test := range []struct {
+		name, text, target, provider string
+		public                       bool
+		wantIntent                   bool
+		unsupported                  bool
+	}{
+		{name: "public bare", text: "auth", target: "public", provider: "vpc-gen2", public: true, wantIntent: true},
+		{name: "public assignment", text: "auth=true", target: "public", provider: "vpc-gen2", public: true, wantIntent: true},
+		{name: "public disabled", text: "auth=false", target: "public", provider: "vpc-gen2", public: true},
+		{name: "public ordinary", text: "version=4.22", target: "public", provider: "vpc-gen2", public: true},
+		{name: "private", text: "auth", target: "private", provider: "vpc-gen2", unsupported: true},
+		{name: "satellite", text: "auth=true", target: "public", provider: "satellite", public: true, unsupported: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			bot, responses := botForTest(t)
+			bot.Defaults = command.CreateDefaults{Target: test.target, Provider: test.provider}
+			if test.public {
+				bot.PublicAuthTargets = []string{"public"}
+			}
+			event := Envelope{ID: "create-" + test.name, Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "<@BOT> create " + test.text, Timestamp: "1710000000.000100"}}
+			if err := bot.Handle(context.Background(), event); err != nil {
+				t.Fatal(err)
+			}
+			stored := &servitorv1alpha1.ServitorCluster{}
+			key := types.NamespacedName{Namespace: "servitor", Name: ownerClusterName("U1")}
+			if err := bot.Client.Get(context.Background(), key, stored); err != nil {
+				t.Fatal(err)
+			}
+			wantTimestamp := ""
+			if test.wantIntent {
+				wantTimestamp = event.Message.Timestamp
+			}
+			if stored.Spec.Lifecycle.AuthRequestTimestamp != wantTimestamp {
+				t.Fatalf("auth intent = %q, want %q", stored.Spec.Lifecycle.AuthRequestTimestamp, wantTimestamp)
+			}
+			if len(responses.responses) == 0 || responses.responses[0].Text != "Planning..." {
+				t.Fatalf("create response = %+v", responses.responses)
+			}
+			if test.unsupported {
+				if len(responses.responses) != 2 || responses.responses[1].Text != "VPN-backed authentication is not implemented yet" {
+					t.Fatalf("private or Satellite auth response = %+v", responses.responses)
+				}
+			} else if len(responses.responses) != 1 {
+				t.Fatalf("unexpected auth create response = %+v", responses.responses)
+			}
+			if err := bot.Handle(context.Background(), event); err != nil {
+				t.Fatal(err)
+			}
+			if err := bot.Handle(context.Background(), Envelope{ID: "repeat-" + test.name, Message: event.Message}); err != nil {
+				t.Fatal(err)
+			}
+			if err := bot.Client.Get(context.Background(), key, stored); err != nil {
+				t.Fatal(err)
+			}
+			if stored.Spec.Lifecycle.AuthRequestTimestamp != wantTimestamp {
+				t.Fatalf("repeat create changed auth intent to %q", stored.Spec.Lifecycle.AuthRequestTimestamp)
+			}
+		})
+	}
+}
+
 func TestHandleCreateNormalizesAssignmentsWithoutDefaults(t *testing.T) {
 	want := servitorv1alpha1.UserOptions{
 		Target: "synthetic-target", Version: "4.22", ResourceGroup: "Platform Team=Core", WorkerCount: 3,
@@ -119,6 +181,25 @@ func TestHandleCreateRejectsInvalidWorkerCountWithoutAllocation(t *testing.T) {
 			cluster := &servitorv1alpha1.ServitorCluster{}
 			if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: ownerClusterName("U1")}, cluster); err == nil {
 				t.Fatal("invalid worker count recorded an allocation")
+			}
+		})
+	}
+}
+
+func TestCreateRejectsInvalidAuthOptionsWithoutAllocation(t *testing.T) {
+	for _, text := range []string{"auth=maybe", "auth auth=true", "auth=false auth"} {
+		t.Run(text, func(t *testing.T) {
+			bot, responses := botForTest(t)
+			event := Envelope{ID: "invalid-" + text, Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "<@BOT> create " + text, Timestamp: "1710000000.000100"}}
+			if err := bot.Handle(context.Background(), event); err != nil {
+				t.Fatal(err)
+			}
+			if len(responses.responses) != 1 || !containsText(responses.responses[0].Text, "auth") {
+				t.Fatalf("responses = %+v", responses.responses)
+			}
+			cluster := &servitorv1alpha1.ServitorCluster{}
+			if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: ownerClusterName("U1")}, cluster); !apierrors.IsNotFound(err) {
+				t.Fatalf("invalid auth create recorded allocation: %v", err)
 			}
 		})
 	}
@@ -666,12 +747,12 @@ func TestCreateRejectsPlatformAndHelpDoesNotAdvertiseIt(t *testing.T) {
 
 func TestCreateHelpDistinguishesDefaultsAliasesStreamsAndProvider(t *testing.T) {
 	help := strings.Join(createHelp(command.CreateDefaults{}), "\n")
-	for _, wanted := range []string{"Configured defaults", "provider=", "key=value", "target=synthetic-target", "resource-group=\"Platform Team\"", "roks", "iks", "k8s", "default_openshift", "default_kubernetes", "4.17"} {
+	for _, wanted := range []string{"Configured defaults", "provider=", "key=value", "target=synthetic-target", "resource-group=\"Platform Team\"", "auth=true", "auth=false", "Public `auth`", "Private-only and Satellite", "roks", "iks", "k8s", "default_openshift", "default_kubernetes", "4.17"} {
 		if !containsText(help, wanted) {
 			t.Fatalf("create help missing %q: %s", wanted, help)
 		}
 	}
-	for _, forbidden := range []string{"--key=value", "--key value", "--provider"} {
+	for _, forbidden := range []string{"--key=value", "--key value", "--provider", "config="} {
 		if containsText(help, forbidden) {
 			t.Fatalf("create help advertises unsupported form %q: %s", forbidden, help)
 		}

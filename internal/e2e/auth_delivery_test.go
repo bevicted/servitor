@@ -10,6 +10,7 @@ import (
 	"time"
 
 	servitorv1alpha1 "github.com/bevicted/servitor/api/v1alpha1"
+	"github.com/bevicted/servitor/internal/command"
 	"github.com/bevicted/servitor/internal/controller"
 	"github.com/bevicted/servitor/internal/pipeline"
 	"github.com/bevicted/servitor/internal/slackbot"
@@ -20,7 +21,9 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
 type replies struct{ values []slackbot.Response }
@@ -28,6 +31,80 @@ type replies struct{ values []slackbot.Response }
 func (r *replies) Reply(_ context.Context, response slackbot.Response) error {
 	r.values = append(r.values, response)
 	return nil
+}
+
+type deliveryCounter struct{ calls int }
+
+func (d *deliveryCounter) DeliverKubeconfig(_ context.Context, _, _ string, _ []byte) error {
+	d.calls++
+	return nil
+}
+
+func TestCreateAuthOptInDrivesOneReadyDelivery(t *testing.T) {
+	now := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := servitorv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name, text string
+		wantCalls  int
+	}{
+		{name: "opt-in", text: "auth", wantCalls: 1},
+		{name: "ordinary", text: "version=4.22", wantCalls: 0},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			kube := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&servitorv1alpha1.ServitorCluster{}).WithInterceptorFuncs(interceptor.Funcs{Create: func(ctx context.Context, underlying client.WithWatch, object client.Object, options ...client.CreateOption) error {
+				if cluster, ok := object.(*servitorv1alpha1.ServitorCluster); ok {
+					cluster.UID = "allocation-uid"
+				}
+				return underlying.Create(ctx, object, options...)
+			}}).Build()
+			responses := &replies{}
+			bot := slackbot.Bot{ChannelID: "C1", SelfUserID: "BOT", Namespace: "ns", Client: kube, Events: state.NewEventStore(kube, "ns"), Responder: responses, Defaults: command.CreateDefaults{Target: "public", Provider: "vpc-gen2"}, PublicAuthTargets: []string{"public"}}
+			event := slackbot.Envelope{ID: test.name, Message: slackbot.Message{Channel: "C1", ChannelType: "channel", User: test.name, Text: "<@BOT> create " + test.text, Timestamp: "1710000000.000100"}}
+			if err := bot.Handle(context.Background(), event); err != nil {
+				t.Fatal(err)
+			}
+			var clusters servitorv1alpha1.ServitorClusterList
+			if err := kube.List(context.Background(), &clusters); err != nil {
+				t.Fatal(err)
+			}
+			cluster := &servitorv1alpha1.ServitorCluster{}
+			for index := range clusters.Items {
+				if clusters.Items[index].Spec.Slack.OwnerID == test.name {
+					cluster = clusters.Items[index].DeepCopy()
+					break
+				}
+			}
+			if cluster.Name == "" {
+				t.Fatal("create did not record the allocation")
+			}
+			key := types.NamespacedName{Namespace: cluster.Namespace, Name: cluster.Name}
+			cluster.Status = servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseReady, LifecycleSnapshot: &servitorv1alpha1.LifecycleSnapshot{InitialLeaseSeconds: cluster.Spec.Lifecycle.InitialLeaseSeconds, RetrySeconds: cluster.Spec.Lifecycle.RetrySeconds, PublicAuthEligible: true}, PublicAuth: &servitorv1alpha1.PublicAuthStatus{Availability: "available"}, ResolvedOptions: &servitorv1alpha1.ResolvedOptions{ClusterName: "example-cluster"}, LeaseExpiresAt: &metav1.Time{Time: now.Add(time.Hour)}}
+			if err := kube.Status().Update(context.Background(), cluster); err != nil {
+				t.Fatal(err)
+			}
+			secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: pipeline.AuthResourceName(string(cluster.UID)), Namespace: "ns", Labels: map[string]string{"servitor.bevicted.github.io/auth-uid": string(cluster.UID)}, Annotations: map[string]string{"servitor.bevicted.github.io/auth-operation": "apply-bb82212777bdc1b9"}}, Data: map[string][]byte{"kubeconfig.yaml": []byte("synthetic-kubeconfig")}}
+			if err := kube.Create(context.Background(), secret); err != nil {
+				t.Fatal(err)
+			}
+			delivery := &deliveryCounter{}
+			reconciler := &controller.Reconciler{Client: kube, SecretReader: kube, AuthDelivery: delivery, Config: controller.Config{Namespace: "ns"}, Now: func() time.Time { return now }}
+			request := ctrl.Request{NamespacedName: key}
+			for range 3 {
+				if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if delivery.calls != test.wantCalls {
+				t.Fatalf("delivery calls = %d, want %d", delivery.calls, test.wantCalls)
+			}
+		})
+	}
 }
 
 func TestOwnerThreadAuthDrivesControllerAndExternalDMUpload(t *testing.T) {
