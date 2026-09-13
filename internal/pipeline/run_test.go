@@ -56,8 +56,8 @@ func TestNewPlanningRunSerializesICTBackendConfig(t *testing.T) {
 	if run.Spec.Timeouts == nil || run.Spec.Timeouts.Pipeline == nil || run.Spec.Timeouts.Tasks == nil || run.Spec.Timeouts.Pipeline.Duration != 100*time.Minute || run.Spec.Timeouts.Tasks.Duration != 95*time.Minute {
 		t.Fatalf("PipelineRun timeouts = %#v, want 100m pipeline and 95m tasks", run.Spec.Timeouts)
 	}
-	if run.Spec.TaskRunTemplate.ServiceAccountName != "servitor-task" || run.Spec.TaskRunTemplate.PodTemplate != nil {
-		t.Fatalf("PipelineRun task security = %#v, want servitor-task without a fixed pod security context", run.Spec.TaskRunTemplate)
+	if run.Spec.TaskRunTemplate.ServiceAccountName != "servitor-task" || run.Spec.TaskRunTemplate.PodTemplate == nil || run.Spec.TaskRunTemplate.PodTemplate.AutomountServiceAccountToken == nil || *run.Spec.TaskRunTemplate.PodTemplate.AutomountServiceAccountToken {
+		t.Fatalf("PipelineRun task security = %#v, want servitor-task with automatic token mounting disabled", run.Spec.TaskRunTemplate)
 	}
 	for name, want := range map[string]string{"ict-config-map": testTaskConfig.ICTConfigMap, "ict-config-key": testTaskConfig.ICTConfigKey, "cos-secret": testTaskConfig.COSSecret, "ibm-secret": testTaskConfig.IBMSecret} {
 		if got := params[name]; got != want {

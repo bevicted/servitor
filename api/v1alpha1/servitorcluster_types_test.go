@@ -64,6 +64,15 @@ func TestServitorClusterDeepCopyPreservesLeaseStatus(t *testing.T) {
 	}
 }
 
+func TestServitorClusterDeepCopyDoesNotAliasPublicAuth(t *testing.T) {
+	cluster := &ServitorCluster{Status: ServitorClusterStatus{PublicAuth: &PublicAuthStatus{Availability: "unavailable"}}}
+	copy := cluster.DeepCopy()
+	copy.Status.PublicAuth.Availability = "available"
+	if cluster.Status.PublicAuth.Availability != "unavailable" {
+		t.Fatal("DeepCopy() aliases public auth status")
+	}
+}
+
 func TestServitorClusterDeepCopyDoesNotAliasPlanRejection(t *testing.T) {
 	cluster := &ServitorCluster{Status: ServitorClusterStatus{PlanRejection: &PlanRejection{ReasonCode: "version_not_supported", OptionKey: "version"}}}
 	copy := cluster.DeepCopy()
@@ -84,6 +93,33 @@ func TestServitorClusterDeepCopyDoesNotAliasSummaryActions(t *testing.T) {
 	if cluster.Status.Review.Resources[0].Actions[0] != "create" || cluster.Status.Ready.Resources[0].Actions[0] != "read" {
 		t.Fatalf("DeepCopy() aliases summary actions: %+v", cluster.Status)
 	}
+}
+
+func TestServitorClusterCRDDefinesBoundedPublicAuthAvailability(t *testing.T) {
+	contents, err := os.ReadFile(filepath.Join("..", "..", "config", "crd", "bases", "servitor.bevicted.github.io_servitorclusters.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	document := make(map[string]any)
+	if err := yaml.Unmarshal(contents, &document); err != nil {
+		t.Fatal(err)
+	}
+	versions := yamlList(t, yamlMap(t, document["spec"])["versions"])
+	for _, value := range versions {
+		version := yamlMap(t, value)
+		if version["name"] != "v1alpha1" {
+			continue
+		}
+		properties := yamlMap(t, yamlMap(t, yamlMap(t, version["schema"])["openAPIV3Schema"])["properties"])
+		status := yamlMap(t, properties["status"])
+		publicAuth := yamlMap(t, yamlMap(t, status["properties"])["publicAuth"])
+		availability := yamlMap(t, yamlMap(t, publicAuth["properties"])["availability"])
+		if availability["type"] != "string" {
+			t.Fatalf("public auth availability schema = %#v", availability)
+		}
+		return
+	}
+	t.Fatal("v1alpha1 CRD version not found")
 }
 
 func TestServitorClusterCRDReadyResourcesIncludesActions(t *testing.T) {

@@ -31,25 +31,28 @@ const cleanupNotificationGrace = 10 * time.Second
 
 // Config values are loaded once at manager startup. Existing status snapshots always win.
 type Config struct {
-	Namespace        string
-	Defaults         servitorv1alpha1.ResolvedOptions
-	Backend          servitorv1alpha1.BackendIdentity
-	BackendPrefix    string
-	ExecutionImage   string
-	TaskConfig       pipeline.TaskConfig
-	ReviewTimeout    time.Duration
-	OpenShiftFlavor  string
-	KubernetesFlavor string
+	Namespace         string
+	Defaults          servitorv1alpha1.ResolvedOptions
+	Backend           servitorv1alpha1.BackendIdentity
+	BackendPrefix     string
+	ExecutionImage    string
+	TaskConfig        pipeline.TaskConfig
+	ReviewTimeout     time.Duration
+	OpenShiftFlavor   string
+	KubernetesFlavor  string
+	PublicAuthTargets []string
 }
 
 // Reconciler is the sole status writer for ServitorCluster.
 type Reconciler struct {
 	client.Client
-	Scheme   *runtime.Scheme
-	Config   Config
-	Logs     pipeline.LogReader
-	Now      func() time.Time
-	LogRetry time.Duration
+	Scheme *runtime.Scheme
+	Config Config
+	Logs   pipeline.LogReader
+	// SecretReader bypasses the manager cache for credential-bearing Secrets.
+	SecretReader client.Reader
+	Now          func() time.Time
+	LogRetry     time.Duration
 }
 
 // +kubebuilder:rbac:groups=servitor.bevicted.github.io,resources=servitorclusters,verbs=get;list;watch;create;update;patch;delete
@@ -60,6 +63,8 @@ type Reconciler struct {
 // +kubebuilder:rbac:groups="",resources=pods/log,verbs=get
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
+// +kubebuilder:rbac:groups="",resources=secrets;serviceaccounts,verbs=get;create;delete
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles;rolebindings,verbs=get;create;delete
 func (r *Reconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.Result, error) {
 	if r.Config.Namespace != "" && request.Namespace != r.Config.Namespace {
 		return ctrl.Result{}, nil
@@ -228,6 +233,9 @@ func (r *Reconciler) reconcileApproval(ctx context.Context, cluster *servitorv1a
 			return ctrl.Result{RequeueAfter: deadline.Time.Sub(r.now())}, nil
 		}
 		operation := applyID(string(cluster.UID))
+		if err := r.ensureAuthPublicationResources(ctx, cluster, operation); err != nil {
+			return ctrl.Result{}, err
+		}
 		cluster.Status.Operation = &servitorv1alpha1.OperationReference{ID: operation, Kind: "apply", PipelineRunName: pipeline.DeterministicRunName(string(cluster.UID), operation), StartedAt: metav1.NewTime(r.now())}
 		// Persist this before run creation: a lost create response must be treated as
 		// an apply that may have reached Terraform.
@@ -272,6 +280,9 @@ func (r *Reconciler) reconcileCleanup(ctx context.Context, cluster *servitorv1al
 	}
 	if cluster.Status.Phase == servitorv1alpha1.PhaseUnresolved {
 		return ctrl.Result{}, nil
+	}
+	if err := r.revokeAuthPublication(ctx, cluster); err != nil {
+		return ctrl.Result{}, err
 	}
 	if cleanup.NextRetryAt != nil && r.now().Before(cleanup.NextRetryAt.Time) {
 		return ctrl.Result{RequeueAfter: cleanup.NextRetryAt.Time.Sub(r.now())}, nil
@@ -401,6 +412,9 @@ func (r *Reconciler) recordDestroyFailure(ctx context.Context, cluster *servitor
 
 func (r *Reconciler) completeCleanup(ctx context.Context, cluster *servitorv1alpha1.ServitorCluster) (ctrl.Result, error) {
 	if err := r.deleteTerminalOperationRuns(ctx, cluster); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := r.removeAuthPublisher(ctx, cluster); err != nil {
 		return ctrl.Result{}, err
 	}
 	now := metav1.NewTime(r.now())
@@ -545,7 +559,12 @@ func (r *Reconciler) adoptReport(ctx context.Context, cluster *servitorv1alpha1.
 		cluster.Status.ReviewApproval = cluster.Spec.Lifecycle.Approval
 		setCondition(cluster, "PlanningSucceeded", metav1.ConditionTrue, "ReportAdopted", "validated planning report adopted")
 	} else {
+		eligible := cluster.Status.LifecycleSnapshot != nil && cluster.Status.LifecycleSnapshot.PublicAuthEligible
+		if eligible != (report.PublicAuth != nil) {
+			return r.unresolved(ctx, cluster, "InvalidReport", errors.New("public auth report does not match the frozen eligibility policy"))
+		}
 		cluster.Status.Ready = &report.Ready
+		cluster.Status.PublicAuth = report.PublicAuth
 		cluster.Status.Phase = servitorv1alpha1.PhaseReady
 		// This is the sole Ready transition. Never recompute this persisted
 		// deadline during report adoption or later duplicate reconciles.
@@ -584,6 +603,7 @@ func (r *Reconciler) snapshot(cluster *servitorv1alpha1.ServitorCluster) error {
 	cluster.Status.LifecycleSnapshot = &servitorv1alpha1.LifecycleSnapshot{
 		InitialLeaseSeconds: cluster.Spec.Lifecycle.InitialLeaseSeconds,
 		RetrySeconds:        append([]int64(nil), cluster.Spec.Lifecycle.RetrySeconds...),
+		PublicAuthEligible:  resolved.Provider != "satellite" && contains(r.Config.PublicAuthTargets, resolved.Target),
 	}
 	backend := r.Config.Backend
 	if backend.Key == "" {

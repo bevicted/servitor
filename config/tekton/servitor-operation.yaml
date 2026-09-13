@@ -3,6 +3,7 @@ kind: Task
 metadata:
   name: servitor-operation
 spec:
+  timeout: 110m
   params:
     - { name: operation-id, type: string }
     - { name: operation-kind, type: string }
@@ -15,6 +16,8 @@ spec:
     - { name: ict-config-key, type: string }
     - { name: cos-secret, type: string }
     - { name: ibm-secret, type: string }
+    - { name: public-auth-eligible, type: string }
+    - { name: auth-secret, type: string }
   stepTemplate:
     env:
       - name: HOME
@@ -30,6 +33,20 @@ spec:
       emptyDir: {}
     - name: tmp
       emptyDir: {}
+    - name: auth-data
+      emptyDir: { medium: Memory }
+    - name: publisher-token
+      projected:
+        sources:
+          - serviceAccountToken:
+              {
+                path: token,
+                audience: https://kubernetes.default.svc,
+                expirationSeconds: 3600,
+              }
+          - configMap:
+              name: kube-root-ca.crt
+              items: [{ key: ca.crt, path: ca.crt }]
     - name: ict-config
       configMap:
         name: $(params.ict-config-map)
@@ -63,6 +80,11 @@ spec:
         - /operation/ict-result.json
         - -report
         - /operation/report.json
+        - -public-auth-eligible=$(params.public-auth-eligible)
+        - -auth-manifest
+        - /auth/manifest.json
+        - -auth-output-dir
+        - /auth
         - -planning-inventory-config
         - /etc/servitor/ict/config.yaml
       env:
@@ -76,7 +98,35 @@ spec:
       volumeMounts:
         - { name: operation-data, mountPath: /operation }
         - { name: tmp, mountPath: /tmp }
+        - { name: auth-data, mountPath: /auth }
         - { name: ict-config, mountPath: /etc/servitor/ict, readOnly: true }
+    - name: publish
+      image: $(params.execution-image)
+      command: ["/usr/local/bin/servitor-task"]
+      args:
+        - -publish-auth
+        - -cluster-uid
+        - $(params.cluster-uid)
+        - -operation-id
+        - $(params.operation-id)
+        - -publish-auth-secret
+        - $(params.auth-secret)
+        - -auth-manifest
+        - /auth/manifest.json
+        - -auth-output-dir
+        - /auth
+        - -report
+        - /operation/report.json
+        - -publisher-namespace
+        - $(context.taskRun.namespace)
+        - -publisher-token
+        - /publisher/token
+        - -publisher-ca
+        - /publisher/ca.crt
+      volumeMounts:
+        - { name: operation-data, mountPath: /operation }
+        - { name: auth-data, mountPath: /auth }
+        - { name: publisher-token, mountPath: /publisher, readOnly: true }
     - name: report
       image: $(params.execution-image)
       command: ["/usr/local/bin/servitor-task"]
@@ -100,10 +150,12 @@ spec:
     - { name: ict-config-key, type: string }
     - { name: cos-secret, type: string }
     - { name: ibm-secret, type: string }
+    - { name: public-auth-eligible, type: string }
+    - { name: auth-secret, type: string }
   tasks:
     - name: operation
       taskRef: { name: servitor-operation }
-      timeout: 95m
+      timeout: 115m
       params:
         - { name: operation-id, value: $(params.operation-id) }
         - { name: operation-kind, value: $(params.operation-kind) }
@@ -116,3 +168,5 @@ spec:
         - { name: ict-config-key, value: $(params.ict-config-key) }
         - { name: cos-secret, value: $(params.cos-secret) }
         - { name: ibm-secret, value: $(params.ibm-secret) }
+        - { name: public-auth-eligible, value: $(params.public-auth-eligible) }
+        - { name: auth-secret, value: $(params.auth-secret) }

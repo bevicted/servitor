@@ -30,6 +30,14 @@ Copy `config.example.yaml` to the ConfigMap input used by `config/default`. It c
 
 The manager reads its mounted configuration from `/etc/servitor/config/config.yaml`; `-config PATH` or `SERVITOR_CONFIG` can select another mounted path. The controller receives the Slack Secret only. Tekton execution receives COS HMAC and IBM credentials from namespace Secrets; the report step receives neither. The task service account has no CR or status write permissions.
 
+## Public kubeconfig publication
+
+Phase 1 can store a complete public admin kubeconfig for a configured `auth.public_targets` target when the allocation is non-Satellite. Eligibility is frozen with the allocation, so later configuration changes cannot redirect publication. Before apply, the controller creates a UID-bound Secret and a dedicated publisher ServiceAccount, Role, and RoleBinding. That Role is limited to `get`, `update`, and `patch` on its one Secret; it cannot create, list, or access another Secret.
+
+Task pods disable automatic ServiceAccount token mounting. The IBM/COS credential-bearing execute step writes the optional kubeconfig only to a memory-backed task volume. The credential-free publish step alone receives a short-lived projected Kubernetes token and atomically updates the allocation Secret after validating the self-contained kubeconfig-only artifact. The report step receives neither the auth volume nor a Kubernetes token. Publication failures and missing or malformed artifacts are recorded only as safe availability metadata and do not prevent a successful infrastructure apply from reaching Ready.
+
+Private-only and Satellite auth publication is deferred. Phase 1 does not send Slack files or messages. Cleanup removes the publisher binding and Secret before waiting for in-flight work, then removes the publisher Role and ServiceAccount, preventing a late publisher from recreating data.
+
 ## Private inventory export
 
 `servitor-inventory` is a private internal Tekton Pipeline for the configured target's common create options. The leader starts discovery when a target has no snapshot, then refreshes each target hourly by default. It persists target run identity, deadlines, last-good catalog, and configuration revision in namespaced ConfigMaps, so a replacement leader adopts a stored run instead of creating a duplicate. Target changes or removal immediately invalidate matching data; stale results for an earlier revision are ignored.

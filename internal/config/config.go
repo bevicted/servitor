@@ -31,6 +31,7 @@ type Config struct {
 	Defaults  DefaultsConfig  `yaml:"defaults"`
 	Lifecycle LifecycleConfig `yaml:"lifecycle"`
 	Inventory InventoryConfig `yaml:"inventory"`
+	Auth      AuthConfig      `yaml:"auth"`
 	ICT       ICTConfig       `yaml:"ict"`
 	COS       COSConfig       `yaml:"cos"`
 	Images    ImagesConfig    `yaml:"images"`
@@ -63,6 +64,12 @@ type LifecycleConfig struct {
 type InventoryConfig struct {
 	RefreshInterval time.Duration `yaml:"refresh_interval"`
 	MaximumAge      time.Duration `yaml:"maximum_age"`
+}
+
+// AuthConfig contains non-secret eligibility policy. Targets omitted here do not
+// receive Phase 1 public kubeconfig acquisition or publication.
+type AuthConfig struct {
+	PublicTargets []string `yaml:"public_targets"`
 }
 
 const (
@@ -201,6 +208,16 @@ func (c Config) Validate() error {
 		}
 		maintainers[id] = struct{}{}
 	}
+	publicTargets := make(map[string]struct{}, len(c.Auth.PublicTargets))
+	for _, target := range c.Auth.PublicTargets {
+		if err := requiredDNSLabel("auth.public_targets", target); err != nil {
+			return err
+		}
+		if _, duplicate := publicTargets[target]; duplicate {
+			return errors.New("config: auth.public_targets contains a duplicate target")
+		}
+		publicTargets[target] = struct{}{}
+	}
 	for _, field := range []struct{ name, value string }{
 		{"ict.target_config_map", c.ICT.TargetConfigMap},
 		{"secrets.slack", c.Secrets.Slack},
@@ -283,6 +300,16 @@ func (c Config) InventoryMaximumAge() time.Duration {
 		return c.Inventory.MaximumAge
 	}
 	return DefaultInventoryMaximumAge
+}
+
+// PublicAuthEligible reports whether this configured target permits Phase 1 public auth.
+func (c Config) PublicAuthEligible(target string) bool {
+	for _, configured := range c.Auth.PublicTargets {
+		if configured == target {
+			return true
+		}
+	}
+	return false
 }
 
 func validCOSEndpoint(value string) bool {

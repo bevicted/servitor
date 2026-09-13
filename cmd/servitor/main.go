@@ -74,7 +74,7 @@ func main() {
 	}
 	logs := controller.NewPodLogReader(kubernetes.NewForConfigOrDie(restConfig))
 	reconciler := &controller.Reconciler{
-		Client: manager.GetClient(), Scheme: manager.GetScheme(), Logs: logs, Config: controllerSettings,
+		Client: manager.GetClient(), SecretReader: manager.GetAPIReader(), Scheme: manager.GetScheme(), Logs: logs, Config: controllerSettings,
 	}
 	if err := reconciler.SetupWithManager(manager); err != nil {
 		fail(fmt.Errorf("configure controller: %w", err))
@@ -131,6 +131,7 @@ func controllerConfig(operator config.Config) (controller.Config, error) {
 		},
 		ReviewTimeout:   operator.Lifecycle.ConfirmationTimeout,
 		OpenShiftFlavor: operator.Defaults.OpenShiftFlavor, KubernetesFlavor: operator.Defaults.KubernetesFlavor,
+		PublicAuthTargets: append([]string(nil), operator.Auth.PublicTargets...),
 	}, nil
 }
 

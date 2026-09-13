@@ -251,6 +251,7 @@ spec:
                         maxItems: 8,
                         items: { type: integer, minimum: 1, maximum: 86400 },
                       }
+                    publicAuthEligible: { type: boolean }
                 backend:
                   type: object
                   properties:
@@ -307,6 +308,12 @@ spec:
                           },
                       },
                   }
+                publicAuth:
+                  type: object
+                  required: [availability]
+                  properties:
+                    availability:
+                      { type: string, enum: [available, unavailable] }
                 recovery:
                   type: object
                   properties:

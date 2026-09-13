@@ -27,6 +27,10 @@ lifecycle:
 inventory:
   refresh_interval: 1h
   maximum_age: 24h
+# Phase 1 public kubeconfig publication is opt-in per configured public target.
+# Targets not listed here, and all Satellite allocations, receive no auth Secret.
+auth:
+  public_targets: []
 ict:
   target_config_map: servitor-ict-config
   target_config_key: config.yaml

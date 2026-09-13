@@ -51,6 +51,22 @@ func TestValidateMaintainerIDsAreOptionalExactValues(t *testing.T) {
 	}
 }
 
+func TestValidateRejectsDuplicateOrInvalidPublicAuthTargets(t *testing.T) {
+	configuration := validConfig()
+	configuration.Auth.PublicTargets = []string{"public-target"}
+	if err := configuration.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+	configuration.Auth.PublicTargets = []string{"public-target", "public-target"}
+	if err := configuration.Validate(); err == nil {
+		t.Fatal("Validate accepted duplicate public auth target")
+	}
+	configuration.Auth.PublicTargets = []string{"not_a_target"}
+	if err := configuration.Validate(); err == nil {
+		t.Fatal("Validate accepted invalid public auth target")
+	}
+}
+
 func TestValidateRejectsCloudDefaultVersionAliases(t *testing.T) {
 	for _, alias := range []string{"default_openshift", "default_kubernetes"} {
 		configuration := validConfig()

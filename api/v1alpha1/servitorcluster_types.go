@@ -89,6 +89,13 @@ type ResolvedOptions struct {
 type LifecycleSnapshot struct {
 	InitialLeaseSeconds int64   `json:"initialLeaseSeconds"`
 	RetrySeconds        []int64 `json:"retrySeconds"`
+	// PublicAuthEligible freezes the non-secret public-access policy selected at creation.
+	PublicAuthEligible bool `json:"publicAuthEligible,omitempty"`
+}
+
+// PublicAuthStatus is the bounded, credential-free result of public kubeconfig publication.
+type PublicAuthStatus struct {
+	Availability string `json:"availability"`
 }
 
 // BackendIdentity identifies remote Terraform state without credentials.
@@ -403,6 +410,7 @@ type ServitorClusterStatus struct {
 	ReviewGeneration int64                 `json:"reviewGeneration,omitempty"`
 	ReviewApproval   string                `json:"reviewApproval,omitempty"`
 	Ready            *ReadySummary         `json:"ready,omitempty"`
+	PublicAuth       *PublicAuthStatus     `json:"publicAuth,omitempty"`
 	LeaseExpiresAt   *metav1.Time          `json:"leaseExpiresAt,omitempty"`
 	LeaseExtension   *LeaseExtensionStatus `json:"leaseExtension,omitempty"`
 	ApplyDispatched  bool                  `json:"applyDispatched,omitempty"`
@@ -563,6 +571,10 @@ func (in *ServitorClusterStatus) DeepCopy() *ServitorClusterStatus {
 			v.Resources[index].Actions = append([]string(nil), v.Resources[index].Actions...)
 		}
 		out.Ready = &v
+	}
+	if in.PublicAuth != nil {
+		v := *in.PublicAuth
+		out.PublicAuth = &v
 	}
 	if in.ReviewDeadline != nil {
 		out.ReviewDeadline = in.ReviewDeadline.DeepCopy()

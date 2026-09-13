@@ -114,7 +114,7 @@ func NewInventoryRun(namespace, image, target, runID, revision string, taskConfi
 				{Name: "ict-config-key", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: taskConfig.ICTConfigKey}},
 				{Name: "ibm-secret", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: taskConfig.IBMSecret}},
 			},
-			TaskRunTemplate: operationTaskRunTemplate(),
+			TaskRunTemplate: operationTaskRunTemplate("", false),
 			Timeouts:        &tektonv1.TimeoutFields{Pipeline: &metav1.Duration{Duration: InventoryRunTimeout}, Tasks: &metav1.Duration{Duration: 14 * time.Minute}},
 		},
 	}, nil

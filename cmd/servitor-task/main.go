@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	servitorv1alpha1 "github.com/bevicted/servitor/api/v1alpha1"
 	"github.com/bevicted/servitor/internal/command"
@@ -42,6 +43,16 @@ type ictOperationResult struct {
 	Operation string `json:"operation"`
 	Workspace string `json:"workspace"`
 }
+
+type authManifest struct {
+	Version      int    `json:"version"`
+	Availability string `json:"availability"`
+	Artifacts    []struct {
+		Name string `json:"name"`
+	} `json:"artifacts,omitempty"`
+}
+
+const applyTimeout = 105 * time.Minute
 
 type ictContext struct {
 	Version  int                             `json:"version"`
@@ -77,6 +88,8 @@ const maxTerraformShowBytes = 4 * 1024 * 1024
 
 func main() {
 	var uid, operation, kind, optionsFile, backendFile, recoveryFile, resultFile, reportFile, emitReport, ictPath, terraformPath, optionsJSON, backendJSON, recoveryJSON string
+	var authManifestFile, authOutputDir, publishAuthSecret, publisherToken, publisherCA, publisherNamespace string
+	var publicAuthEligible, publishAuth bool
 	var inventoryConfig, inventoryTarget, inventoryRunID, inventoryRevision, inventoryReport, emitInventoryReport, apiKeyEnv string
 	var planningInventoryConfig string
 	flag.StringVar(&uid, "cluster-uid", "", "ServitorCluster UID")
@@ -91,6 +104,14 @@ func main() {
 	flag.StringVar(&resultFile, "ict-result", "", "task-local ICT result JSON")
 	flag.StringVar(&reportFile, "report", "", "task-local report JSON")
 	flag.StringVar(&emitReport, "emit-report", "", "emit one validated task-local report JSON document")
+	flag.StringVar(&authManifestFile, "auth-manifest", "", "private optional public-auth manifest path")
+	flag.StringVar(&authOutputDir, "auth-output-dir", "", "private optional public-auth output directory")
+	flag.BoolVar(&publicAuthEligible, "public-auth-eligible", false, "frozen public auth eligibility")
+	flag.BoolVar(&publishAuth, "publish-auth", false, "publish optional public auth without failing the operation")
+	flag.StringVar(&publishAuthSecret, "publish-auth-secret", "", "allocation-bound Secret to update")
+	flag.StringVar(&publisherToken, "publisher-token", "", "projected publisher token path")
+	flag.StringVar(&publisherCA, "publisher-ca", "", "projected Kubernetes CA path")
+	flag.StringVar(&publisherNamespace, "publisher-namespace", "", "publisher namespace")
 	flag.StringVar(&inventoryConfig, "inventory-config", "", "mounted inventory target configuration")
 	flag.StringVar(&planningInventoryConfig, "planning-inventory-config", "/etc/servitor/ict/config.yaml", "mounted configuration for planning validation")
 	flag.StringVar(&inventoryTarget, "inventory-target", "", "configured inventory target")
@@ -102,6 +123,10 @@ func main() {
 	flag.StringVar(&ictPath, "ict", "ict", "ICT executable")
 	flag.StringVar(&terraformPath, "terraform", "terraform", "Terraform executable")
 	flag.Parse()
+	if publishAuth {
+		publishPublicAuth(publishAuthSecret, uid, operation, authManifestFile, authOutputDir, reportFile, publisherNamespace, publisherToken, publisherCA)
+		return
+	}
 	if emitReport != "" || emitInventoryReport != "" {
 		var err error
 		if emitReport != "" {
@@ -130,7 +155,7 @@ func main() {
 		err = materializeParameterFile(recoveryFile, recoveryJSON)
 	}
 	if err == nil {
-		err = run(context.Background(), uid, operation, kind, optionsFile, backendFile, recoveryFile, resultFile, reportFile, ictPath, terraformPath, planningInventoryConfig, os.Getenv(apiKeyEnv))
+		err = run(context.Background(), uid, operation, kind, optionsFile, backendFile, recoveryFile, resultFile, reportFile, ictPath, terraformPath, planningInventoryConfig, os.Getenv(apiKeyEnv), publicAuthEligible, authManifestFile, authOutputDir)
 	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "servitor-task:", err)
@@ -219,7 +244,7 @@ func materializeParameterFile(path, contents string) error {
 	return os.WriteFile(path, []byte(contents), 0o600)
 }
 
-func run(ctx context.Context, uid, operation, kind, optionsFile, backendFile, recoveryFile, resultFile, reportFile, ictPath, terraformPath, planningInventoryConfig, apiKey string) error {
+func run(ctx context.Context, uid, operation, kind, optionsFile, backendFile, recoveryFile, resultFile, reportFile, ictPath, terraformPath, planningInventoryConfig, apiKey string, publicAuthEligible bool, authManifestFile, authOutputDir string) error {
 	if uid == "" || operation == "" || (kind != "plan" && kind != "apply" && kind != "destroy") {
 		return errors.New("cluster UID, operation ID, and operation kind are required")
 	}
@@ -240,7 +265,7 @@ func run(ctx context.Context, uid, operation, kind, optionsFile, backendFile, re
 		return runPlan(ctx, uid, operation, options, backendFile, resultFile, reportFile, ictPath, terraformPath, planningInventoryConfig, apiKey)
 	}
 	if kind == "apply" {
-		return runApply(ctx, uid, operation, options, backendFile, recoveryFile, resultFile, reportFile, ictPath, terraformPath)
+		return runApply(ctx, uid, operation, options, backendFile, recoveryFile, resultFile, reportFile, ictPath, terraformPath, publicAuthEligible, authManifestFile, authOutputDir)
 	}
 	return runDestroy(ctx, uid, operation, options, backendFile, recoveryFile, resultFile, reportFile, ictPath)
 }
@@ -430,19 +455,28 @@ func selectedSatelliteRegion(zones []string) string {
 	return region
 }
 
-func runApply(ctx context.Context, uid, operation string, options servitorv1alpha1.ResolvedOptions, backendFile, recoveryFile, resultFile, reportFile, ictPath, terraformPath string) error {
+func runApply(ctx context.Context, uid, operation string, options servitorv1alpha1.ResolvedOptions, backendFile, recoveryFile, resultFile, reportFile, ictPath, terraformPath string, publicAuthEligible bool, authManifestFile, authOutputDir string) error {
 	recovery, contextFile, err := frozenContext(operation, backendFile, recoveryFile, resultFile)
 	if err != nil {
 		return err
 	}
-	if _, err := (command.Runner{MaxOutput: 64 * 1024, Stdout: os.Stdout, Stderr: os.Stderr, Log: os.Stderr}).Run(ctx, ictPath, "apply", operation, "--context-file", contextFile, "--backend-config", backendFile, "--result-file", resultFile, "--auto-approve"); err != nil {
+	applyCtx, cancel := context.WithTimeout(ctx, applyTimeout)
+	defer cancel()
+	args := []string{"apply", operation, "--context-file", contextFile, "--backend-config", backendFile, "--result-file", resultFile, "--auto-approve"}
+	if publicAuthEligible {
+		if !filepath.IsAbs(authManifestFile) || !filepath.IsAbs(authOutputDir) {
+			return errors.New("public auth paths must be absolute")
+		}
+		args = append(args, "--auth-manifest-file", authManifestFile, "--auth-output-dir", authOutputDir)
+	}
+	if _, err := (command.Runner{MaxOutput: 64 * 1024, Stdout: os.Stdout, Stderr: os.Stderr, Log: os.Stderr}).Run(applyCtx, ictPath, args...); err != nil {
 		return err
 	}
 	result, err := readJSON[ictOperationResult](resultFile)
 	if err != nil || result.Version != 1 || result.Operation != "apply" || !filepath.IsAbs(result.Workspace) {
 		return errors.New("ICT produced no valid apply result")
 	}
-	shown, err := (command.Runner{MaxOutput: maxTerraformShowBytes}).Run(ctx, terraformPath, "-chdir="+result.Workspace, "show", "-json")
+	shown, err := (command.Runner{MaxOutput: maxTerraformShowBytes}).Run(applyCtx, terraformPath, "-chdir="+result.Workspace, "show", "-json")
 	if err != nil || shown.StdoutTruncated {
 		return errors.New("cannot obtain bounded Terraform ready summary")
 	}
@@ -450,7 +484,11 @@ func runApply(ctx context.Context, uid, operation string, options servitorv1alph
 	if err != nil {
 		return fmt.Errorf("sanitize Terraform state: %w", err)
 	}
-	return writeReport(reportFile, pipeline.Report{Version: 1, ClusterUID: uid, OperationID: operation, ResolvedOptions: options, Recovery: recovery, Ready: summaryFromState(state)})
+	report := pipeline.Report{Version: 1, ClusterUID: uid, OperationID: operation, ResolvedOptions: options, Recovery: recovery, Ready: summaryFromState(state)}
+	if publicAuthEligible {
+		report.PublicAuth = &servitorv1alpha1.PublicAuthStatus{Availability: "unavailable"}
+	}
+	return writeReport(reportFile, report)
 }
 
 func runDestroy(ctx context.Context, uid, operation string, options servitorv1alpha1.ResolvedOptions, backendFile, recoveryFile, resultFile, reportFile, ictPath string) error {

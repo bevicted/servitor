@@ -8,6 +8,7 @@ import (
 	"time"
 
 	servitorv1alpha1 "github.com/bevicted/servitor/api/v1alpha1"
+	tektonpod "github.com/tektoncd/pipeline/pkg/apis/pipeline/pod"
 	tektonv1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -30,6 +31,12 @@ type TaskConfig struct {
 func DeterministicRunName(uid, operation string) string {
 	digest := sha256.Sum256([]byte(uid + "\x00" + operation))
 	return fmt.Sprintf("servitor-%s-%s", operation, hex.EncodeToString(digest[:])[:12])
+}
+
+// AuthResourceName is UID-derived so a later allocation cannot inherit old data.
+func AuthResourceName(uid string) string {
+	digest := sha256.Sum256([]byte(uid))
+	return "servitor-auth-" + hex.EncodeToString(digest[:])[:20]
 }
 
 // NewPlanningRun constructs one disposable planning PipelineRun. It has no owner reference,
@@ -61,6 +68,7 @@ func newOperationRun(cluster *servitorv1alpha1.ServitorCluster, kind string, tas
 		return nil, fmt.Errorf("encode backend identity: %w", err)
 	}
 	operation := cluster.Status.Operation
+	publicAuthEligible := kind == "apply" && cluster.Status.LifecycleSnapshot != nil && cluster.Status.LifecycleSnapshot.PublicAuthEligible
 	params := tektonv1.Params{
 		{Name: "operation-id", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: operation.ID}},
 		{Name: "operation-kind", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: kind}},
@@ -72,6 +80,8 @@ func newOperationRun(cluster *servitorv1alpha1.ServitorCluster, kind string, tas
 		{Name: "ict-config-key", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: taskConfig.ICTConfigKey}},
 		{Name: "cos-secret", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: taskConfig.COSSecret}},
 		{Name: "ibm-secret", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: taskConfig.IBMSecret}},
+		{Name: "public-auth-eligible", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: fmt.Sprintf("%t", publicAuthEligible)}},
+		{Name: "auth-secret", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: authSecretParameter(string(cluster.UID), publicAuthEligible)}},
 	}
 	if kind == "apply" || kind == "destroy" {
 		if cluster.Status.Recovery == nil {
@@ -83,7 +93,11 @@ func newOperationRun(cluster *servitorv1alpha1.ServitorCluster, kind string, tas
 		}
 		params = append(params, tektonv1.Param{Name: "recovery", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: string(recovery)}})
 	}
-	taskRunTemplate := operationTaskRunTemplate()
+	taskRunTemplate := operationTaskRunTemplate(string(cluster.UID), publicAuthEligible)
+	pipelineTimeout, tasksTimeout := 100*time.Minute, 95*time.Minute
+	if kind == "apply" {
+		pipelineTimeout, tasksTimeout = 120*time.Minute, 115*time.Minute
+	}
 	return &tektonv1.PipelineRun{
 		TypeMeta: metav1.TypeMeta{APIVersion: "tekton.dev/v1", Kind: "PipelineRun"},
 		ObjectMeta: metav1.ObjectMeta{
@@ -94,15 +108,30 @@ func newOperationRun(cluster *servitorv1alpha1.ServitorCluster, kind string, tas
 			PipelineRef: &tektonv1.PipelineRef{Name: PipelineName}, Params: params,
 			TaskRunTemplate: taskRunTemplate,
 			Timeouts: &tektonv1.TimeoutFields{
-				Pipeline: &metav1.Duration{Duration: 100 * time.Minute},
-				Tasks:    &metav1.Duration{Duration: 95 * time.Minute},
+				Pipeline: &metav1.Duration{Duration: pipelineTimeout},
+				Tasks:    &metav1.Duration{Duration: tasksTimeout},
 			},
 		},
 	}, nil
 }
 
-func operationTaskRunTemplate() tektonv1.PipelineTaskRunTemplate {
-	return tektonv1.PipelineTaskRunTemplate{ServiceAccountName: "servitor-task"}
+func operationTaskRunTemplate(uid string, publicAuthEligible bool) tektonv1.PipelineTaskRunTemplate {
+	automount := false
+	serviceAccount := "servitor-task"
+	if publicAuthEligible {
+		serviceAccount = AuthResourceName(uid)
+	}
+	return tektonv1.PipelineTaskRunTemplate{
+		ServiceAccountName: serviceAccount,
+		PodTemplate:        &tektonpod.PodTemplate{AutomountServiceAccountToken: &automount},
+	}
+}
+
+func authSecretParameter(uid string, eligible bool) string {
+	if !eligible {
+		return ""
+	}
+	return AuthResourceName(uid)
 }
 
 func MatchingRun(run *tektonv1.PipelineRun, uid, operation string) bool {
