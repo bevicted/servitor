@@ -74,6 +74,11 @@ func (s *SocketMode) Reply(ctx context.Context, response Response) error {
 }
 
 // Permalink resolves a Slack-provided link for a persisted lifecycle message.
+// DeliverKubeconfig sends one stored kubeconfig to the allocation owner's DM.
+func (s *SocketMode) DeliverKubeconfig(ctx context.Context, ownerID, clusterName string, kubeconfig []byte) error {
+	return NewAuthDelivery(&s.client.Client).DeliverKubeconfig(ctx, ownerID, clusterName, kubeconfig)
+}
+
 func (s *SocketMode) Permalink(ctx context.Context, channel, timestamp string) (string, error) {
 	permalink, err := s.client.GetPermalinkContext(ctx, &slack.PermalinkParameters{Channel: channel, Ts: timestamp})
 	if err != nil {

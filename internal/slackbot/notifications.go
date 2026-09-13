@@ -158,6 +158,11 @@ func statusNoticesAt(cluster *servitorv1alpha1.ServitorCluster, now time.Time) [
 			notices = append(notices, statusNotice{id: extensionNoticeID(uid, extension), text: text})
 		}
 	}
+	if delivery := cluster.Status.AuthDelivery; delivery != nil {
+		if text := authDeliveryOutcomeText(delivery); text != "" {
+			notices = append(notices, statusNotice{id: authDeliveryNoticeID(uid, delivery), text: text})
+		}
+	}
 	return notices
 }
 
@@ -341,6 +346,23 @@ func actionTotals(rows [][]string) (create, change, destroy int) {
 
 func extensionNoticeID(uid string, extension *servitorv1alpha1.LeaseExtensionStatus) string {
 	return "extension:" + uid + ":" + extension.RequestedExpiry.UTC().Format(time.RFC3339Nano)
+}
+
+func authDeliveryNoticeID(uid string, delivery *servitorv1alpha1.AuthDeliveryStatus) string {
+	return "auth-delivery:" + uid + ":" + delivery.AttemptTimestamp
+}
+
+func authDeliveryOutcomeText(delivery *servitorv1alpha1.AuthDeliveryStatus) string {
+	switch delivery.Outcome {
+	case "Delivered":
+		return "Your requested kubeconfig was sent to your DM."
+	case "Failed":
+		return "Unable to deliver the requested kubeconfig to your DM. Send a new `auth` request to retry."
+	case "Unavailable":
+		return "The requested kubeconfig is unavailable. No new credentials were created."
+	default:
+		return ""
+	}
 }
 
 func extensionOutcomeText(extension *servitorv1alpha1.LeaseExtensionStatus, now time.Time) string {

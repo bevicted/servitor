@@ -67,7 +67,10 @@ type LifecyclePolicy struct {
 	// Slack redelivery, controller restarts, and optimistic-concurrency retries.
 	RequestedExpiry         *metav1.Time `json:"requestedExpiry,omitempty"`
 	ExtensionEventTimestamp string       `json:"extensionEventTimestamp,omitempty"`
-	CleanupRequested        bool         `json:"cleanupRequested,omitempty"`
+	// AuthRequestTimestamp identifies an explicit owner-thread auth request.
+	// It is monotonic so redelivery and old events cannot replay a delivery.
+	AuthRequestTimestamp string `json:"authRequestTimestamp,omitempty"`
+	CleanupRequested     bool   `json:"cleanupRequested,omitempty"`
 }
 
 // ServitorClusterSpec is immutable after creation except lifecycle intent.
@@ -393,6 +396,14 @@ type LeaseExtensionStatus struct {
 	Outcome         ExtensionOutcome `json:"outcome"`
 }
 
+// AuthDeliveryStatus records a consumed owner request and its sanitized result.
+// AttemptTimestamp is persisted before any Slack API side effect.
+type AuthDeliveryStatus struct {
+	RequestTimestamp string `json:"requestTimestamp"`
+	AttemptTimestamp string `json:"attemptTimestamp"`
+	Outcome          string `json:"outcome"`
+}
+
 // ServitorClusterStatus is written exclusively by the controller.
 type ServitorClusterStatus struct {
 	Phase             string              `json:"phase,omitempty"`
@@ -413,6 +424,7 @@ type ServitorClusterStatus struct {
 	PublicAuth       *PublicAuthStatus     `json:"publicAuth,omitempty"`
 	LeaseExpiresAt   *metav1.Time          `json:"leaseExpiresAt,omitempty"`
 	LeaseExtension   *LeaseExtensionStatus `json:"leaseExtension,omitempty"`
+	AuthDelivery     *AuthDeliveryStatus   `json:"authDelivery,omitempty"`
 	ApplyDispatched  bool                  `json:"applyDispatched,omitempty"`
 	CleanupRequested bool                  `json:"cleanupRequested,omitempty"`
 	Cleanup          *CleanupStatus        `json:"cleanup,omitempty"`
@@ -591,6 +603,10 @@ func (in *ServitorClusterStatus) DeepCopy() *ServitorClusterStatus {
 			v.NewExpiry = in.LeaseExtension.NewExpiry.DeepCopy()
 		}
 		out.LeaseExtension = &v
+	}
+	if in.AuthDelivery != nil {
+		v := *in.AuthDelivery
+		out.AuthDelivery = &v
 	}
 	if in.Cleanup != nil {
 		v := *in.Cleanup

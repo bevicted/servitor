@@ -85,9 +85,10 @@ func main() {
 		fail(fmt.Errorf("configure inventory refresh: %w", err))
 	}
 	transport := slackbot.NewSocketMode(secrets.BotToken, secrets.AppToken)
+	reconciler.AuthDelivery = transport
 	bot := slackbot.Bot{
 		ChannelID: operator.Slack.ChannelID, Namespace: operator.Namespace, Client: manager.GetClient(),
-		Events: state.NewEventStore(manager.GetClient(), operator.Namespace), Defaults: commandDefaults(operator),
+		Events: state.NewEventStore(manager.GetClient(), operator.Namespace), Defaults: commandDefaults(operator), PublicAuthTargets: append([]string(nil), operator.Auth.PublicTargets...),
 		InventoryConfigMap: operator.ICT.TargetConfigMap, InventoryConfigKey: operator.ICT.TargetConfigKey, InventoryMaximumAge: operator.InventoryMaximumAge(), MaintainerIDs: operator.Slack.MaintainerIDs,
 		Lease: operator.Lifecycle.Lease, RetryIntervals: operator.Lifecycle.RetryIntervals, Responder: transport, Permalinks: transport,
 	}

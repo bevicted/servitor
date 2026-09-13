@@ -51,6 +51,7 @@ type Reconciler struct {
 	Logs   pipeline.LogReader
 	// SecretReader bypasses the manager cache for credential-bearing Secrets.
 	SecretReader client.Reader
+	AuthDelivery AuthFileDelivery
 	Now          func() time.Time
 	LogRetry     time.Duration
 }
@@ -163,6 +164,9 @@ func (r *Reconciler) reconcileReady(ctx context.Context, cluster *servitorv1alph
 		}
 		return r.recordExtensionOutcome(ctx, cluster, servitorv1alpha1.ExtensionOutcomeApplied, expiry, &metav1.Time{Time: newExpiry})
 	}
+	if result, handled, err := r.reconcileAuthDelivery(ctx, cluster); handled || err != nil {
+		return result, err
+	}
 	return ctrl.Result{RequeueAfter: expiry.Time.Sub(r.now())}, nil
 }
 
@@ -255,6 +259,9 @@ func (r *Reconciler) requestCleanup(ctx context.Context, cluster *servitorv1alph
 		}
 	}
 	cluster.Status.CleanupRequested = true
+	if request := cluster.Spec.Lifecycle.AuthRequestTimestamp; request != "" && (cluster.Status.AuthDelivery == nil || cluster.Status.AuthDelivery.RequestTimestamp != request || cluster.Status.AuthDelivery.Outcome == authDeliveryPending) {
+		cluster.Status.AuthDelivery = &servitorv1alpha1.AuthDeliveryStatus{RequestTimestamp: request, AttemptTimestamp: request, Outcome: authDeliveryCancelled}
+	}
 	if reason == servitorv1alpha1.CleanupReasonApplyFailed {
 		cluster.Status.Diagnostic = "ApplyFailed"
 	}

@@ -147,7 +147,18 @@ spec:
                           message: retrySeconds is immutable
                     approval: { type: string, enum: ["", approved, rejected] }
                     requestedExpiry: { type: string, format: date-time }
-                    extensionEventTimestamp: { type: string }
+                    extensionEventTimestamp:
+                      {
+                        type: string,
+                        maxLength: 64,
+                        pattern: '^[0-9]+(\.[0-9]+)?$',
+                      }
+                    authRequestTimestamp:
+                      {
+                        type: string,
+                        maxLength: 64,
+                        pattern: '^[0-9]+(\.[0-9]+)?$',
+                      }
                     cleanupRequested: { type: boolean }
             status:
               type: object
@@ -414,6 +425,28 @@ spec:
                       {
                         type: string,
                         enum: [Applied, Invalid, NotReady, Expired],
+                      }
+                authDelivery:
+                  type: object
+                  required: [requestTimestamp, attemptTimestamp, outcome]
+                  properties:
+                    requestTimestamp:
+                      {
+                        type: string,
+                        maxLength: 64,
+                        pattern: '^[0-9]+(\.[0-9]+)?$',
+                      }
+                    attemptTimestamp:
+                      {
+                        type: string,
+                        maxLength: 64,
+                        pattern: '^[0-9]+(\.[0-9]+)?$',
+                      }
+                    outcome:
+                      {
+                        type: string,
+                        enum:
+                          [Pending, Delivered, Failed, Unavailable, Cancelled],
                       }
                 applyDispatched: { type: boolean }
                 cleanupRequested: { type: boolean }

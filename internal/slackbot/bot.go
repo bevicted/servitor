@@ -62,6 +62,7 @@ type Bot struct {
 	InventoryConfigKey    string
 	MaintainerIDs         []string
 	InventoryMaximumAge   time.Duration
+	PublicAuthTargets     []string
 	Lease                 time.Duration
 	RetryIntervals        []time.Duration
 	Responder             Responder
@@ -121,6 +122,8 @@ func (b Bot) Handle(ctx context.Context, envelope Envelope) error {
 			b.cleanup(ctx, message, thread, true)
 		case "destroy":
 			b.cleanup(ctx, message, thread, false)
+		case "auth":
+			b.auth(ctx, message, thread, reply)
 		default:
 			if firstToken(message.Text) == "extend" {
 				b.extend(ctx, message, thread, true, reply)
@@ -414,6 +417,71 @@ func (b Bot) cleanup(ctx context.Context, message Message, thread string, acknow
 	}
 }
 
+// auth records one owner-thread request. The controller consumes it before
+// reading the allocation Secret or calling Slack, so intake never handles credentials.
+func (b Bot) auth(ctx context.Context, message Message, thread string, respond func(string)) {
+	cluster, err := b.ownerCluster(ctx, message.User)
+	if err != nil || !ownsThread(cluster, message, thread, true) {
+		return
+	}
+	if !b.publicAuthEligible(cluster) {
+		respond("VPN-backed authentication is not implemented yet")
+		return
+	}
+	if _, _, valid := splitSlackTimestamp(message.Timestamp); !valid {
+		respond(rejectedText("Unable to record the authentication request."))
+		return
+	}
+	stateText := ""
+	updated, err := b.updateIntent(ctx, cluster.Name, func(current *servitorv1alpha1.ServitorCluster) (bool, error) {
+		if !ownsThread(current, message, thread, true) {
+			return false, nil
+		}
+		if !b.publicAuthEligible(current) {
+			stateText = "VPN-backed authentication is not implemented yet"
+			return false, nil
+		}
+		if staleAuthEvent(current.Spec.Lifecycle.AuthRequestTimestamp, message.Timestamp) {
+			stateText = "This authentication request was already recorded. Send a new `auth` request to resend the stored file."
+			return false, nil
+		}
+		current.Spec.Lifecycle.AuthRequestTimestamp = message.Timestamp
+		return true, nil
+	})
+	if err != nil {
+		b.logf("request authentication delivery: %v", err)
+		if apierrors.IsNotFound(err) {
+			respond(lifecycleLookupText(err))
+		} else {
+			respond(rejectedText("Unable to record the authentication request."))
+		}
+		return
+	}
+	if updated {
+		respond("Authentication delivery has been queued for your DM.")
+	} else if stateText != "" {
+		respond(stateText)
+	}
+}
+
+func (b Bot) publicAuthEligible(cluster *servitorv1alpha1.ServitorCluster) bool {
+	if cluster.Status.LifecycleSnapshot != nil {
+		return cluster.Status.LifecycleSnapshot.PublicAuthEligible
+	}
+	provider := cluster.Spec.UserOptions.Provider
+	if provider == "" {
+		provider = b.Defaults.Provider
+	}
+	if provider == "satellite" {
+		return false
+	}
+	target := cluster.Spec.UserOptions.Target
+	if target == "" {
+		target = b.Defaults.Target
+	}
+	return slices.Contains(b.PublicAuthTargets, target)
+}
+
 func (b Bot) extend(ctx context.Context, message Message, thread string, requireThread bool, respond func(string)) {
 	cluster, err := b.ownerCluster(ctx, message.User)
 	if err != nil {
@@ -577,6 +645,8 @@ func ownerClusterName(owner string) string {
 // staleExtensionEvent rejects a redelivery even after the bounded receipt
 // cache evicts its ID. Slack message timestamps are monotonically increasing
 // for a conversation and the latest accepted value is durable CR spec intent.
+func staleAuthEvent(last, current string) bool { return staleExtensionEvent(last, current) }
+
 func staleExtensionEvent(last, current string) bool {
 	if last == "" {
 		return false
@@ -775,6 +845,8 @@ func (b Bot) respondHelp(text string, respond func(string), maintainer bool) {
 		messages = []string{"`done` releases your resources. Use it in your lifecycle thread, or as `@servitor done` in the configured channel. It is unavailable after cleanup completes; repeated requests report cleanup in progress."}
 	case "extend":
 		messages = []string{"`extend [N[h]]` extends your ready lease by the configured duration or by 1 through 24 whole hours. Use it in your lifecycle thread or as `@servitor extend` in the configured channel. It is available only while the lease is ready, not during planning, cleanup, or after expiry."}
+	case "auth":
+		messages = []string{"`auth` sends the stored public kubeconfig to the allocation owner's DM. Use exact `auth` only in the initiating lifecycle thread. Requests made before Ready are queued; a failed or interrupted delivery is not retried automatically, so send a newer `auth` request to resend the stored file. Private-only and Satellite authentication is not implemented yet."}
 	case "list":
 		messages = []string{"`list` shows available cluster state. `*` marks your allocation; cleanup in progress and cleanup complete are shown separately. Use it in a DM or as `@servitor list` in the configured channel."}
 	case "refresh":
@@ -858,7 +930,7 @@ func firstToken(text string) string {
 func unknownText() string               { return "Command unknown.\n\n" + helpOverview(false)[0] }
 func rejectedText(reason string) string { return "Command rejected.\n\n" + reason }
 func helpOverview(maintainer bool) []string {
-	text := "Servitor provisions one temporary IBM Cloud cluster per Slack user.\n\nCommands\n```\nDM\n  help [command]          print help\n  list                    list clusters\n\nConfigured channel\n  @servitor help [command]  print help\n  @servitor create [safe options]  provision a new cluster\n  @servitor done            release your resources\n  @servitor extend [N[h]]   extend your lease\n  @servitor list            list clusters\n\nLifecycle thread\n  yes                       approve the cluster plan\n  no                        reject the cluster plan\n  done                      release your resources\n  extend [N[h]]             extend your lease\n"
+	text := "Servitor provisions one temporary IBM Cloud cluster per Slack user.\n\nCommands\n```\nDM\n  help [command]          print help\n  list                    list clusters\n\nConfigured channel\n  @servitor help [command]  print help\n  @servitor create [safe options]  provision a new cluster\n  @servitor done            release your resources\n  @servitor extend [N[h]]   extend your lease\n  @servitor list            list clusters\n\nLifecycle thread\n  yes                       approve the cluster plan\n  no                        reject the cluster plan\n  done                      release your resources\n  extend [N[h]]             extend your lease\n  auth                      send stored public access to your DM\n"
 	if maintainer {
 		text += "\nMaintainer DM\n  refresh inventory         refresh private inventory\n"
 	}

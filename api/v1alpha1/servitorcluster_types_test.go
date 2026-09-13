@@ -73,6 +73,15 @@ func TestServitorClusterDeepCopyDoesNotAliasPublicAuth(t *testing.T) {
 	}
 }
 
+func TestServitorClusterDeepCopyDoesNotAliasAuthDelivery(t *testing.T) {
+	cluster := &ServitorCluster{Status: ServitorClusterStatus{AuthDelivery: &AuthDeliveryStatus{RequestTimestamp: "1.2", AttemptTimestamp: "1.2", Outcome: "Failed"}}}
+	copy := cluster.DeepCopy()
+	copy.Status.AuthDelivery.Outcome = "Delivered"
+	if cluster.Status.AuthDelivery.Outcome != "Failed" {
+		t.Fatal("DeepCopy() aliases auth delivery status")
+	}
+}
+
 func TestServitorClusterDeepCopyDoesNotAliasPlanRejection(t *testing.T) {
 	cluster := &ServitorCluster{Status: ServitorClusterStatus{PlanRejection: &PlanRejection{ReasonCode: "version_not_supported", OptionKey: "version"}}}
 	copy := cluster.DeepCopy()
@@ -116,6 +125,34 @@ func TestServitorClusterCRDDefinesBoundedPublicAuthAvailability(t *testing.T) {
 		availability := yamlMap(t, yamlMap(t, publicAuth["properties"])["availability"])
 		if availability["type"] != "string" {
 			t.Fatalf("public auth availability schema = %#v", availability)
+		}
+		return
+	}
+	t.Fatal("v1alpha1 CRD version not found")
+}
+
+func TestServitorClusterCRDDefinesBoundedAuthDelivery(t *testing.T) {
+	contents, err := os.ReadFile(filepath.Join("..", "..", "config", "crd", "bases", "servitor.bevicted.github.io_servitorclusters.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	document := make(map[string]any)
+	if err := yaml.Unmarshal(contents, &document); err != nil {
+		t.Fatal(err)
+	}
+	versions := yamlList(t, yamlMap(t, document["spec"])["versions"])
+	for _, value := range versions {
+		version := yamlMap(t, value)
+		if version["name"] != "v1alpha1" {
+			continue
+		}
+		properties := yamlMap(t, yamlMap(t, yamlMap(t, version["schema"])["openAPIV3Schema"])["properties"])
+		lifecycle := yamlMap(t, yamlMap(t, yamlMap(t, properties["spec"])["properties"])["lifecycle"])
+		request := yamlMap(t, yamlMap(t, lifecycle["properties"])["authRequestTimestamp"])
+		delivery := yamlMap(t, yamlMap(t, yamlMap(t, properties["status"])["properties"])["authDelivery"])
+		outcome := yamlMap(t, yamlMap(t, delivery["properties"])["outcome"])
+		if request["type"] != "string" || outcome["type"] != "string" {
+			t.Fatalf("auth delivery schema request=%#v outcome=%#v", request, outcome)
 		}
 		return
 	}
