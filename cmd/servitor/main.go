@@ -74,7 +74,7 @@ func main() {
 	}
 	logs := controller.NewPodLogReader(kubernetes.NewForConfigOrDie(restConfig))
 	reconciler := &controller.Reconciler{
-		Client: manager.GetClient(), SecretReader: manager.GetAPIReader(), Scheme: manager.GetScheme(), Logs: logs, Config: controllerSettings,
+		Client: manager.GetClient(), DirectReader: manager.GetAPIReader(), Scheme: manager.GetScheme(), Logs: logs, Config: controllerSettings,
 	}
 	if err := reconciler.SetupWithManager(manager); err != nil {
 		fail(fmt.Errorf("configure controller: %w", err))

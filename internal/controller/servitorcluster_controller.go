@@ -49,8 +49,8 @@ type Reconciler struct {
 	Scheme *runtime.Scheme
 	Config Config
 	Logs   pipeline.LogReader
-	// SecretReader bypasses the manager cache for credential-bearing Secrets.
-	SecretReader client.Reader
+	// DirectReader bypasses the manager cache for exact publication-resource lookups.
+	DirectReader client.Reader
 	AuthDelivery AuthFileDelivery
 	Now          func() time.Time
 	LogRetry     time.Duration
@@ -65,8 +65,8 @@ type Reconciler struct {
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;create;delete
-// +kubebuilder:rbac:groups="",resources=serviceaccounts,verbs=get;list;watch;create;delete
-// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles;rolebindings,verbs=get;list;watch;create;delete
+// +kubebuilder:rbac:groups="",resources=serviceaccounts,verbs=get;create;delete
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles;rolebindings,verbs=get;create;delete
 func (r *Reconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.Result, error) {
 	if r.Config.Namespace != "" && request.Namespace != r.Config.Namespace {
 		return ctrl.Result{}, nil

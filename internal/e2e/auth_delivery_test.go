@@ -93,7 +93,7 @@ func TestCreateAuthOptInDrivesOneReadyDelivery(t *testing.T) {
 				t.Fatal(err)
 			}
 			delivery := &deliveryCounter{}
-			reconciler := &controller.Reconciler{Client: kube, SecretReader: kube, AuthDelivery: delivery, Config: controller.Config{Namespace: "ns"}, Now: func() time.Time { return now }}
+			reconciler := &controller.Reconciler{Client: kube, DirectReader: kube, AuthDelivery: delivery, Config: controller.Config{Namespace: "ns"}, Now: func() time.Time { return now }}
 			request := ctrl.Request{NamespacedName: key}
 			for range 3 {
 				if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
@@ -184,7 +184,7 @@ func TestOwnerThreadAuthDrivesControllerAndExternalDMUpload(t *testing.T) {
 	}
 
 	api := slack.New("synthetic-token", slack.OptionAPIURL(server.URL+"/"))
-	reconciler := &controller.Reconciler{Client: kube, SecretReader: kube, AuthDelivery: slackbot.NewAuthDelivery(api), Config: controller.Config{Namespace: "ns"}, Now: func() time.Time { return now }}
+	reconciler := &controller.Reconciler{Client: kube, DirectReader: kube, AuthDelivery: slackbot.NewAuthDelivery(api), Config: controller.Config{Namespace: "ns"}, Now: func() time.Time { return now }}
 	request := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "ns", Name: "slack-316ca0efda6296d8f2c11d1e"}}
 	if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
 		t.Fatal(err)

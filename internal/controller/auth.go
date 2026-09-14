@@ -33,7 +33,7 @@ func (r *Reconciler) ensureAuthPublicationResources(ctx context.Context, cluster
 	annotations := map[string]string{authOperationKey: operation}
 	secret := &corev1.Secret{}
 	key := types.NamespacedName{Namespace: cluster.Namespace, Name: name}
-	if err := r.secretReader().Get(ctx, key, secret); err != nil {
+	if err := r.directReader().Get(ctx, key, secret); err != nil {
 		if !apierrors.IsNotFound(err) {
 			return err
 		}
@@ -67,7 +67,7 @@ func validateAuthSecret(secret *corev1.Secret, cluster *servitorv1alpha1.Servito
 func (r *Reconciler) ensurePublisherServiceAccount(ctx context.Context, cluster *servitorv1alpha1.ServitorCluster, name string, labels map[string]string) error {
 	current := &corev1.ServiceAccount{}
 	key := types.NamespacedName{Namespace: cluster.Namespace, Name: name}
-	if err := r.Get(ctx, key, current); err == nil {
+	if err := r.directReader().Get(ctx, key, current); err == nil {
 		if current.Labels[authUIDLabel] != string(cluster.UID) {
 			return errors.New("public auth ServiceAccount ownership does not match the allocation")
 		}
@@ -81,7 +81,7 @@ func (r *Reconciler) ensurePublisherServiceAccount(ctx context.Context, cluster 
 func (r *Reconciler) ensurePublisherRole(ctx context.Context, cluster *servitorv1alpha1.ServitorCluster, name string, labels map[string]string) error {
 	current := &rbacv1.Role{}
 	key := types.NamespacedName{Namespace: cluster.Namespace, Name: name}
-	if err := r.Get(ctx, key, current); err == nil {
+	if err := r.directReader().Get(ctx, key, current); err == nil {
 		if current.Labels[authUIDLabel] != string(cluster.UID) || !publisherRoleMatches(current, name) {
 			return errors.New("public auth Role does not match the allocation scope")
 		}
@@ -99,7 +99,7 @@ func publisherRoleMatches(role *rbacv1.Role, name string) bool {
 func (r *Reconciler) ensurePublisherRoleBinding(ctx context.Context, cluster *servitorv1alpha1.ServitorCluster, name string, labels map[string]string) error {
 	current := &rbacv1.RoleBinding{}
 	key := types.NamespacedName{Namespace: cluster.Namespace, Name: name}
-	if err := r.Get(ctx, key, current); err == nil {
+	if err := r.directReader().Get(ctx, key, current); err == nil {
 		if current.Labels[authUIDLabel] != string(cluster.UID) || len(current.Subjects) != 1 || current.Subjects[0].Kind != "ServiceAccount" || current.Subjects[0].Name != name || current.Subjects[0].Namespace != cluster.Namespace || current.RoleRef.APIGroup != rbacv1.GroupName || current.RoleRef.Kind != "Role" || current.RoleRef.Name != name {
 			return errors.New("public auth RoleBinding does not match the allocation scope")
 		}
@@ -122,7 +122,7 @@ func (r *Reconciler) revokeAuthPublication(ctx context.Context, cluster *servito
 	}
 	secret := &corev1.Secret{}
 	key := types.NamespacedName{Namespace: cluster.Namespace, Name: name}
-	if err := r.secretReader().Get(ctx, key, secret); err != nil {
+	if err := r.directReader().Get(ctx, key, secret); err != nil {
 		if apierrors.IsNotFound(err) {
 			return nil
 		}
@@ -169,9 +169,9 @@ func sameStrings(actual, expected []string) bool {
 
 func boolPointer(value bool) *bool { return &value }
 
-func (r *Reconciler) secretReader() client.Reader {
-	if r.SecretReader != nil {
-		return r.SecretReader
+func (r *Reconciler) directReader() client.Reader {
+	if r.DirectReader != nil {
+		return r.DirectReader
 	}
 	return r.Client
 }

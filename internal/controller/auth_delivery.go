@@ -76,7 +76,7 @@ func (r *Reconciler) reconcileAuthDelivery(ctx context.Context, cluster *servito
 	}
 	secret := &corev1.Secret{}
 	key = types.NamespacedName{Namespace: cluster.Namespace, Name: authResourceName(cluster)}
-	if err := r.secretReader().Get(ctx, key, secret); err != nil {
+	if err := r.directReader().Get(ctx, key, secret); err != nil {
 		if apierrors.IsNotFound(err) {
 			return ctrl.Result{}, true, r.setAuthDeliveryOutcome(ctx, cluster, authDeliveryUnavailable)
 		}

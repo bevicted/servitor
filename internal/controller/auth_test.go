@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"testing"
+	"time"
 
 	servitorv1alpha1 "github.com/bevicted/servitor/api/v1alpha1"
 	"github.com/bevicted/servitor/internal/pipeline"
@@ -12,8 +13,73 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
+
+type publisherCacheUnavailableClient struct{ client.Client }
+
+func (c publisherCacheUnavailableClient) Get(ctx context.Context, key client.ObjectKey, object client.Object, options ...client.GetOption) error {
+	switch object.(type) {
+	case *corev1.ServiceAccount, *rbacv1.Role, *rbacv1.RoleBinding:
+		return apierrors.NewServiceUnavailable("publisher informer cache unavailable")
+	default:
+		return c.Client.Get(ctx, key, object, options...)
+	}
+}
+
+func TestApprovalResumesPartialPublisherResourcesWithoutInformerCache(t *testing.T) {
+	scheme := runtime.NewScheme()
+	for _, add := range []func(*runtime.Scheme) error{servitorv1alpha1.AddToScheme, corev1.AddToScheme, rbacv1.AddToScheme} {
+		if err := add(scheme); err != nil {
+			t.Fatal(err)
+		}
+	}
+	now := time.Date(2026, 9, 14, 0, 0, 0, 0, time.UTC)
+	deadline := metav1.NewTime(now.Add(time.Minute))
+	cluster := &servitorv1alpha1.ServitorCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "cluster", Namespace: "ns", UID: "allocation-uid", Generation: 2},
+		Spec: servitorv1alpha1.ServitorClusterSpec{
+			Slack:     servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "1.2"},
+			Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 3600, RetrySeconds: []int64{60}},
+		},
+		Status: servitorv1alpha1.ServitorClusterStatus{
+			Phase:             servitorv1alpha1.PhaseAwaitingApproval,
+			ResolvedOptions:   &servitorv1alpha1.ResolvedOptions{},
+			LifecycleSnapshot: &servitorv1alpha1.LifecycleSnapshot{InitialLeaseSeconds: 3600, RetrySeconds: []int64{60}, PublicAuthEligible: true},
+			ReviewDeadline:    &deadline,
+			ReviewGeneration:  1,
+		},
+	}
+	name := authResourceName(cluster)
+	operation := applyID(string(cluster.UID))
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: cluster.Namespace, Labels: map[string]string{authUIDLabel: string(cluster.UID)}, Annotations: map[string]string{authOperationKey: operation}}}
+	serviceAccount := &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: cluster.Namespace, Labels: map[string]string{authUIDLabel: string(cluster.UID)}}, AutomountServiceAccountToken: boolPointer(false)}
+	base := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&servitorv1alpha1.ServitorCluster{}).WithObjects(cluster, secret, serviceAccount).Build()
+	approved := &servitorv1alpha1.ServitorCluster{}
+	if err := base.Get(context.Background(), types.NamespacedName{Namespace: cluster.Namespace, Name: cluster.Name}, approved); err != nil {
+		t.Fatal(err)
+	}
+	approved.Spec.Lifecycle.Approval = "approved"
+	approved.Generation = approved.Status.ReviewGeneration + 1
+	cached := publisherCacheUnavailableClient{Client: base}
+	reconciler := &Reconciler{Client: cached, DirectReader: base, Config: Config{Namespace: "ns"}, Now: func() time.Time { return now }}
+	if _, err := reconciler.reconcileApproval(context.Background(), approved); err != nil {
+		t.Fatal(err)
+	}
+	stored := &servitorv1alpha1.ServitorCluster{}
+	if err := base.Get(context.Background(), types.NamespacedName{Namespace: cluster.Namespace, Name: cluster.Name}, stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status.Phase != servitorv1alpha1.PhaseApplying || !stored.Status.ApplyDispatched || stored.Status.Operation == nil || stored.Status.Operation.ID != operation {
+		t.Fatalf("approval did not persist Applying after partial publisher creation: %+v", stored.Status)
+	}
+	for _, object := range []client.Object{&rbacv1.Role{}, &rbacv1.RoleBinding{}} {
+		if err := base.Get(context.Background(), types.NamespacedName{Namespace: cluster.Namespace, Name: name}, object); err != nil {
+			t.Fatalf("approval did not resume %T creation: %v", object, err)
+		}
+	}
+}
 
 func TestPublicAuthResourcesAreUIDBoundAndRevokedBeforePublisherRemoval(t *testing.T) {
 	scheme := runtime.NewScheme()

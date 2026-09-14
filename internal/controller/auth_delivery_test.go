@@ -120,7 +120,7 @@ func TestReadyAuthDeliveryConsumesBeforeReadingAndDoesNotReplay(t *testing.T) {
 	cluster := readyAuthCluster("1710000000.000100", now.Add(time.Hour))
 	kube, secret := newAuthDeliveryClient(t, cluster, []byte("synthetic-kubeconfig"))
 	recorder := &authDeliveryRecorder{}
-	reconciler := &Reconciler{Client: kube, SecretReader: kube, AuthDelivery: recorder, Now: func() time.Time { return now }}
+	reconciler := &Reconciler{Client: kube, DirectReader: kube, AuthDelivery: recorder, Now: func() time.Time { return now }}
 	recorder.before = func() {
 		stored := &servitorv1alpha1.ServitorCluster{}
 		if err := kube.Get(context.Background(), types.NamespacedName{Namespace: "ns", Name: "cluster"}, stored); err != nil {
@@ -165,7 +165,7 @@ func TestFailedAuthDeliveryRemainsConsumedUntilNewerRequest(t *testing.T) {
 	cluster := readyAuthCluster("1710000000.000100", now.Add(time.Hour))
 	kube, _ := newAuthDeliveryClient(t, cluster, []byte("synthetic-kubeconfig"))
 	recorder := &authDeliveryRecorder{err: errors.New("controlled upload failure")}
-	reconciler := &Reconciler{Client: kube, SecretReader: kube, AuthDelivery: recorder, Now: func() time.Time { return now }}
+	reconciler := &Reconciler{Client: kube, DirectReader: kube, AuthDelivery: recorder, Now: func() time.Time { return now }}
 	stored := &servitorv1alpha1.ServitorCluster{}
 	key := types.NamespacedName{Namespace: "ns", Name: "cluster"}
 	if err := kube.Get(context.Background(), key, stored); err != nil {
@@ -211,7 +211,7 @@ func TestPendingAuthDeliveryBecomesFailedWhenOutcomeWriteFails(t *testing.T) {
 	base, _ := newAuthDeliveryClient(t, cluster, []byte("synthetic-kubeconfig"))
 	kube := &authDeliveryStatusClient{Client: base}
 	recorder := &authDeliveryRecorder{before: func() { kube.failNextStatusUpdate = true }}
-	reconciler := &Reconciler{Client: kube, SecretReader: kube, AuthDelivery: recorder, Now: func() time.Time { return now }}
+	reconciler := &Reconciler{Client: kube, DirectReader: kube, AuthDelivery: recorder, Now: func() time.Time { return now }}
 	key := types.NamespacedName{Namespace: "ns", Name: "cluster"}
 	stored := &servitorv1alpha1.ServitorCluster{}
 	if err := kube.Get(context.Background(), key, stored); err != nil {
@@ -256,7 +256,7 @@ func TestCleanupAfterPendingAuthDeliveryPreventsSecretReadAndUpload(t *testing.T
 	}
 	secretReader := &authSecretReadRecorder{Reader: kube}
 	recorder := &authDeliveryRecorder{}
-	reconciler := &Reconciler{Client: kube, SecretReader: secretReader, AuthDelivery: recorder, Now: func() time.Time { return now }}
+	reconciler := &Reconciler{Client: kube, DirectReader: secretReader, AuthDelivery: recorder, Now: func() time.Time { return now }}
 	stored := &servitorv1alpha1.ServitorCluster{}
 	if err := kube.Get(context.Background(), key, stored); err != nil {
 		t.Fatal(err)
@@ -303,7 +303,7 @@ func TestExpiredAuthRequestCancelsWithoutDelivery(t *testing.T) {
 	cluster := readyAuthCluster("1710000000.000100", now)
 	kube, _ := newAuthDeliveryClient(t, cluster, []byte("synthetic-kubeconfig"))
 	recorder := &authDeliveryRecorder{}
-	reconciler := &Reconciler{Client: kube, SecretReader: kube, AuthDelivery: recorder, Now: func() time.Time { return now }}
+	reconciler := &Reconciler{Client: kube, DirectReader: kube, AuthDelivery: recorder, Now: func() time.Time { return now }}
 	stored := &servitorv1alpha1.ServitorCluster{}
 	if err := kube.Get(context.Background(), types.NamespacedName{Namespace: "ns", Name: "cluster"}, stored); err != nil {
 		t.Fatal(err)

@@ -23,18 +23,18 @@ func TestControllerRoleAllowsInventoryStateDeletion(t *testing.T) {
 	}
 }
 
-func TestControllerRoleAllowsCachedPublisherResources(t *testing.T) {
+func TestControllerRoleUsesDirectPublisherLookups(t *testing.T) {
 	role := loadControllerRole(t)
-	for _, resource := range []struct{ group, resource string }{{"", "serviceaccounts"}, {"rbac.authorization.k8s.io", "roles"}, {"rbac.authorization.k8s.io", "rolebindings"}} {
-		for _, verb := range []string{"get", "list", "watch", "create", "delete"} {
+	for _, resource := range []struct{ group, resource string }{{"", "secrets"}, {"", "serviceaccounts"}, {"rbac.authorization.k8s.io", "roles"}, {"rbac.authorization.k8s.io", "rolebindings"}} {
+		for _, verb := range []string{"get", "create", "delete"} {
 			if !role.allows(resource.group, resource.resource, verb) {
 				t.Errorf("controller Role does not allow %s %s in %q", verb, resource.resource, resource.group)
 			}
 		}
-	}
-	for _, verb := range []string{"list", "watch"} {
-		if role.allows("", "secrets", verb) {
-			t.Errorf("controller Role must not cache Secrets: allows %s", verb)
+		for _, verb := range []string{"list", "watch"} {
+			if role.allows(resource.group, resource.resource, verb) {
+				t.Errorf("controller Role must not cache %s: allows %s", resource.resource, verb)
+			}
 		}
 	}
 }
