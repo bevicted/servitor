@@ -56,7 +56,7 @@ Apply the rendered resources in the target namespace. They include the CRD, cont
 
 ## Slack interface
 
-Enable Socket Mode with `connections:write`, `chat:write`, and the message-history scopes/events needed for the configured channel and DMs. Keep `SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` in the referenced Kubernetes Secret.
+Enable Socket Mode with the `connections:write` app scope. Grant the bot `chat:write`, `files:write`, `im:write`, and the message-history scopes/events needed for the configured channel and DMs, then reinstall the app after changing scopes. Keep `SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` in the referenced Kubernetes Secret.
 
 ```text
 DM
