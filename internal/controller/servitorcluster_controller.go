@@ -27,7 +27,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 )
 
-const cleanupNotificationGrace = 10 * time.Second
+const (
+	cleanupNotificationGrace = 10 * time.Second
+	cleanupProgressRequeue   = time.Second
+)
 
 // Config values are loaded once at manager startup. Existing status snapshots always win.
 type Config struct {
@@ -268,7 +271,7 @@ func (r *Reconciler) requestCleanup(ctx context.Context, cluster *servitorv1alph
 	}
 	cluster.Status.Phase = servitorv1alpha1.PhaseCleanupPending
 	setCondition(cluster, "Ready", metav1.ConditionFalse, string(cluster.Status.Cleanup.Reason), "cleanup is required")
-	return ctrl.Result{}, r.Status().Update(ctx, cluster)
+	return ctrl.Result{RequeueAfter: cleanupProgressRequeue}, r.Status().Update(ctx, cluster)
 }
 
 func applyMayHaveRun(cluster *servitorv1alpha1.ServitorCluster) bool {
@@ -307,7 +310,7 @@ func (r *Reconciler) reconcileCleanup(ctx context.Context, cluster *servitorv1al
 	}
 	cleanup.NextRetryAt = nil
 	cluster.Status.Phase = servitorv1alpha1.PhaseCleanupPending
-	return ctrl.Result{}, r.Status().Update(ctx, cluster)
+	return ctrl.Result{RequeueAfter: cleanupProgressRequeue}, r.Status().Update(ctx, cluster)
 }
 
 // waitForCleanupOperation serializes destroy behind any persisted plan/apply run.
@@ -332,12 +335,12 @@ func (r *Reconciler) waitForCleanupOperation(ctx context.Context, cluster *servi
 				return ctrl.Result{}, createErr
 			}
 			operation.Dispatched = true
-			return ctrl.Result{RequeueAfter: time.Second}, r.Status().Update(ctx, cluster)
+			return ctrl.Result{RequeueAfter: cleanupProgressRequeue}, r.Status().Update(ctx, cluster)
 		}
 		// The operation was persisted but never observed in the API. It cannot be
 		// running; apply ownership was already conservatively recorded at launch.
 		cluster.Status.Operation = nil
-		return ctrl.Result{}, r.Status().Update(ctx, cluster)
+		return ctrl.Result{RequeueAfter: cleanupProgressRequeue}, r.Status().Update(ctx, cluster)
 	}
 	if err != nil {
 		return ctrl.Result{}, err
@@ -354,7 +357,7 @@ func (r *Reconciler) waitForCleanupOperation(ctx context.Context, cluster *servi
 			cluster.Status.ApplyDispatched = true
 		}
 		cluster.Status.Operation = nil
-		return ctrl.Result{}, r.Status().Update(ctx, cluster)
+		return ctrl.Result{RequeueAfter: cleanupProgressRequeue}, r.Status().Update(ctx, cluster)
 	}
 	if !succeeded {
 		return r.recordDestroyFailure(ctx, cluster)

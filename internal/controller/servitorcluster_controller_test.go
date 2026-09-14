@@ -428,6 +428,38 @@ func TestReconcileApprovalRejectsLateAndRejectedDecisions(t *testing.T) {
 	}
 }
 
+func TestReviewExpiryCleanupProgressesWithoutExternalEvents(t *testing.T) {
+	now := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
+	cluster := cleanupCluster(now)
+	deadline := metav1.NewTime(now)
+	cluster.Status.Phase = servitorv1alpha1.PhaseAwaitingApproval
+	cluster.Status.ReviewDeadline = &deadline
+	cluster.Status.Operation = operationReference("plan", "plan-run")
+	plan := &tektonv1.PipelineRun{ObjectMeta: metav1.ObjectMeta{Name: "plan-run", Namespace: "ns", Labels: map[string]string{pipeline.ClusterUIDLabel: string(cluster.UID), pipeline.OperationLabel: "plan"}}}
+	succeededRun(plan)
+	client := fake.NewClientBuilder().WithScheme(cleanupScheme(t)).WithStatusSubresource(&servitorv1alpha1.ServitorCluster{}, &tektonv1.PipelineRun{}).WithObjects(cluster, plan).Build()
+	reconciler := cleanupReconciler(client, now)
+
+	for _, expected := range []time.Duration{cleanupProgressRequeue, cleanupProgressRequeue, cleanupNotificationGrace} {
+		result, err := reconciler.Reconcile(context.Background(), cleanupRequest())
+		if err != nil || result.RequeueAfter != expected {
+			t.Fatalf("cleanup result = %+v, %v; want requeue after %s", result, err, expected)
+		}
+	}
+
+	stored := &servitorv1alpha1.ServitorCluster{}
+	if err := client.Get(context.Background(), cleanupRequest().NamespacedName, stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status.Phase != servitorv1alpha1.PhaseCleanupComplete || stored.Status.Cleanup == nil || stored.Status.Cleanup.Reason != servitorv1alpha1.CleanupReasonReviewExpired || stored.Status.Cleanup.RequiresDestroy {
+		t.Fatalf("expired review did not complete plan-only cleanup: %+v", stored.Status)
+	}
+	var runs tektonv1.PipelineRunList
+	if err := client.List(context.Background(), &runs); err != nil || len(runs.Items) != 0 {
+		t.Fatalf("terminal plan run was not removed: %d, %v", len(runs.Items), err)
+	}
+}
+
 func TestReconcileFailedApplyRequestsCleanupWithoutRetry(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := servitorv1alpha1.AddToScheme(scheme); err != nil {
