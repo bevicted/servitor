@@ -57,7 +57,7 @@ func (r *Reconciler) reconcileAuthDelivery(ctx context.Context, cluster *servito
 
 	current := &servitorv1alpha1.ServitorCluster{}
 	key := types.NamespacedName{Namespace: cluster.Namespace, Name: cluster.Name}
-	if err := r.Get(ctx, key, current); err != nil {
+	if err := r.directReader().Get(ctx, key, current); err != nil {
 		if apierrors.IsNotFound(err) {
 			return ctrl.Result{}, true, nil
 		}

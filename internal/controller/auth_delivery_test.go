@@ -108,6 +108,21 @@ type authSecretReadRecorder struct {
 	reads int
 }
 
+type staleAuthDeliveryClient struct {
+	client.Client
+	stale *servitorv1alpha1.ServitorCluster
+	reads int
+}
+
+func (c *staleAuthDeliveryClient) Get(ctx context.Context, key client.ObjectKey, object client.Object, options ...client.GetOption) error {
+	if cluster, ok := object.(*servitorv1alpha1.ServitorCluster); ok && c.reads > 0 {
+		c.reads--
+		c.stale.DeepCopyInto(cluster)
+		return nil
+	}
+	return c.Client.Get(ctx, key, object, options...)
+}
+
 func (r *authSecretReadRecorder) Get(ctx context.Context, key client.ObjectKey, object client.Object, options ...client.GetOption) error {
 	if _, ok := object.(*corev1.Secret); ok {
 		r.reads++
@@ -157,6 +172,32 @@ func TestReadyAuthDeliveryConsumesBeforeReadingAndDoesNotReplay(t *testing.T) {
 	}
 	if recorder.calls != 1 {
 		t.Fatalf("reconciliation replayed consumed delivery: %d calls", recorder.calls)
+	}
+}
+
+func TestReadyAuthDeliveryRefetchesConsumedStatusWithoutCacheLag(t *testing.T) {
+	now := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
+	cluster := readyAuthCluster("1710000000.000100", now.Add(time.Hour))
+	kube, _ := newAuthDeliveryClient(t, cluster, []byte("synthetic-kubeconfig"))
+	stale := &staleAuthDeliveryClient{Client: kube, stale: cluster.DeepCopy(), reads: 1}
+	recorder := &authDeliveryRecorder{}
+	reconciler := &Reconciler{Client: stale, DirectReader: kube, AuthDelivery: recorder, Now: func() time.Time { return now }}
+	stored := &servitorv1alpha1.ServitorCluster{}
+	key := types.NamespacedName{Namespace: "ns", Name: "cluster"}
+	if err := kube.Get(context.Background(), key, stored); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconciler.reconcileReady(context.Background(), stored); err != nil {
+		t.Fatal(err)
+	}
+	if recorder.calls != 1 {
+		t.Fatalf("cache lag suppressed consumed delivery: %d calls", recorder.calls)
+	}
+	if err := kube.Get(context.Background(), key, stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status.AuthDelivery == nil || stored.Status.AuthDelivery.Outcome != authDeliveryDelivered {
+		t.Fatalf("delivery status = %#v", stored.Status.AuthDelivery)
 	}
 }
 
