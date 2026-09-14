@@ -442,20 +442,46 @@ func (r *Reconciler) completeCleanup(ctx context.Context, cluster *servitorv1alp
 }
 
 func (r *Reconciler) deleteTerminalOperationRuns(ctx context.Context, cluster *servitorv1alpha1.ServitorCluster) error {
-	var runs tektonv1.PipelineRunList
-	if err := r.List(ctx, &runs, client.InNamespace(cluster.Namespace), client.MatchingLabels{pipeline.ClusterUIDLabel: string(cluster.UID)}); err != nil {
+	labels := client.MatchingLabels{pipeline.ClusterUIDLabel: string(cluster.UID)}
+	var pipelineRuns tektonv1.PipelineRunList
+	if err := r.List(ctx, &pipelineRuns, client.InNamespace(cluster.Namespace), labels); err != nil {
 		return err
 	}
-	for i := range runs.Items {
-		done, _ := pipeline.Succeeded(&runs.Items[i])
+	for i := range pipelineRuns.Items {
+		done, _ := pipeline.Succeeded(&pipelineRuns.Items[i])
 		if !done {
-			return fmt.Errorf("active PipelineRun %q cannot be removed during cleanup", runs.Items[i].Name)
+			return fmt.Errorf("active PipelineRun %q cannot be removed during cleanup", pipelineRuns.Items[i].Name)
 		}
-		if err := r.Delete(ctx, &runs.Items[i]); err != nil && !apierrors.IsNotFound(err) {
+	}
+	var taskRuns tektonv1.TaskRunList
+	if err := r.List(ctx, &taskRuns, client.InNamespace(cluster.Namespace), labels); err != nil {
+		return err
+	}
+	for i := range taskRuns.Items {
+		if !taskRunDone(&taskRuns.Items[i]) {
+			return fmt.Errorf("active TaskRun %q cannot be removed during cleanup", taskRuns.Items[i].Name)
+		}
+	}
+	for i := range taskRuns.Items {
+		if err := r.Delete(ctx, &taskRuns.Items[i]); err != nil && !apierrors.IsNotFound(err) {
+			return err
+		}
+	}
+	for i := range pipelineRuns.Items {
+		if err := r.Delete(ctx, &pipelineRuns.Items[i]); err != nil && !apierrors.IsNotFound(err) {
 			return err
 		}
 	}
 	return nil
+}
+
+func taskRunDone(run *tektonv1.TaskRun) bool {
+	for _, condition := range run.Status.Status.Conditions {
+		if condition.Type == "Succeeded" {
+			return condition.Status == corev1.ConditionTrue || condition.Status == corev1.ConditionFalse
+		}
+	}
+	return false
 }
 
 func (r *Reconciler) removeFinalizer(ctx context.Context, cluster *servitorv1alpha1.ServitorCluster) (ctrl.Result, error) {

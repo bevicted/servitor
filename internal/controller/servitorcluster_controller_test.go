@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"strings"
 	"testing"
 	"time"
 
@@ -799,9 +800,14 @@ func TestPlanOnlyCleanupFinalizesWithoutDestroy(t *testing.T) {
 	cluster.Status.Phase = servitorv1alpha1.PhaseCleanupPending
 	cluster.Status.Cleanup = &servitorv1alpha1.CleanupStatus{Reason: servitorv1alpha1.CleanupReasonRejected, RequestedAt: metav1.NewTime(now)}
 	cluster.Status.Operation = operationReference("plan", "plan-run")
-	plan := &tektonv1.PipelineRun{ObjectMeta: metav1.ObjectMeta{Name: "plan-run", Namespace: "ns", Labels: map[string]string{pipeline.ClusterUIDLabel: string(cluster.UID), pipeline.OperationLabel: "plan"}}}
+	labels := map[string]string{pipeline.ClusterUIDLabel: string(cluster.UID), pipeline.OperationLabel: "plan"}
+	plan := &tektonv1.PipelineRun{ObjectMeta: metav1.ObjectMeta{Name: "plan-run", Namespace: "ns", Labels: labels}}
 	succeededRun(plan)
-	client := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&servitorv1alpha1.ServitorCluster{}, &tektonv1.PipelineRun{}).WithObjects(cluster, plan).Build()
+	task := &tektonv1.TaskRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "plan-task", Namespace: "ns", Labels: labels},
+		Status:     tektonv1.TaskRunStatus{Status: duckv1.Status{Conditions: duckv1.Conditions{{Type: apis.ConditionSucceeded, Status: corev1.ConditionTrue}}}},
+	}
+	client := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&servitorv1alpha1.ServitorCluster{}, &tektonv1.PipelineRun{}, &tektonv1.TaskRun{}).WithObjects(cluster, plan, task).Build()
 	reconciler := cleanupReconciler(client, now)
 	for i := 0; i < 2; i++ {
 		if _, err := reconciler.Reconcile(context.Background(), cleanupRequest()); err != nil {
@@ -815,9 +821,31 @@ func TestPlanOnlyCleanupFinalizesWithoutDestroy(t *testing.T) {
 	if stored.Status.Cleanup.CompletedAt == nil || stored.Status.Phase != servitorv1alpha1.PhaseCleanupComplete || !contains(stored.Finalizers, servitorv1alpha1.CleanupFinalizer) {
 		t.Fatalf("plan-only cleanup did not retain its observable completion state: %+v", stored)
 	}
-	var runs tektonv1.PipelineRunList
-	if err := client.List(context.Background(), &runs); err != nil || len(runs.Items) != 0 {
-		t.Fatalf("plan run was not explicitly removed: %d, %v", len(runs.Items), err)
+	var pipelineRuns tektonv1.PipelineRunList
+	if err := client.List(context.Background(), &pipelineRuns); err != nil || len(pipelineRuns.Items) != 0 {
+		t.Fatalf("plan PipelineRun was not explicitly removed: %d, %v", len(pipelineRuns.Items), err)
+	}
+	var taskRuns tektonv1.TaskRunList
+	if err := client.List(context.Background(), &taskRuns); err != nil || len(taskRuns.Items) != 0 {
+		t.Fatalf("plan TaskRun was not explicitly removed: %d, %v", len(taskRuns.Items), err)
+	}
+}
+
+func TestCleanupRefusesActiveTaskRunWithoutDeletingItsPipeline(t *testing.T) {
+	now := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
+	scheme := cleanupScheme(t)
+	cluster := cleanupCluster(now)
+	labels := map[string]string{pipeline.ClusterUIDLabel: string(cluster.UID), pipeline.OperationLabel: "plan"}
+	plan := &tektonv1.PipelineRun{ObjectMeta: metav1.ObjectMeta{Name: "plan-run", Namespace: "ns", Labels: labels}}
+	succeededRun(plan)
+	task := &tektonv1.TaskRun{ObjectMeta: metav1.ObjectMeta{Name: "plan-task", Namespace: "ns", Labels: labels}}
+	client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, plan, task).Build()
+	reconciler := cleanupReconciler(client, now)
+	if err := reconciler.deleteTerminalOperationRuns(context.Background(), cluster); err == nil || !strings.Contains(err.Error(), "active TaskRun") {
+		t.Fatalf("active TaskRun cleanup error = %v", err)
+	}
+	if err := client.Get(context.Background(), types.NamespacedName{Namespace: "ns", Name: "plan-run"}, &tektonv1.PipelineRun{}); err != nil {
+		t.Fatalf("PipelineRun was deleted before its active TaskRun: %v", err)
 	}
 }
 
