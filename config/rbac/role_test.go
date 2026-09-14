@@ -23,6 +23,16 @@ func TestControllerRoleAllowsInventoryStateDeletion(t *testing.T) {
 	}
 }
 
+func TestControllerRoleAllowsTerminalTaskRunDeletion(t *testing.T) {
+	role := loadControllerRole(t)
+	if !role.allows("tekton.dev", "taskruns", "delete") {
+		t.Fatal("controller Role does not allow deleting terminal TaskRuns")
+	}
+	if role.allows("tekton.dev", "taskruns", "create") {
+		t.Fatal("controller Role must not create TaskRuns directly")
+	}
+}
+
 func TestControllerRoleUsesDirectPublisherLookups(t *testing.T) {
 	role := loadControllerRole(t)
 	for _, resource := range []struct{ group, resource string }{{"", "secrets"}, {"", "serviceaccounts"}, {"rbac.authorization.k8s.io", "roles"}, {"rbac.authorization.k8s.io", "rolebindings"}} {

@@ -17,7 +17,7 @@ rules:
     verbs: [get, list, watch, create, delete]
   - apiGroups: [tekton.dev]
     resources: [taskruns]
-    verbs: [get, list, watch]
+    verbs: [get, list, watch, delete]
   - apiGroups: [""]
     resources: [configmaps]
     verbs: [get, list, watch, create, update, patch, delete]
