@@ -23,9 +23,11 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	ctrlconfig "sigs.k8s.io/controller-runtime/pkg/client/config"
+	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 )
 
 func main() {
+	ctrl.SetLogger(zap.New(zap.UseDevMode(false)))
 	configPath := flag.String("config", "", "mounted operator configuration YAML path")
 	flag.Usage = func() {
 		output := flag.CommandLine.Output()
