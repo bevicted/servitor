@@ -5,7 +5,29 @@ import (
 	"time"
 
 	"github.com/bevicted/servitor/internal/config"
+	rbacv1 "k8s.io/api/rbac/v1"
 )
+
+func TestControllerSchemeRegistersRBACResources(t *testing.T) {
+	scheme, err := controllerScheme()
+	if err != nil {
+		t.Fatal(err)
+	}
+	role, err := scheme.New(rbacv1.SchemeGroupVersion.WithKind("Role"))
+	if err != nil {
+		t.Fatalf("resolve Role GVK: %v", err)
+	}
+	if _, ok := role.(*rbacv1.Role); !ok {
+		t.Errorf("Role GVK resolved to %T", role)
+	}
+	binding, err := scheme.New(rbacv1.SchemeGroupVersion.WithKind("RoleBinding"))
+	if err != nil {
+		t.Fatalf("resolve RoleBinding GVK: %v", err)
+	}
+	if _, ok := binding.(*rbacv1.RoleBinding); !ok {
+		t.Errorf("RoleBinding GVK resolved to %T", binding)
+	}
+}
 
 func TestControllerConfigCarriesAllStartupDefaultInputs(t *testing.T) {
 	settings, err := controllerConfig(config.Config{Defaults: config.DefaultsConfig{

@@ -17,6 +17,7 @@ import (
 	"github.com/bevicted/servitor/internal/state"
 	tektonv1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1"
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -49,14 +50,8 @@ func main() {
 	if err != nil {
 		fail(err)
 	}
-	scheme := runtime.NewScheme()
-	if err := corev1.AddToScheme(scheme); err != nil {
-		fail(err)
-	}
-	if err := servitorv1alpha1.AddToScheme(scheme); err != nil {
-		fail(err)
-	}
-	if err := tektonv1.AddToScheme(scheme); err != nil {
+	scheme, err := controllerScheme()
+	if err != nil {
 		fail(err)
 	}
 	manager, err := ctrl.NewManager(restConfig, ctrl.Options{
@@ -104,6 +99,21 @@ func main() {
 	if err := manager.Start(ctrl.SetupSignalHandler()); err != nil && !errors.Is(err, context.Canceled) {
 		fail(err)
 	}
+}
+
+func controllerScheme() (*runtime.Scheme, error) {
+	scheme := runtime.NewScheme()
+	for _, addToScheme := range []func(*runtime.Scheme) error{
+		corev1.AddToScheme,
+		servitorv1alpha1.AddToScheme,
+		tektonv1.AddToScheme,
+		rbacv1.AddToScheme,
+	} {
+		if err := addToScheme(scheme); err != nil {
+			return nil, err
+		}
+	}
+	return scheme, nil
 }
 
 func controllerConfig(operator config.Config) (controller.Config, error) {
