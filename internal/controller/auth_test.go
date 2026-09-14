@@ -2,8 +2,12 @@ package controller
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
+
+	"gopkg.in/yaml.v3"
 
 	servitorv1alpha1 "github.com/bevicted/servitor/api/v1alpha1"
 	"github.com/bevicted/servitor/internal/pipeline"
@@ -79,6 +83,92 @@ func TestApprovalResumesPartialPublisherResourcesWithoutInformerCache(t *testing
 			t.Fatalf("approval did not resume %T creation: %v", object, err)
 		}
 	}
+}
+
+func TestGeneratedPublisherRolePermissionsAreHeldByController(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := rbacv1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", UID: "allocation-uid"}}
+	name := authResourceName(cluster)
+	client := fake.NewClientBuilder().WithScheme(scheme).Build()
+	if err := (&Reconciler{Client: client}).ensurePublisherRole(context.Background(), cluster, name, map[string]string{authUIDLabel: string(cluster.UID)}); err != nil {
+		t.Fatal(err)
+	}
+	publisher := &rbacv1.Role{}
+	if err := client.Get(context.Background(), types.NamespacedName{Namespace: cluster.Namespace, Name: name}, publisher); err != nil {
+		t.Fatal(err)
+	}
+	if len(publisher.Rules) != 1 || !publisherRuleAllows(publisher.Rules[0], name, "get") || !publisherRuleAllows(publisher.Rules[0], name, "update") || !publisherRuleAllows(publisher.Rules[0], name, "patch") {
+		t.Fatalf("generated publisher Role does not have its expected Secret permissions: %#v", publisher.Rules)
+	}
+	for _, verb := range []string{"create", "list", "watch"} {
+		if publisherRuleAllows(publisher.Rules[0], name, verb) {
+			t.Errorf("generated publisher Role must not allow Secret %s", verb)
+		}
+	}
+	if publisherRuleAllows(publisher.Rules[0], "other-allocation-secret", "get") {
+		t.Error("generated publisher Role can read another allocation Secret")
+	}
+
+	data, err := os.ReadFile(filepath.Join("..", "..", "config", "rbac", "role.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var parent controllerRoleManifest
+	if err := yaml.Unmarshal(data, &parent); err != nil {
+		t.Fatal(err)
+	}
+	for _, publisherRule := range publisher.Rules {
+		for _, verb := range publisherRule.Verbs {
+			if !parentAllows(parent.Rules, publisherRule, verb) {
+				t.Errorf("controller Role does not hold delegated publisher permission %q on %q", verb, publisherRule.Resources)
+			}
+		}
+	}
+}
+
+func publisherRuleAllows(rule rbacv1.PolicyRule, secretName, verb string) bool {
+	return containsString(rule.APIGroups, "") && containsString(rule.Resources, "secrets") && containsString(rule.ResourceNames, secretName) && containsString(rule.Verbs, verb)
+}
+
+type controllerRoleManifest struct {
+	Rules []controllerRoleRule `yaml:"rules"`
+}
+
+type controllerRoleRule struct {
+	APIGroups     []string `yaml:"apiGroups"`
+	Resources     []string `yaml:"resources"`
+	ResourceNames []string `yaml:"resourceNames"`
+	Verbs         []string `yaml:"verbs"`
+}
+
+func parentAllows(parentRules []controllerRoleRule, publisherRule rbacv1.PolicyRule, verb string) bool {
+	for _, parentRule := range parentRules {
+		if !containsString(parentRule.APIGroups, "") || !containsString(parentRule.Resources, "secrets") || !containsString(parentRule.Verbs, verb) {
+			continue
+		}
+		if len(parentRule.ResourceNames) == 0 {
+			return true
+		}
+		for _, name := range publisherRule.ResourceNames {
+			if !containsString(parentRule.ResourceNames, name) {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
+func containsString(values []string, expected string) bool {
+	for _, value := range values {
+		if value == expected {
+			return true
+		}
+	}
+	return false
 }
 
 func TestPublicAuthResourcesAreUIDBoundAndRevokedBeforePublisherRemoval(t *testing.T) {
