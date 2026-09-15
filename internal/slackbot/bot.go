@@ -705,13 +705,13 @@ func (b Bot) list(ctx context.Context, user string, respond func(string)) {
 		respond(rejectedText("List is unavailable. Inspect the allocation CR status and private cluster logs."))
 		return
 	}
-	clusters, err := b.ownerAllocations(ctx, user)
-	if err != nil {
+	var clusters servitorv1alpha1.ServitorClusterList
+	if err := b.allocationReader().List(ctx, &clusters, client.InNamespace(b.Namespace)); err != nil {
 		b.logf("list allocations: %v", err)
 		respond(rejectedText("Unable to list clusters. No operation was started."))
 		return
 	}
-	for _, text := range clusterListMessages(clusters, user, b.now()) {
+	for _, text := range clusterListMessages(clusters.Items, user, b.now()) {
 		respond(text)
 	}
 }

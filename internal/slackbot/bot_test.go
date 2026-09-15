@@ -1173,6 +1173,23 @@ func TestHandleListReportsCallerAllocationsInDMAndChannel(t *testing.T) {
 		run(t, bot, responses, nil, []string{"other-owner-sentinel", "applying", "eu-de", "2031-01-02 03:04:05 UTC", "Uother"})
 	})
 
+	t.Run("redacts other persisted owner IDs", func(t *testing.T) {
+		caller := &servitorv1alpha1.ServitorCluster{
+			ObjectMeta: metav1.ObjectMeta{Name: "caller", Namespace: "servitor"},
+			Spec:       servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "Ucaller"}},
+			Status: servitorv1alpha1.ServitorClusterStatus{
+				Phase:           servitorv1alpha1.PhaseReady,
+				ResolvedOptions: &servitorv1alpha1.ResolvedOptions{ClusterName: "servitor-private-owner-id", Region: "us-south/private-owner-id"},
+			},
+		}
+		other := &servitorv1alpha1.ServitorCluster{
+			ObjectMeta: metav1.ObjectMeta{Name: "other", Namespace: "servitor"},
+			Spec:       servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "private-owner-id"}},
+		}
+		bot, responses := botForTest(t, caller, other)
+		run(t, bot, responses, []string{"ready"}, []string{"private-owner-id"})
+	})
+
 	t.Run("all caller lifecycle phases", func(t *testing.T) {
 		phases := []string{
 			servitorv1alpha1.PhasePending,
