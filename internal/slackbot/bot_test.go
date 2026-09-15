@@ -674,14 +674,14 @@ func TestThreadOwnerMutatesOnlySpecIntent(t *testing.T) {
 	if err := bot.Client.Update(context.Background(), cluster); err != nil {
 		t.Fatal(err)
 	}
-	if err := bot.Handle(context.Background(), Envelope{ID: "extend", Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "extend 1h", Timestamp: "reply", ThreadTimestamp: "root"}}); err != nil {
+	if err := bot.Handle(context.Background(), Envelope{ID: "extend", Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "extend 1h", Timestamp: "200.000001", ThreadTimestamp: "root"}}); err != nil {
 		t.Fatal(err)
 	}
 	if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: cluster.Name}, cluster); err != nil {
 		t.Fatal(err)
 	}
-	if cluster.Spec.Lifecycle.RequestedExpiry == nil || !cluster.Spec.Lifecycle.RequestedExpiry.Time.Equal(expiry.Add(time.Hour)) {
-		t.Fatalf("extension=%+v", cluster.Spec.Lifecycle.RequestedExpiry)
+	if cluster.Spec.Lifecycle.RequestedExpiry == nil || !cluster.Spec.Lifecycle.RequestedExpiry.Time.Equal(expiry.Add(time.Hour)) || cluster.Spec.Lifecycle.ExtensionEventTimestamp != "200.000001" {
+		t.Fatalf("extension=%+v", cluster.Spec.Lifecycle)
 	}
 	if err := bot.Handle(context.Background(), Envelope{ID: "foreign", Message: Message{Channel: "C1", ChannelType: "channel", User: "U2", Text: "done", Timestamp: "reply", ThreadTimestamp: "root"}}); err != nil {
 		t.Fatal(err)
@@ -690,6 +690,38 @@ func TestThreadOwnerMutatesOnlySpecIntent(t *testing.T) {
 		t.Fatal("foreign user requested cleanup")
 	}
 }
+func TestChannelAndDMExtensionsDoNotMutateIntent(t *testing.T) {
+	now := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
+	expiry := metav1.NewTime(now.Add(time.Hour))
+	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: ownerClusterName("U1"), Namespace: "servitor"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 3600}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseReady, LeaseExpiresAt: &expiry, LifecycleSnapshot: &servitorv1alpha1.LifecycleSnapshot{InitialLeaseSeconds: 3600}}}
+	bot, responses := botForTest(t, cluster)
+	for _, event := range []Envelope{
+		{ID: "channel-bare", Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "<@BOT> extend", Timestamp: "100.000001"}},
+		{ID: "channel-duration", Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "<@BOT> extend 1h", Timestamp: "100.000002"}},
+		{ID: "dm", Message: Message{Channel: "D1", ChannelType: "im", User: "U1", Text: "extend 1h", Timestamp: "100.000003"}},
+	} {
+		if err := bot.Handle(context.Background(), event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(responses.responses) != 3 {
+		t.Fatalf("extension responses = %+v", responses.responses)
+	}
+	if got := []string{responses.responses[0].Text, responses.responses[1].Text}; !reflect.DeepEqual(got, []string{unknownText(), unknownText()}) {
+		t.Fatalf("channel extension responses = %q", got)
+	}
+	if got := responses.responses[2].Text; got != rejectedText("`extend [N[h]]` is available only in your lifecycle thread.") {
+		t.Fatalf("DM extension response = %q", got)
+	}
+	stored := &servitorv1alpha1.ServitorCluster{}
+	if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: cluster.Name}, stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.Spec.Lifecycle.RequestedExpiry != nil || stored.Spec.Lifecycle.ExtensionEventTimestamp != "" {
+		t.Fatalf("non-thread extension changed intent: %+v", stored.Spec.Lifecycle)
+	}
+}
+
 func TestStaleExtensionDoesNotRecomputeTargetAfterReceiptEviction(t *testing.T) {
 	expiry := metav1.NewTime(time.Date(2026, 9, 8, 4, 0, 0, 0, time.UTC))
 	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: ownerClusterName("U1"), Namespace: "servitor"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 14400}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseReady, LeaseExpiresAt: &expiry, LifecycleSnapshot: &servitorv1alpha1.LifecycleSnapshot{InitialLeaseSeconds: 14400}}}
@@ -782,7 +814,7 @@ func TestHelpDoesNotExposeMaintainerControls(t *testing.T) {
 	if len(responses.responses) != 1 {
 		t.Fatal("missing help")
 	}
-	for _, forbidden := range []string{"status", "pause", "unpause", "stop", "Maintainer"} {
+	for _, forbidden := range []string{"status", "pause", "unpause", "stop", "Maintainer", "@servitor extend"} {
 		if containsText(responses.responses[0].Text, forbidden) {
 			t.Fatalf("help exposed %q: %s", forbidden, responses.responses[0].Text)
 		}
@@ -879,7 +911,7 @@ func TestLifecycleHelpExplainsAvailableStates(t *testing.T) {
 		wanted  []string
 	}{
 		{command: "help done", wanted: []string{"cleanup completes", "cleanup in progress"}},
-		{command: "help extend", wanted: []string{"only while the lease is ready", "planning, cleanup, or after expiry"}},
+		{command: "help extend", wanted: []string{"only in your lifecycle thread", "only while the lease is ready", "planning, cleanup, or after expiry"}},
 	} {
 		responses.responses = nil
 		if err := bot.Handle(context.Background(), Envelope{ID: topic.command, Message: Message{Channel: "D1", ChannelType: "im", User: "U1", Text: topic.command}}); err != nil {
@@ -892,6 +924,9 @@ func TestLifecycleHelpExplainsAvailableStates(t *testing.T) {
 			if !containsText(responses.responses[0].Text, wanted) {
 				t.Fatalf("%s help missing %q: %s", topic.command, wanted, responses.responses[0].Text)
 			}
+		}
+		if topic.command == "help extend" && containsText(responses.responses[0].Text, "@servitor extend") {
+			t.Fatalf("%s help advertised channel extension: %s", topic.command, responses.responses[0].Text)
 		}
 	}
 }
@@ -1017,7 +1052,12 @@ func TestLifecycleCommandsExplainStateAndRecordOnlyAcceptedIntent(t *testing.T) 
 		}
 	}
 	message := func(text string) Envelope {
-		return Envelope{ID: text, Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "<@BOT> " + text, Timestamp: "100.000001"}}
+		event := Envelope{ID: text, Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "<@BOT> " + text, Timestamp: "100.000001"}}
+		if firstToken(text) == "extend" {
+			event.Message.Text = text
+			event.Message.ThreadTimestamp = "root"
+		}
+		return event
 	}
 
 	for _, test := range []struct {
@@ -1083,7 +1123,7 @@ func TestLifecycleCommandsKeepForeignAndWrongThreadRequestsSilent(t *testing.T) 
 	bot, responses := botForTest(t, cluster)
 	for _, event := range []Envelope{
 		{ID: "foreign", Message: Message{Channel: "C1", ChannelType: "channel", User: "U2", Text: "extend nonsense", Timestamp: "100.000001", ThreadTimestamp: "root"}},
-		{ID: "wrong-thread", Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "done", Timestamp: "100.000002", ThreadTimestamp: "other"}},
+		{ID: "wrong-thread", Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "extend 1h", Timestamp: "100.000002", ThreadTimestamp: "other"}},
 	} {
 		if err := bot.Handle(context.Background(), event); err != nil {
 			t.Fatal(err)
@@ -1107,7 +1147,7 @@ func TestExtensionFeedbackAfterPersistenceFailureAndConflict(t *testing.T) {
 	cluster := func() *servitorv1alpha1.ServitorCluster {
 		return &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: ownerClusterName("U1"), Namespace: "servitor"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 3600}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseReady, LeaseExpiresAt: expiry.DeepCopy(), LifecycleSnapshot: &servitorv1alpha1.LifecycleSnapshot{InitialLeaseSeconds: 3600}}}
 	}
-	event := Envelope{ID: "extend", Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "<@BOT> extend 1h", Timestamp: "100.000001"}}
+	event := Envelope{ID: "extend", Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "extend 1h", Timestamp: "100.000001", ThreadTimestamp: "root"}}
 	t.Run("persistence failure", func(t *testing.T) {
 		recorder := &progressRecorder{}
 		bot := progressBotForTest(t, recorder, false, true, cluster())

@@ -68,7 +68,6 @@ Configured channel
   @servitor help [command]
   @servitor create [safe options]
   @servitor done
-  @servitor extend [N[h]]
   @servitor list
 
 Lifecycle thread
@@ -82,7 +81,7 @@ Lifecycle thread
 
 `list` returns an explicit empty state when no allocations are recorded. In a nonempty list, `*` identifies only the caller's allocation; other owner identities are not displayed. Cleanup in progress and cleanup complete are distinct states. Lease deadlines are persisted UTC timestamps with remaining time; an expired lease is labeled `expired` and an allocation without a deadline is labeled `never`.
 
-Ready messages show how to extend or release an allocation: reply with `extend [N[h]]` or `done` in its lifecycle thread, or use `@servitor extend [N[h]]` or `@servitor done` in the configured channel.
+Ready messages show how to extend or release an allocation: reply with `extend [N[h]]` or `done` in its lifecycle thread, or use `@servitor done` in the configured channel.
 
 Optional `slack.maintainer_ids` holds exact Slack user IDs. Only those users can send the exact `refresh inventory` command in a DM; it starts or joins the normal private target refreshes and later receives a safe success, partial-failure, or failure summary. Empty `maintainer_ids` disables the command. The command never reveals target inventories or changes allocations. There are no maintainer `status`, `pause`, `unpause`, or `stop` commands.
 

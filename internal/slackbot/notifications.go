@@ -414,7 +414,7 @@ func readyNoticeTexts(ownerID string, ready *servitorv1alpha1.ReadySummary, expi
 	}
 	header := []string{"Resource", "Name", "ID"}
 	texts := statusTableChunks(fmt.Sprintf("<@%s> your request is complete.\n\nCreated", ownerID), header, created, "")
-	conclusion := "\nThis lease will expire at " + lifecycle.FormatLeaseExpiry(expiry, now) + ".\nUse `extend [N[h]]` in this thread or `@servitor extend [N[h]]` in the configured channel. Use `done` or `@servitor done` to release resources sooner."
+	conclusion := "\nThis lease will expire at " + lifecycle.FormatLeaseExpiry(expiry, now) + ".\nUse `extend [N[h]]` in this thread. Use `done` or `@servitor done` to release resources sooner."
 	return append(texts, statusTableChunks("Reused", header, reused, conclusion)...)
 }
 

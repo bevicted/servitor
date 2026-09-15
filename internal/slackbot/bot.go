@@ -126,7 +126,7 @@ func (b Bot) Handle(ctx context.Context, envelope Envelope) error {
 			b.auth(ctx, message, thread, reply)
 		default:
 			if firstToken(message.Text) == "extend" {
-				b.extend(ctx, message, thread, true, reply)
+				b.extend(ctx, message, thread, reply)
 			}
 		}
 		return claim()
@@ -148,9 +148,6 @@ func (b Bot) Handle(ctx context.Context, envelope Envelope) error {
 		b.cleanup(ctx, message, thread, true)
 	case "destroy":
 		b.cleanup(ctx, message, thread, false)
-	case "extend":
-		message.Text = text
-		b.extend(ctx, message, thread, false, reply)
 	default:
 		reply(unknownText())
 	}
@@ -171,8 +168,10 @@ func (b Bot) handleDM(ctx context.Context, message Message, eventID string) {
 			return
 		}
 		b.requestInventoryRefresh(ctx, message, eventID, respond)
-	case "create", "done", "destroy", "extend":
+	case "create", "done", "destroy":
 		respond(rejectedText(channelOnlyText(b.ChannelID)))
+	case "extend":
+		respond(rejectedText("`extend [N[h]]` is available only in your lifecycle thread."))
 	default:
 		respond(unknownText())
 	}
@@ -494,15 +493,12 @@ func (b Bot) publicAuthEligible(cluster *servitorv1alpha1.ServitorCluster) bool 
 	return slices.Contains(b.PublicAuthTargets, target)
 }
 
-func (b Bot) extend(ctx context.Context, message Message, thread string, requireThread bool, respond func(string)) {
+func (b Bot) extend(ctx context.Context, message Message, thread string, respond func(string)) {
 	cluster, err := b.ownerCluster(ctx, message.User)
 	if err != nil {
-		if !requireThread {
-			respond(lifecycleLookupText(err))
-		}
 		return
 	}
-	if !ownsThread(cluster, message, thread, requireThread) {
+	if !ownsThread(cluster, message, thread, true) {
 		return
 	}
 	increment, err := command.ParseExtend(message.Text)
@@ -516,7 +512,7 @@ func (b Bot) extend(ctx context.Context, message Message, thread string, require
 	}
 	stateText := ""
 	updated, err := b.updateIntent(ctx, cluster.Name, func(current *servitorv1alpha1.ServitorCluster) (bool, error) {
-		if !ownsThread(current, message, thread, requireThread) {
+		if !ownsThread(current, message, thread, true) {
 			return false, nil
 		}
 		if text := extensionUnavailableText(current, b.now()); text != "" {
@@ -856,7 +852,7 @@ func (b Bot) respondHelp(text string, respond func(string), maintainer bool) {
 	case "done":
 		messages = []string{"`done` releases your resources. Use it in your lifecycle thread, or as `@servitor done` in the configured channel. It is unavailable after cleanup completes; repeated requests report cleanup in progress."}
 	case "extend":
-		messages = []string{"`extend [N[h]]` extends your ready lease by the configured duration or by 1 through 24 whole hours. Use it in your lifecycle thread or as `@servitor extend` in the configured channel. It is available only while the lease is ready, not during planning, cleanup, or after expiry."}
+		messages = []string{"`extend [N[h]]` extends your ready lease by the configured duration or by 1 through 24 whole hours. Use it only in your lifecycle thread. It is available only while the lease is ready, not during planning, cleanup, or after expiry."}
 	case "auth":
 		messages = []string{"`auth` sends the stored public kubeconfig to the allocation owner's DM. Use exact `auth` only in the initiating lifecycle thread. Requests made before Ready are queued; a failed or interrupted delivery is not retried automatically, so send a newer `auth` request to resend the stored file. Private-only and Satellite authentication is not implemented yet."}
 	case "list":
@@ -942,7 +938,7 @@ func firstToken(text string) string {
 func unknownText() string               { return "Command unknown.\n\n" + helpOverview(false)[0] }
 func rejectedText(reason string) string { return "Command rejected.\n\n" + reason }
 func helpOverview(maintainer bool) []string {
-	text := "Servitor provisions one temporary IBM Cloud cluster per Slack user.\n\nCommands\n```\nDM\n  help [command]          print help\n  list                    list clusters\n\nConfigured channel\n  @servitor help [command]  print help\n  @servitor create [safe options]  provision a new cluster\n  @servitor done            release your resources\n  @servitor extend [N[h]]   extend your lease\n  @servitor list            list clusters\n\nLifecycle thread\n  yes                       approve the cluster plan\n  no                        reject the cluster plan\n  done                      release your resources\n  extend [N[h]]             extend your lease\n  auth                      send stored public access to your DM\n"
+	text := "Servitor provisions one temporary IBM Cloud cluster per Slack user.\n\nCommands\n```\nDM\n  help [command]          print help\n  list                    list clusters\n\nConfigured channel\n  @servitor help [command]  print help\n  @servitor create [safe options]  provision a new cluster\n  @servitor done            release your resources\n  @servitor list            list clusters\n\nLifecycle thread\n  yes                       approve the cluster plan\n  no                        reject the cluster plan\n  done                      release your resources\n  extend [N[h]]             extend your lease\n  auth                      send stored public access to your DM\n"
 	if maintainer {
 		text += "\nMaintainer DM\n  refresh inventory         refresh private inventory\n"
 	}
