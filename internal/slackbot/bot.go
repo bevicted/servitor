@@ -982,7 +982,7 @@ func (b Bot) respondHelp(text string, respond func(string), maintainer bool) {
 	case "auth":
 		messages = []string{"`auth` sends the stored public kubeconfig to the allocation owner's DM. Use exact `auth` only in the initiating lifecycle thread. Requests made before Ready are queued; a failed or interrupted delivery is not retried automatically, so send a newer `auth` request to resend the stored file. Private-only and Satellite authentication is not implemented yet."}
 	case "list":
-		messages = []string{"`list` shows available cluster state. `*` marks your allocation; cleanup in progress and cleanup complete are shown separately. Use it in a DM or as `@servitor list` in the configured channel."}
+		messages = []string{"`list` shows only your allocations in a table with cluster, state, location, and expires columns. Cleanup in progress and cleanup complete are shown separately. Use it in a DM or as `@servitor list` in the configured channel."}
 	case "refresh":
 		if maintainer {
 			messages = []string{"`refresh inventory` starts or joins a private inventory refresh. Use it only in a DM; a safe completion summary follows."}

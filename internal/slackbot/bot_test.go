@@ -988,8 +988,8 @@ func TestHelpDoesNotExposeMaintainerControls(t *testing.T) {
 		}
 	}
 }
-func TestHandleListReportsEmptyAndLifecycleStatesInDMAndChannel(t *testing.T) {
-	run := func(t *testing.T, bot Bot, responses *memoryResponder, expected []string) {
+func TestHandleListReportsCallerAllocationsInDMAndChannel(t *testing.T) {
+	run := func(t *testing.T, bot Bot, responses *memoryResponder, expected, absent []string) {
 		t.Helper()
 		for _, test := range []struct {
 			name, channel, channelType, text, timestamp, thread string
@@ -1010,21 +1010,35 @@ func TestHandleListReportsEmptyAndLifecycleStatesInDMAndChannel(t *testing.T) {
 				if response.Channel != test.channel || response.ThreadTimestamp != test.thread {
 					t.Fatalf("response routing = %+v", response)
 				}
+				if !strings.HasPrefix(response.Text, "Your allocations:\n```\n") {
+					t.Fatalf("response has no list heading and table: %s", response.Text)
+				}
+				header := strings.Split(response.Text, "\n")[2]
+				if fields := strings.Fields(header); len(fields) != 4 || strings.Join(fields, ",") != "cluster,state,location,expires" {
+					t.Fatalf("table header = %q", header)
+				}
 				for _, want := range expected {
 					if !strings.Contains(response.Text, want) {
 						t.Fatalf("response missing %q: %s", want, response.Text)
+					}
+				}
+				for _, value := range absent {
+					if strings.Contains(response.Text, value) {
+						t.Fatalf("response rendered another owner's value %q: %s", value, response.Text)
 					}
 				}
 			})
 		}
 	}
 
-	t.Run("empty", func(t *testing.T) {
-		bot, responses := botForTest(t)
-		run(t, bot, responses, []string{listLegend, "cluster", "state", "location", "expires"})
+	t.Run("only other owners", func(t *testing.T) {
+		expires := metav1.NewTime(time.Date(2031, 1, 2, 3, 4, 5, 0, time.UTC))
+		other := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "other", Namespace: "servitor"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "Uother"}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseApplying, ResolvedOptions: &servitorv1alpha1.ResolvedOptions{ClusterName: "other-owner-sentinel", Region: "eu-de"}, LeaseExpiresAt: &expires}}
+		bot, responses := botForTest(t, other)
+		run(t, bot, responses, nil, []string{"other-owner-sentinel", "applying", "eu-de", "2031-01-02 03:04:05 UTC", "Uother"})
 	})
 
-	t.Run("all lifecycle phases", func(t *testing.T) {
+	t.Run("all caller lifecycle phases", func(t *testing.T) {
 		phases := []string{
 			servitorv1alpha1.PhasePending,
 			servitorv1alpha1.PhasePlanning,
@@ -1035,29 +1049,25 @@ func TestHandleListReportsEmptyAndLifecycleStatesInDMAndChannel(t *testing.T) {
 			servitorv1alpha1.PhaseCleanupComplete,
 			servitorv1alpha1.PhaseUnresolved,
 		}
-		objects := make([]runtime.Object, 0, len(phases))
+		objects := make([]runtime.Object, 0, len(phases)+1)
 		for index, phase := range phases {
-			owner := fmt.Sprintf("Uother-%d", index)
-			if phase == servitorv1alpha1.PhaseReady {
-				owner = "Ucaller"
+			name, location := fmt.Sprintf("cluster-%d", index), "us-south/us-south-1"
+			if phase == servitorv1alpha1.PhaseAwaitingApproval {
+				name, location = "servitor-260914043417-26841e2f", "us-south"
 			}
 			objects = append(objects, &servitorv1alpha1.ServitorCluster{
 				ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("allocation-%d", index), Namespace: "servitor"},
-				Spec:       servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: owner}},
-				Status:     servitorv1alpha1.ServitorClusterStatus{Phase: phase, ResolvedOptions: &servitorv1alpha1.ResolvedOptions{ClusterName: fmt.Sprintf("cluster-%d", index), Region: "us-south/us-south-1"}},
+				Spec:       servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "Ucaller"}},
+				Status:     servitorv1alpha1.ServitorClusterStatus{Phase: phase, ResolvedOptions: &servitorv1alpha1.ResolvedOptions{ClusterName: name, Region: location}},
 			})
 		}
+		objects = append(objects, &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "other", Namespace: "servitor"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "Uother"}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseReady, ResolvedOptions: &servitorv1alpha1.ResolvedOptions{ClusterName: "other-owner-sentinel", Region: "eu-de"}}})
 		bot, responses := botForTest(t, objects...)
-		run(t, bot, responses, []string{listLegend, "planning", "review", "applying", "ready", "cleanup in progress", "cleanup complete", "unresolved"})
-		for _, response := range responses.responses {
-			if strings.Contains(response.Text, "Ucaller") || strings.Contains(response.Text, "Uother-") {
-				t.Fatalf("list leaked owner identity: %s", response.Text)
-			}
-		}
+		run(t, bot, responses, []string{"servitor-260914043417-26841e2f", "review", "us-south", "never", "planning", "applying", "ready", "cleanup in progress", "cleanup complete", "unresolved"}, []string{"other-owner-sentinel", "eu-de", "Ucaller", "Uother", "*"})
 	})
 }
 
-func TestListHelpExplainsOwnershipAndCleanupStates(t *testing.T) {
+func TestListHelpExplainsCallerOnlyAllocationsAndCleanupStates(t *testing.T) {
 	bot, responses := botForTest(t)
 	if err := bot.Handle(context.Background(), Envelope{ID: "list-help", Message: Message{Channel: "D1", ChannelType: "im", User: "Ucaller", Text: "help list"}}); err != nil {
 		t.Fatal(err)
@@ -1065,10 +1075,13 @@ func TestListHelpExplainsOwnershipAndCleanupStates(t *testing.T) {
 	if len(responses.responses) != 1 {
 		t.Fatalf("responses = %+v", responses.responses)
 	}
-	for _, want := range []string{"`*` marks your allocation", "cleanup in progress", "cleanup complete"} {
+	for _, want := range []string{"only your allocations", "cluster, state, location, and expires", "Cleanup in progress", "cleanup complete"} {
 		if !strings.Contains(responses.responses[0].Text, want) {
 			t.Fatalf("list help missing %q: %s", want, responses.responses[0].Text)
 		}
+	}
+	if strings.Contains(responses.responses[0].Text, "marks your allocation") {
+		t.Fatalf("list help retained marker legend: %s", responses.responses[0].Text)
 	}
 }
 

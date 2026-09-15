@@ -13,33 +13,63 @@ import (
 
 func TestClusterListMessagesRendersEmptyTable(t *testing.T) {
 	messages := clusterListMessages(nil, "Ucaller", time.Now())
-	const expected = "`*` marks your allocations.\n```\n  cluster  state  location  expires\n```"
+	const expected = "Your allocations:\n```\ncluster  state  location  expires\n```"
 	if len(messages) != 1 || messages[0] != expected {
 		t.Fatalf("empty list messages = %q", messages)
 	}
 }
 
-func TestClusterListRendersSafeStatusWithoutSlackIDs(t *testing.T) {
+func TestClusterListMessagesRenderOnlyCallerAllocations(t *testing.T) {
 	expires := metav1.NewTime(time.Date(2026, 9, 8, 4, 0, 0, 0, time.UTC))
 	clusters := []servitorv1alpha1.ServitorCluster{
 		{Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "Ucaller"}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseReady, ResolvedOptions: &servitorv1alpha1.ResolvedOptions{ClusterName: "servitor-one", Region: "us-south/us-south-1"}, LeaseExpiresAt: &expires}},
-		{Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "Uother"}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseApplying, ResolvedOptions: &servitorv1alpha1.ResolvedOptions{ClusterName: "bad<@Ucaller>", Region: "../../bad"}}},
-		{Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "Ucleanup-pending"}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseCleanupPending}},
-		{Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "Ucleanup-complete"}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseCleanupComplete}},
+		{Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "Ucaller"}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseCleanupComplete}},
+		{Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "Uother"}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseApplying, ResolvedOptions: &servitorv1alpha1.ResolvedOptions{ClusterName: "other-owner-sentinel", Region: "eu-de/eu-de-1"}}},
 	}
 	text := strings.Join(clusterListMessages(clusters, "Ucaller", time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)), "\n")
-	for _, want := range []string{listLegend, "servitor-one", "ready", "applying", "cleanup in progress", "cleanup complete", "2026-09-08 04:00:00 UTC (~4h)"} {
+	for _, want := range []string{"Your allocations:", "servitor-one", "ready", "cleanup complete", "2026-09-08 04:00:00 UTC (~4h)"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("list missing %q: %s", want, text)
 		}
 	}
-	if !strings.Contains(text, "\n* ") || strings.Index(text, "servitor-one") > strings.Index(text, "applying") {
-		t.Fatalf("list did not retain caller marker and expiry ordering: %s", text)
-	}
-	for _, private := range []string{"Ucaller", "Uother", "Ucleanup-pending", "Ucleanup-complete", "bad"} {
-		if strings.Contains(text, private) {
-			t.Fatalf("list leaked %q: %s", private, text)
+	for _, absent := range []string{"other-owner-sentinel", "applying", "eu-de"} {
+		if strings.Contains(text, absent) {
+			t.Fatalf("list rendered another owner's value %q: %s", absent, text)
 		}
+	}
+	if strings.Index(text, "servitor-one") > strings.Index(text, "cleanup complete") {
+		t.Fatalf("list did not retain expiry ordering: %s", text)
+	}
+	if strings.Contains(text, "*") {
+		t.Fatalf("list retained owner marker: %s", text)
+	}
+}
+
+func TestClusterListSuppressesAllPersistedOwnerIDs(t *testing.T) {
+	clusters := []servitorv1alpha1.ServitorCluster{
+		{Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "Ucaller"}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseReady, ResolvedOptions: &servitorv1alpha1.ResolvedOptions{ClusterName: "servitor-private-owner-id", Region: "us-south/private-owner-id"}}},
+		{Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "private-owner-id"}}},
+	}
+	text := strings.Join(clusterListMessages(clusters, "Ucaller", time.Now()), "\n")
+	if strings.Contains(text, "private-owner-id") {
+		t.Fatalf("list leaked another persisted owner ID: %s", text)
+	}
+	if strings.Count(text, "-") < 2 {
+		t.Fatalf("list did not render safe placeholders: %s", text)
+	}
+}
+
+func TestClusterListRendersSafeStatusWithoutSlackIDs(t *testing.T) {
+	clusters := []servitorv1alpha1.ServitorCluster{{
+		Spec:   servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "Ucaller"}},
+		Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseApplying, ResolvedOptions: &servitorv1alpha1.ResolvedOptions{ClusterName: "bad<@Ucaller>", Region: "../../bad"}},
+	}}
+	text := strings.Join(clusterListMessages(clusters, "Ucaller", time.Now()), "\n")
+	if !strings.Contains(text, "applying") || strings.Count(text, "-") < 2 || !strings.Contains(text, "never") {
+		t.Fatalf("list did not render safe placeholders: %s", text)
+	}
+	if strings.Contains(text, "Ucaller") || strings.Contains(text, "bad") {
+		t.Fatalf("list leaked unsafe input: %s", text)
 	}
 }
 
@@ -49,18 +79,15 @@ func TestClusterListFormatsLeasePresentationBoundaries(t *testing.T) {
 	expiredExpiry := metav1.NewTime(now)
 	clusters := []servitorv1alpha1.ServitorCluster{
 		{ObjectMeta: metav1.ObjectMeta{Name: "minute", Namespace: "servitor"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "Ucaller"}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseReady, LeaseExpiresAt: &minuteExpiry}},
-		{ObjectMeta: metav1.ObjectMeta{Name: "expired", Namespace: "servitor"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "Uother"}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseReady, LeaseExpiresAt: &expiredExpiry}},
-		{ObjectMeta: metav1.ObjectMeta{Name: "no-expiry", Namespace: "servitor"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "Uunknown"}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseReady}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "expired", Namespace: "servitor"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "Ucaller"}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseReady, LeaseExpiresAt: &expiredExpiry}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "no-expiry", Namespace: "servitor"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "Ucaller"}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseReady}},
 	}
 	bot, responses := botForTest(t, &clusters[0], &clusters[1], &clusters[2])
+	bot.Clock = func() time.Time { return now }
 	if err := bot.Handle(context.Background(), Envelope{ID: "list-boundaries", Message: Message{Channel: "C1", ChannelType: "channel", User: "Ucaller", Text: "<@BOT> list", Timestamp: "123"}}); err != nil {
 		t.Fatal(err)
 	}
-	var messages []string
-	for _, response := range responses.responses {
-		messages = append(messages, response.Text)
-	}
-	text := strings.Join(messages, "\n")
+	text := responses.responses[0].Text
 	for _, want := range []string{"2026-09-08 00:59:59 UTC (59m)", "2026-09-08 00:00:00 UTC (expired)", "never"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("list missing %q: %s", want, text)
@@ -72,7 +99,7 @@ func TestClusterListMessagesRemainBoundedAndUnderstandableAcrossChunks(t *testin
 	clusters := make([]servitorv1alpha1.ServitorCluster, 30)
 	for index := range clusters {
 		clusters[index] = servitorv1alpha1.ServitorCluster{
-			Spec:   servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: fmt.Sprintf("Uother-%d", index)}},
+			Spec:   servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "Ucaller"}},
 			Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseReady, ResolvedOptions: &servitorv1alpha1.ResolvedOptions{ClusterName: fmt.Sprintf("cluster-%02d-", index) + strings.Repeat("a", 140)}},
 		}
 	}
@@ -81,11 +108,11 @@ func TestClusterListMessagesRemainBoundedAndUnderstandableAcrossChunks(t *testin
 		t.Fatalf("chunked messages = %d, want more than one", len(messages))
 	}
 	for index, message := range messages {
-		if len(message) > maxSlackMessage || !strings.HasPrefix(message, listLegend+"\n```") {
-			t.Fatalf("message %d is not bounded with legend: %q", index, message)
+		if len(message) > maxSlackMessage || !strings.HasPrefix(message, "Your allocations:\n```") {
+			t.Fatalf("message %d is not bounded with a table heading: %q", index, message)
 		}
-		if strings.Contains(message, "Uother-") {
-			t.Fatalf("message %d leaked an owner identifier: %q", index, message)
+		if strings.Contains(message, "Ucaller") || strings.Contains(message, "*") {
+			t.Fatalf("message %d leaked an owner identifier or marker: %q", index, message)
 		}
 	}
 }

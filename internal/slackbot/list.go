@@ -12,24 +12,20 @@ import (
 	"github.com/bevicted/servitor/internal/lifecycle"
 )
 
-const (
-	listSafeCellLimit = 160
-	listLegend        = "`*` marks your allocations."
-)
+const listSafeCellLimit = 160
 
 var listStatuses = map[string]string{
 	servitorv1alpha1.PhasePending: "planning", servitorv1alpha1.PhasePlanning: "planning", servitorv1alpha1.PhaseAwaitingApproval: "review", servitorv1alpha1.PhaseApplying: "applying", servitorv1alpha1.PhaseReady: "ready", servitorv1alpha1.PhaseCleanupPending: "cleanup in progress", servitorv1alpha1.PhaseCleanupComplete: "cleanup complete", servitorv1alpha1.PhaseUnresolved: "unresolved",
 }
 
 type clusterListRow struct {
-	marker, cluster, status, location, expires string
-	owner                                      string
-	updated                                    time.Time
-	hasExpiry                                  bool
+	cluster, status, location, expires string
+	owner                              string
+	updated                            time.Time
+	hasExpiry                          bool
 }
 
-// clusterListMessages renders only status data held by namespaced CRs. Slack
-// owner identities remain a caller marker and are never resolved or displayed.
+// clusterListMessages renders the caller's allocations from namespaced CRs.
 func clusterListMessages(clusters []servitorv1alpha1.ServitorCluster, caller string, now time.Time) []string {
 	owners := make([]string, 0, len(clusters))
 	for _, cluster := range clusters {
@@ -37,6 +33,9 @@ func clusterListMessages(clusters []servitorv1alpha1.ServitorCluster, caller str
 	}
 	rows := make([]clusterListRow, 0, len(clusters))
 	for _, cluster := range clusters {
+		if cluster.Spec.Slack.OwnerID != caller {
+			continue
+		}
 		expiry := time.Time{}
 		if cluster.Status.LeaseExpiresAt != nil {
 			expiry = cluster.Status.LeaseExpiresAt.Time
@@ -47,7 +46,7 @@ func clusterListMessages(clusters []servitorv1alpha1.ServitorCluster, caller str
 			name = options.ClusterName
 			location = options.Region
 		}
-		rows = append(rows, clusterListRow{marker: listMarker(cluster.Spec.Slack.OwnerID, caller), cluster: listClusterCell(name, owners), status: listStatusCell(cluster.Status.Phase), location: listLocationCell(location, owners), expires: listExpiry(expiry, now), owner: cluster.Spec.Slack.OwnerID, updated: cluster.CreationTimestamp.Time, hasExpiry: !expiry.IsZero()})
+		rows = append(rows, clusterListRow{cluster: listClusterCell(name, owners), status: listStatusCell(cluster.Status.Phase), location: listLocationCell(location, owners), expires: listExpiry(expiry, now), owner: cluster.Spec.Slack.OwnerID, updated: cluster.CreationTimestamp.Time, hasExpiry: !expiry.IsZero()})
 	}
 	sort.Slice(rows, func(i, j int) bool {
 		left, right := rows[i], rows[j]
@@ -80,12 +79,12 @@ func clusterListMessages(clusters []servitorv1alpha1.ServitorCluster, caller str
 func renderClusterList(rows []clusterListRow) string {
 	var buffer bytes.Buffer
 	writer := tabwriter.NewWriter(&buffer, 0, 4, 2, ' ', 0)
-	writeListRow(writer, []string{"", "cluster", "state", "location", "expires"})
+	writeListRow(writer, []string{"cluster", "state", "location", "expires"})
 	for _, row := range rows {
-		writeListRow(writer, []string{row.marker, row.cluster, row.status, row.location, row.expires})
+		writeListRow(writer, []string{row.cluster, row.status, row.location, row.expires})
 	}
 	_ = writer.Flush()
-	return listLegend + "\n```\n" + strings.TrimSuffix(buffer.String(), "\n") + "\n```"
+	return "Your allocations:\n```\n" + strings.TrimSuffix(buffer.String(), "\n") + "\n```"
 }
 func writeListRow(writer *tabwriter.Writer, row []string) {
 	for i, value := range row {
@@ -95,12 +94,6 @@ func writeListRow(writer *tabwriter.Writer, row []string) {
 		_, _ = writer.Write([]byte(value))
 	}
 	_, _ = writer.Write([]byte{'\n'})
-}
-func listMarker(owner, caller string) string {
-	if owner == caller {
-		return "*"
-	}
-	return " "
 }
 func listClusterCell(value string, owners []string) string {
 	value = listSafeCell(value)
