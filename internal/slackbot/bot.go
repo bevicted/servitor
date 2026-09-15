@@ -383,20 +383,24 @@ func (b Bot) recordReviewDecision(ctx context.Context, name string, message Mess
 }
 
 func (b Bot) cleanup(ctx context.Context, message Message, thread string, acknowledge bool) {
-	requireThread := message.ThreadTimestamp != ""
-	cluster, err := b.ownerCluster(ctx, message.User)
-	if err != nil {
-		if acknowledge && !requireThread {
-			b.respond(ctx, message.Channel, thread, lifecycleLookupText(err))
-		}
+	if message.ThreadTimestamp == "" {
+		b.cleanupAll(ctx, message, thread, acknowledge)
 		return
 	}
-	if !ownsThread(cluster, message, thread, requireThread) {
+	b.cleanupThread(ctx, message, thread, acknowledge)
+}
+
+func (b Bot) cleanupThread(ctx context.Context, message Message, thread string, acknowledge bool) {
+	cluster, err := b.ownerCluster(ctx, message.User)
+	if err != nil {
+		return
+	}
+	if !ownsThread(cluster, message, thread, true) {
 		return
 	}
 	stateText := ""
 	updated, err := b.updateIntent(ctx, cluster.Name, func(current *servitorv1alpha1.ServitorCluster) (bool, error) {
-		if !ownsThread(current, message, thread, requireThread) {
+		if !ownsThread(current, message, thread, true) {
 			return false, nil
 		}
 		if text := cleanupUnavailableText(current); text != "" {
@@ -426,6 +430,97 @@ func (b Bot) cleanup(ctx context.Context, message Message, thread string, acknow
 	if acknowledge {
 		b.respondCleanupCause(ctx, message.Channel, thread, cluster, servitorv1alpha1.CleanupReasonExplicit, "Cleaning up...")
 	}
+}
+
+func (b Bot) cleanupAll(ctx context.Context, message Message, thread string, acknowledge bool) {
+	clusters, err := b.ownerAllocations(ctx, message.User)
+	if err != nil {
+		b.logf("list cleanup allocations: %v", err)
+		if acknowledge {
+			b.respond(ctx, message.Channel, thread, rejectedText("Unable to list your allocations. No cleanup was started."))
+		}
+		return
+	}
+	selected := make([]servitorv1alpha1.ServitorCluster, 0, len(clusters))
+	for _, cluster := range clusters {
+		if cluster.Spec.Slack.ChannelID == message.Channel {
+			selected = append(selected, cluster)
+		}
+	}
+	if len(selected) == 0 {
+		if acknowledge {
+			b.respond(ctx, message.Channel, thread, "You have no allocations in this channel. Use @servitor create to start one.")
+		}
+		return
+	}
+
+	summary := cleanupSummary{}
+	for _, cluster := range selected {
+		stateText := ""
+		updated, err := b.updateIntent(ctx, cluster.Name, func(current *servitorv1alpha1.ServitorCluster) (bool, error) {
+			if !ownsThread(current, message, thread, false) {
+				stateText = "unavailable"
+				return false, nil
+			}
+			if text := cleanupUnavailableText(current); text != "" {
+				stateText = text
+				return false, nil
+			}
+			current.Spec.Lifecycle.CleanupRequested = true
+			return true, nil
+		})
+		if err != nil {
+			b.logf("request cleanup for %s: %v", cluster.Name, err)
+			summary.failed++
+			continue
+		}
+		if !updated {
+			summary.recordUnavailable(stateText)
+			continue
+		}
+		summary.requested++
+		if acknowledge {
+			b.respondCleanupCause(ctx, message.Channel, cluster.Spec.Slack.ThreadTimestamp, &cluster, servitorv1alpha1.CleanupReasonExplicit, "Cleaning up...")
+		}
+	}
+	if acknowledge {
+		b.respond(ctx, message.Channel, thread, summary.text())
+	}
+}
+
+type cleanupSummary struct{ requested, alreadyCleaning, completed, unresolved, unavailable, failed int }
+
+func (s *cleanupSummary) recordUnavailable(text string) {
+	switch text {
+	case "Cleanup is already in progress. No further action is needed.":
+		s.alreadyCleaning++
+	case "Cleanup is complete. Use @servitor create to start a new allocation.":
+		s.completed++
+	case "Cleanup is unresolved. An administrator must inspect the allocation CR status and private cluster logs.":
+		s.unresolved++
+	default:
+		s.unavailable++
+	}
+}
+
+func (s cleanupSummary) text() string {
+	parts := []string{fmt.Sprintf("Cleanup requested for %d allocation(s).", s.requested)}
+	if s.alreadyCleaning > 0 {
+		parts = append(parts, fmt.Sprintf("Already cleaning: %d allocation(s).", s.alreadyCleaning))
+	}
+	if s.completed > 0 {
+		parts = append(parts, fmt.Sprintf("Cleanup complete: %d allocation(s).", s.completed))
+	}
+	if s.unresolved > 0 {
+		parts = append(parts, fmt.Sprintf("Cleanup unresolved: %d allocation(s).", s.unresolved))
+	}
+	if s.unavailable > 0 {
+		parts = append(parts, fmt.Sprintf("Skipped or unavailable: %d allocation(s).", s.unavailable))
+	}
+	if s.failed > 0 {
+		parts = append(parts, fmt.Sprintf("Failed to record cleanup for %d allocation(s).", s.failed))
+	}
+	return strings.Join(parts, "\n")
 }
 
 // auth records one owner-thread request. The controller consumes it before
@@ -554,12 +649,12 @@ func lifecycleLookupText(err error) string {
 
 func cleanupUnavailableText(cluster *servitorv1alpha1.ServitorCluster) string {
 	switch {
-	case cluster.Spec.Lifecycle.CleanupRequested || cluster.Status.Cleanup != nil || cluster.Status.Phase == servitorv1alpha1.PhaseCleanupPending:
-		return "Cleanup is already in progress. No further action is needed."
 	case cluster.Status.Phase == servitorv1alpha1.PhaseCleanupComplete:
 		return "Cleanup is complete. Use @servitor create to start a new allocation."
 	case cluster.Status.Phase == servitorv1alpha1.PhaseUnresolved:
 		return "Cleanup is unresolved. An administrator must inspect the allocation CR status and private cluster logs."
+	case cluster.Spec.Lifecycle.CleanupRequested || cluster.Status.Cleanup != nil || cluster.Status.Phase == servitorv1alpha1.PhaseCleanupPending:
+		return "Cleanup is already in progress. No further action is needed."
 	default:
 		return ""
 	}
@@ -611,16 +706,47 @@ func (b Bot) list(ctx context.Context, user string, respond func(string)) {
 
 func (b Bot) ownerCluster(ctx context.Context, owner string) (*servitorv1alpha1.ServitorCluster, error) {
 	cluster := &servitorv1alpha1.ServitorCluster{}
-	if err := b.Client.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: ownerClusterName(owner)}, cluster); err != nil {
+	if err := b.allocationReader().Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: ownerClusterName(owner)}, cluster); err != nil {
 		return nil, err
 	}
 	return cluster, nil
 }
+
+// ownerAllocations returns only allocations with the exact persisted owner in
+// the configured namespace. Callers apply any channel or thread scope.
+func (b Bot) ownerAllocations(ctx context.Context, owner string) ([]servitorv1alpha1.ServitorCluster, error) {
+	if b.Namespace == "" {
+		return nil, fmt.Errorf("allocation namespace is not configured")
+	}
+	var clusters servitorv1alpha1.ServitorClusterList
+	if err := b.allocationReader().List(ctx, &clusters, client.InNamespace(b.Namespace)); err != nil {
+		return nil, err
+	}
+	allocations := make([]servitorv1alpha1.ServitorCluster, 0, len(clusters.Items))
+	for _, cluster := range clusters.Items {
+		if cluster.Spec.Slack.OwnerID == owner {
+			allocations = append(allocations, cluster)
+		}
+	}
+	return allocations, nil
+}
+
+type allocationReaderProvider interface {
+	AllocationReader() client.Reader
+}
+
+func (b Bot) allocationReader() client.Reader {
+	if provider, ok := b.Client.(allocationReaderProvider); ok && provider.AllocationReader() != nil {
+		return provider.AllocationReader()
+	}
+	return b.Client
+}
+
 func (b Bot) updateIntent(ctx context.Context, name string, mutate func(*servitorv1alpha1.ServitorCluster) (bool, error)) (bool, error) {
 	updated := false
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		current := &servitorv1alpha1.ServitorCluster{}
-		if err := b.Client.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: name}, current); err != nil {
+		if err := b.allocationReader().Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: name}, current); err != nil {
 			return err
 		}
 		changed, err := mutate(current)
@@ -850,7 +976,7 @@ func (b Bot) respondHelp(text string, respond func(string), maintainer bool) {
 	case "create":
 		messages = createHelp(b.Defaults)
 	case "done":
-		messages = []string{"`done` releases your resources. Use it in your lifecycle thread, or as `@servitor done` in the configured channel. It is unavailable after cleanup completes; repeated requests report cleanup in progress."}
+		messages = []string{"`done` in a lifecycle thread releases that allocation. `@servitor done` in the configured channel requests cleanup for all of your allocations in that channel. It is unavailable after cleanup completes; repeated requests report cleanup in progress."}
 	case "extend":
 		messages = []string{"`extend [N[h]]` extends your ready lease by the configured duration or by 1 through 24 whole hours. Use it only in your lifecycle thread. It is available only while the lease is ready, not during planning, cleanup, or after expiry."}
 	case "auth":
@@ -938,7 +1064,7 @@ func firstToken(text string) string {
 func unknownText() string               { return "Command unknown.\n\n" + helpOverview(false)[0] }
 func rejectedText(reason string) string { return "Command rejected.\n\n" + reason }
 func helpOverview(maintainer bool) []string {
-	text := "Servitor provisions one temporary IBM Cloud cluster per Slack user.\n\nCommands\n```\nDM\n  help [command]          print help\n  list                    list clusters\n\nConfigured channel\n  @servitor help [command]  print help\n  @servitor create [safe options]  provision a new cluster\n  @servitor done            release your resources\n  @servitor list            list clusters\n\nLifecycle thread\n  yes                       approve the cluster plan\n  no                        reject the cluster plan\n  done                      release your resources\n  extend [N[h]]             extend your lease\n  auth                      send stored public access to your DM\n"
+	text := "Servitor provisions one temporary IBM Cloud cluster per Slack user.\n\nCommands\n```\nDM\n  help [command]          print help\n  list                    list clusters\n\nConfigured channel\n  @servitor help [command]  print help\n  @servitor create [safe options]  provision a new cluster\n  @servitor done            request cleanup for all your allocations in this channel\n  @servitor list            list clusters\n\nLifecycle thread\n  yes                       approve the cluster plan\n  no                        reject the cluster plan\n  done                      release this allocation\n  extend [N[h]]             extend your lease\n  auth                      send stored public access to your DM\n"
 	if maintainer {
 		text += "\nMaintainer DM\n  refresh inventory         refresh private inventory\n"
 	}

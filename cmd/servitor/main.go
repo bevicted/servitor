@@ -18,6 +18,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	ctrlconfig "sigs.k8s.io/controller-runtime/pkg/client/config"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 )
@@ -76,12 +77,7 @@ func main() {
 	if err := inventoryReconciler.SetupWithManager(manager); err != nil {
 		fail(fmt.Errorf("configure inventory refresh: %w", err))
 	}
-	bot := slackbot.Bot{
-		ChannelID: operator.Slack.ChannelID, Namespace: operator.Namespace, Client: manager.GetClient(),
-		Events: state.NewEventStore(manager.GetClient(), operator.Namespace), Defaults: commandDefaults(operator), PublicAuthTargets: append([]string(nil), operator.Auth.PublicTargets...),
-		InventoryConfigMap: operator.ICT.TargetConfigMap, InventoryConfigKey: operator.ICT.TargetConfigKey, InventoryMaximumAge: operator.InventoryMaximumAge(), MaintainerIDs: operator.Slack.MaintainerIDs,
-		Lease: operator.Lifecycle.Lease, RetryIntervals: operator.Lifecycle.RetryIntervals, Responder: transport, Permalinks: transport,
-	}
+	bot := newSlackBot(operator, manager.GetClient(), manager.GetAPIReader(), transport, transport)
 	if err := manager.Add(slackbot.NewLeaderRunnable(transport, bot)); err != nil {
 		fail(fmt.Errorf("configure Slack intake: %w", err))
 	}
@@ -134,8 +130,24 @@ func inventoryControllerConfig(operator config.Config) controller.InventoryConfi
 	}
 }
 
+type allocationClient struct {
+	client.Client
+	reader client.Reader
+}
+
+func (c allocationClient) AllocationReader() client.Reader { return c.reader }
+
 func commandDefaults(operator config.Config) command.CreateDefaults {
 	return command.CreateDefaults{Version: operator.Defaults.Version, Target: operator.Defaults.Target, Provider: operator.Defaults.Provider, ResourceGroup: operator.Defaults.ResourceGroup, Zone: operator.Defaults.Zone, VPCID: operator.Defaults.VPCID, OpenShiftFlavor: operator.Defaults.OpenShiftFlavor, KubernetesFlavor: operator.Defaults.KubernetesFlavor}
+}
+
+func newSlackBot(operator config.Config, kube client.Client, reader client.Reader, responder slackbot.Responder, permalinks slackbot.PermalinkLookup) slackbot.Bot {
+	return slackbot.Bot{
+		ChannelID: operator.Slack.ChannelID, Namespace: operator.Namespace, Client: allocationClient{Client: kube, reader: reader},
+		Events: state.NewEventStore(kube, operator.Namespace), Defaults: commandDefaults(operator), PublicAuthTargets: append([]string(nil), operator.Auth.PublicTargets...),
+		InventoryConfigMap: operator.ICT.TargetConfigMap, InventoryConfigKey: operator.ICT.TargetConfigKey, InventoryMaximumAge: operator.InventoryMaximumAge(), MaintainerIDs: operator.Slack.MaintainerIDs,
+		Lease: operator.Lifecycle.Lease, RetryIntervals: operator.Lifecycle.RetryIntervals, Responder: responder, Permalinks: permalinks,
+	}
 }
 
 func fail(err error) { _, _ = os.Stderr.WriteString("servitor: " + err.Error() + "\n"); os.Exit(1) }

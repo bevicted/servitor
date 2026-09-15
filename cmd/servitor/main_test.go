@@ -7,6 +7,7 @@ import (
 	"github.com/bevicted/servitor/internal/config"
 	"github.com/bevicted/servitor/internal/controller"
 	rbacv1 "k8s.io/api/rbac/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
 func TestControllerSchemeRegistersRBACResources(t *testing.T) {
@@ -51,6 +52,16 @@ func TestInventoryControllerConfigCarriesValidatedPolicy(t *testing.T) {
 	})
 	if settings.RefreshInterval != 2*time.Hour || settings.MaximumAge != 48*time.Hour || settings.TaskConfig.COSSecret != "" || settings.TaskConfig.IBMSecret != "servitor-ibm" {
 		t.Fatalf("inventory settings = %+v", settings)
+	}
+}
+
+func TestNewSlackBotUsesDirectAPIReader(t *testing.T) {
+	cached := fake.NewClientBuilder().Build()
+	reader := fake.NewClientBuilder().Build()
+	bot := newSlackBot(config.Config{Namespace: "servitor", Slack: config.SlackConfig{ChannelID: "C1"}}, cached, reader, nil, nil)
+	direct, ok := bot.Client.(allocationClient)
+	if !ok || direct.Client != cached || direct.AllocationReader() != reader || bot.Namespace != "servitor" || bot.ChannelID != "C1" {
+		t.Fatalf("Slack bot wiring = %+v", bot)
 	}
 }
 

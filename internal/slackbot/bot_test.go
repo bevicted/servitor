@@ -28,6 +28,13 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
+type testAllocationClient struct {
+	client.Client
+	reader client.Reader
+}
+
+func (c testAllocationClient) AllocationReader() client.Reader { return c.reader }
+
 type memoryResponder struct {
 	mu        sync.Mutex
 	responses []Response
@@ -319,7 +326,7 @@ func TestHandleCommandProgressAndPersistenceOrdering(t *testing.T) {
 		if err := bot.Handle(context.Background(), Envelope{Message: message("<@BOT> done", "done")}); err != nil {
 			t.Fatal(err)
 		}
-		if want := []string{"kubernetes update", "reply: Cleaning up..."}; !reflect.DeepEqual(recorder.events, want) {
+		if want := []string{"kubernetes update", "reply: Cleaning up...", "reply: Cleanup requested for 1 allocation(s)."}; !reflect.DeepEqual(recorder.events, want) {
 			t.Fatalf("events=%q, want %q", recorder.events, want)
 		}
 		current := &servitorv1alpha1.ServitorCluster{}
@@ -376,7 +383,7 @@ func TestHandleCommandProgressAndPersistenceOrdering(t *testing.T) {
 		if err := bot.Handle(context.Background(), Envelope{Message: message("<@BOT> done", "done")}); err != nil {
 			t.Fatal(err)
 		}
-		if want := []string{"kubernetes update", "reply: Command rejected.\n\nUnable to record the cleanup request. No cleanup was started."}; !reflect.DeepEqual(recorder.events, want) {
+		if want := []string{"kubernetes update", "reply: Cleanup requested for 0 allocation(s).\nFailed to record cleanup for 1 allocation(s)."}; !reflect.DeepEqual(recorder.events, want) {
 			t.Fatalf("cleanup events=%q, want %q", recorder.events, want)
 		}
 		current = &servitorv1alpha1.ServitorCluster{}
@@ -384,6 +391,167 @@ func TestHandleCommandProgressAndPersistenceOrdering(t *testing.T) {
 			t.Fatalf("cleanup request = (%t, %v), want (false, nil)", current.Spec.Lifecycle.CleanupRequested, err)
 		}
 	})
+}
+
+func TestChannelCleanupAllUsesDirectReaderAndContinuesAfterFailures(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := servitorv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	allocation := func(name, owner, channel, thread, phase string) *servitorv1alpha1.ServitorCluster {
+		return &servitorv1alpha1.ServitorCluster{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "servitor", UID: types.UID(name)},
+			Spec:       servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: owner, ChannelID: channel, ThreadTimestamp: thread}},
+			Status:     servitorv1alpha1.ServitorClusterStatus{Phase: phase},
+		}
+	}
+	requestedOne := allocation("requested-one", "U1", "C1", "thread-one", servitorv1alpha1.PhasePlanning)
+	requestedTwo := allocation("requested-two", "U1", "C1", "thread-two", servitorv1alpha1.PhaseReady)
+	failed := allocation("failed", "U1", "C1", "thread-failed", servitorv1alpha1.PhasePlanning)
+	vanished := allocation("vanished", "U1", "C1", "thread-vanished", servitorv1alpha1.PhasePlanning)
+	alreadyCleaning := allocation("already-cleaning", "U1", "C1", "thread-cleaning", servitorv1alpha1.PhaseCleanupPending)
+	alreadyCleaning.Status.Cleanup = &servitorv1alpha1.CleanupStatus{Reason: servitorv1alpha1.CleanupReasonExplicit}
+	completed := allocation("completed", "U1", "C1", "thread-completed", servitorv1alpha1.PhaseCleanupComplete)
+	completed.Status.Cleanup = &servitorv1alpha1.CleanupStatus{Reason: servitorv1alpha1.CleanupReasonExplicit}
+	unresolved := allocation("unresolved", "U1", "C1", "thread-unresolved", servitorv1alpha1.PhaseUnresolved)
+	unresolved.Status.Cleanup = &servitorv1alpha1.CleanupStatus{Reason: servitorv1alpha1.CleanupReasonExplicit}
+	otherOwner := allocation("other-owner", "U2", "C1", "thread-other", servitorv1alpha1.PhasePlanning)
+	otherChannel := allocation("other-channel", "U1", "C2", "thread-channel", servitorv1alpha1.PhasePlanning)
+	otherNamespace := allocation("other-namespace", "U1", "C1", "thread-namespace", servitorv1alpha1.PhasePlanning)
+	otherNamespace.Namespace = "other"
+	direct := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(requestedOne, requestedTwo, failed, vanished, alreadyCleaning, completed, unresolved, otherOwner, otherChannel, otherNamespace).Build()
+	cached := fake.NewClientBuilder().WithScheme(scheme).WithInterceptorFuncs(interceptor.Funcs{
+		Update: func(ctx context.Context, underlying client.WithWatch, object client.Object, options ...client.UpdateOption) error {
+			cluster, ok := object.(*servitorv1alpha1.ServitorCluster)
+			if !ok {
+				return underlying.Update(ctx, object, options...)
+			}
+			if cluster.Name == "failed" {
+				return errors.New("persistence failure")
+			}
+			if cluster.Name == "vanished" {
+				if err := direct.Delete(ctx, cluster); err != nil {
+					return err
+				}
+				return apierrors.NewNotFound(schema.GroupResource{Group: "servitor.bevicted.github.io", Resource: "servitorclusters"}, cluster.Name)
+			}
+			return direct.Update(ctx, cluster, options...)
+		},
+	}).Build()
+	responses := &memoryResponder{}
+	bot := Bot{ChannelID: "C1", SelfUserID: "BOT", Namespace: "servitor", Client: testAllocationClient{Client: cached, reader: direct}, Events: state.NewEventStore(cached, "servitor"), Responder: responses}
+	if err := bot.Handle(context.Background(), Envelope{ID: "cleanup-all", Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "<@BOT> done", Timestamp: "command-thread"}}); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"requested-one", "requested-two"} {
+		current := &servitorv1alpha1.ServitorCluster{}
+		if err := direct.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: name}, current); err != nil || !current.Spec.Lifecycle.CleanupRequested {
+			t.Fatalf("cleanup intent for %s = (%t, %v), want (true, nil)", name, current.Spec.Lifecycle.CleanupRequested, err)
+		}
+	}
+	for _, name := range []string{"failed", "already-cleaning", "completed", "unresolved", "other-owner", "other-channel"} {
+		current := &servitorv1alpha1.ServitorCluster{}
+		if err := direct.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: name}, current); err != nil {
+			t.Fatal(err)
+		}
+		if current.Spec.Lifecycle.CleanupRequested {
+			t.Fatalf("unexpected cleanup intent for %s", name)
+		}
+	}
+	if len(responses.responses) != 3 {
+		t.Fatalf("responses=%+v", responses.responses)
+	}
+	if responses.responses[0].ThreadTimestamp != "thread-one" || responses.responses[1].ThreadTimestamp != "thread-two" || responses.responses[0].Text != "Cleaning up..." || responses.responses[1].Text != "Cleaning up..." {
+		t.Fatalf("cleanup notices=%+v", responses.responses[:2])
+	}
+	summary := responses.responses[2]
+	if summary.ThreadTimestamp != "command-thread" {
+		t.Fatalf("summary routing=%+v", summary)
+	}
+	for _, want := range []string{"Cleanup requested for 2 allocation(s).", "Already cleaning: 1 allocation(s).", "Cleanup complete: 1 allocation(s).", "Cleanup unresolved: 1 allocation(s).", "Failed to record cleanup for 2 allocation(s)."} {
+		if !strings.Contains(summary.Text, want) {
+			t.Fatalf("summary missing %q: %s", want, summary.Text)
+		}
+	}
+}
+
+func TestChannelDestroyCleansAllAllocationsSilently(t *testing.T) {
+	allocation := func(name, owner string) *servitorv1alpha1.ServitorCluster {
+		return &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "servitor"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: owner, ChannelID: "C1", ThreadTimestamp: name}}}
+	}
+	first, second, other := allocation("first", "U1"), allocation("second", "U1"), allocation("other", "U2")
+	bot, responses := botForTest(t, first, second, other)
+	if err := bot.Handle(context.Background(), Envelope{ID: "destroy-all", Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "<@BOT> destroy", Timestamp: "command-thread"}}); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name string
+		want bool
+	}{{first.Name, true}, {second.Name, true}, {other.Name, false}} {
+		current := &servitorv1alpha1.ServitorCluster{}
+		if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: test.name}, current); err != nil || current.Spec.Lifecycle.CleanupRequested != test.want {
+			t.Fatalf("cleanup intent for %s = (%t, %v), want (%t, nil)", test.name, current.Spec.Lifecycle.CleanupRequested, err, test.want)
+		}
+	}
+	if len(responses.responses) != 0 {
+		t.Fatalf("destroy responses=%+v", responses.responses)
+	}
+}
+
+func TestChannelCleanupReportsNoMatchesAndListFailure(t *testing.T) {
+	t.Run("no matches", func(t *testing.T) {
+		bot, responses := botForTest(t, &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "other", Namespace: "servitor"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U2", ChannelID: "C1"}}})
+		if err := bot.Handle(context.Background(), Envelope{ID: "none", Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "<@BOT> done", Timestamp: "command-thread"}}); err != nil {
+			t.Fatal(err)
+		}
+		if len(responses.responses) != 1 || responses.responses[0].Text != "You have no allocations in this channel. Use @servitor create to start one." {
+			t.Fatalf("responses=%+v", responses.responses)
+		}
+	})
+	t.Run("list failure", func(t *testing.T) {
+		scheme := runtime.NewScheme()
+		if err := corev1.AddToScheme(scheme); err != nil {
+			t.Fatal(err)
+		}
+		if err := servitorv1alpha1.AddToScheme(scheme); err != nil {
+			t.Fatal(err)
+		}
+		kube := fake.NewClientBuilder().WithScheme(scheme).WithInterceptorFuncs(interceptor.Funcs{List: func(context.Context, client.WithWatch, client.ObjectList, ...client.ListOption) error {
+			return errors.New("list failure")
+		}}).Build()
+		responses := &memoryResponder{}
+		bot := Bot{ChannelID: "C1", SelfUserID: "BOT", Namespace: "servitor", Client: kube, Events: state.NewEventStore(kube, "servitor"), Responder: responses}
+		if err := bot.Handle(context.Background(), Envelope{ID: "list-failure", Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "<@BOT> done", Timestamp: "command-thread"}}); err != nil {
+			t.Fatal(err)
+		}
+		if len(responses.responses) != 1 || responses.responses[0].Text != rejectedText("Unable to list your allocations. No cleanup was started.") {
+			t.Fatalf("responses=%+v", responses.responses)
+		}
+	})
+}
+
+func TestThreadCleanupTargetsOnlyItsLifecycleThread(t *testing.T) {
+	primary := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: ownerClusterName("U1"), Namespace: "servitor"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "primary"}}}
+	sibling := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "sibling", Namespace: "servitor"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "sibling"}}}
+	bot, responses := botForTest(t, primary, sibling)
+	if err := bot.Handle(context.Background(), Envelope{ID: "thread-cleanup", Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "done", Timestamp: "reply", ThreadTimestamp: "primary"}}); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name string
+		want bool
+	}{{primary.Name, true}, {sibling.Name, false}} {
+		current := &servitorv1alpha1.ServitorCluster{}
+		if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: test.name}, current); err != nil || current.Spec.Lifecycle.CleanupRequested != test.want {
+			t.Fatalf("cleanup intent for %s = (%t, %v), want (%t, nil)", test.name, current.Spec.Lifecycle.CleanupRequested, err, test.want)
+		}
+	}
+	if len(responses.responses) != 1 || responses.responses[0].Text != "Cleaning up..." {
+		t.Fatalf("responses=%+v", responses.responses)
+	}
 }
 
 func TestReviewDecisionRecordsIntentAndAcknowledges(t *testing.T) {
@@ -910,7 +1078,7 @@ func TestLifecycleHelpExplainsAvailableStates(t *testing.T) {
 		command string
 		wanted  []string
 	}{
-		{command: "help done", wanted: []string{"cleanup completes", "cleanup in progress"}},
+		{command: "help done", wanted: []string{"lifecycle thread", "all of your allocations in that channel", "cleanup completes", "cleanup in progress"}},
 		{command: "help extend", wanted: []string{"only in your lifecycle thread", "only while the lease is ready", "planning, cleanup, or after expiry"}},
 	} {
 		responses.responses = nil
@@ -1070,14 +1238,14 @@ func TestLifecycleCommandsExplainStateAndRecordOnlyAcceptedIntent(t *testing.T) 
 	}{
 		{name: "planning extension", phase: servitorv1alpha1.PhasePlanning, command: "extend 1h", response: "Planning is in progress. Extend is available when your cluster is ready."},
 		{name: "cleanup extension", phase: servitorv1alpha1.PhaseCleanupPending, command: "extend 1h", response: "Cleanup is in progress. The lease cannot be extended."},
-		{name: "repeated cleanup", phase: servitorv1alpha1.PhaseCleanupPending, command: "done", response: "Cleanup is already in progress. No further action is needed."},
-		{name: "completed cleanup", phase: servitorv1alpha1.PhaseCleanupComplete, command: "done", response: "Cleanup is complete. Use @servitor create to start a new allocation."},
+		{name: "repeated cleanup", phase: servitorv1alpha1.PhaseCleanupPending, command: "done", response: "Cleanup requested for 0 allocation(s).\nAlready cleaning: 1 allocation(s)."},
+		{name: "completed cleanup", phase: servitorv1alpha1.PhaseCleanupComplete, command: "done", response: "Cleanup requested for 0 allocation(s).\nCleanup complete: 1 allocation(s)."},
 		{name: "expired extension", phase: servitorv1alpha1.PhaseReady, command: "extend 1h", prepare: func(cluster *servitorv1alpha1.ServitorCluster) {
 			expired := metav1.NewTime(now)
 			cluster.Status.LeaseExpiresAt = &expired
 		}, response: "Your lease has expired. Cleanup will begin; use @servitor create after cleanup completes."},
 		{name: "ready extension", phase: servitorv1alpha1.PhaseReady, command: "extend 1h", mutated: true},
-		{name: "planning cleanup", phase: servitorv1alpha1.PhasePlanning, command: "done", response: "Cleaning up...", mutated: true},
+		{name: "planning cleanup", phase: servitorv1alpha1.PhasePlanning, command: "done", response: "Cleanup requested for 1 allocation(s).", mutated: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			allocation := cluster(test.phase)
@@ -1090,8 +1258,8 @@ func TestLifecycleCommandsExplainStateAndRecordOnlyAcceptedIntent(t *testing.T) 
 				t.Fatal(err)
 			}
 			if len(responses.responses) != 0 {
-				if len(responses.responses) != 1 || responses.responses[0].Text != test.response {
-					t.Fatalf("responses=%+v, want %q", responses.responses, test.response)
+				if responses.responses[len(responses.responses)-1].Text != test.response {
+					t.Fatalf("responses=%+v, want final response %q", responses.responses, test.response)
 				}
 			} else if test.response != "" {
 				t.Fatalf("responses=%+v, want %q", responses.responses, test.response)
@@ -1111,7 +1279,7 @@ func TestLifecycleCommandsExplainStateAndRecordOnlyAcceptedIntent(t *testing.T) 
 		if err := bot.Handle(context.Background(), message("done")); err != nil {
 			t.Fatal(err)
 		}
-		if len(responses.responses) != 1 || responses.responses[0].Text != "You have no allocation. Use @servitor create to start one." {
+		if len(responses.responses) != 1 || responses.responses[0].Text != "You have no allocations in this channel. Use @servitor create to start one." {
 			t.Fatalf("responses=%+v", responses.responses)
 		}
 	})
