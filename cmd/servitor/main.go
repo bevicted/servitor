@@ -15,10 +15,6 @@ import (
 	"github.com/bevicted/servitor/internal/pipeline"
 	"github.com/bevicted/servitor/internal/slackbot"
 	"github.com/bevicted/servitor/internal/state"
-	tektonv1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1"
-	corev1 "k8s.io/api/core/v1"
-	rbacv1 "k8s.io/api/rbac/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
@@ -52,7 +48,7 @@ func main() {
 	if err != nil {
 		fail(err)
 	}
-	scheme, err := controllerScheme()
+	scheme, err := controller.NewScheme()
 	if err != nil {
 		fail(err)
 	}
@@ -70,9 +66,8 @@ func main() {
 		fail(err)
 	}
 	logs := controller.NewPodLogReader(kubernetes.NewForConfigOrDie(restConfig))
-	reconciler := &controller.Reconciler{
-		Client: manager.GetClient(), DirectReader: manager.GetAPIReader(), Scheme: manager.GetScheme(), Logs: logs, Config: controllerSettings,
-	}
+	transport := slackbot.NewSocketMode(secrets.BotToken, secrets.AppToken)
+	reconciler := controller.NewReconciler(manager, controllerSettings, logs, transport)
 	if err := reconciler.SetupWithManager(manager); err != nil {
 		fail(fmt.Errorf("configure controller: %w", err))
 	}
@@ -81,8 +76,6 @@ func main() {
 	if err := inventoryReconciler.SetupWithManager(manager); err != nil {
 		fail(fmt.Errorf("configure inventory refresh: %w", err))
 	}
-	transport := slackbot.NewSocketMode(secrets.BotToken, secrets.AppToken)
-	reconciler.AuthDelivery = transport
 	bot := slackbot.Bot{
 		ChannelID: operator.Slack.ChannelID, Namespace: operator.Namespace, Client: manager.GetClient(),
 		Events: state.NewEventStore(manager.GetClient(), operator.Namespace), Defaults: commandDefaults(operator), PublicAuthTargets: append([]string(nil), operator.Auth.PublicTargets...),
@@ -101,21 +94,6 @@ func main() {
 	if err := manager.Start(ctrl.SetupSignalHandler()); err != nil && !errors.Is(err, context.Canceled) {
 		fail(err)
 	}
-}
-
-func controllerScheme() (*runtime.Scheme, error) {
-	scheme := runtime.NewScheme()
-	for _, addToScheme := range []func(*runtime.Scheme) error{
-		corev1.AddToScheme,
-		servitorv1alpha1.AddToScheme,
-		tektonv1.AddToScheme,
-		rbacv1.AddToScheme,
-	} {
-		if err := addToScheme(scheme); err != nil {
-			return nil, err
-		}
-	}
-	return scheme, nil
 }
 
 func controllerConfig(operator config.Config) (controller.Config, error) {

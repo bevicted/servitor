@@ -5,11 +5,12 @@ import (
 	"time"
 
 	"github.com/bevicted/servitor/internal/config"
+	"github.com/bevicted/servitor/internal/controller"
 	rbacv1 "k8s.io/api/rbac/v1"
 )
 
 func TestControllerSchemeRegistersRBACResources(t *testing.T) {
-	scheme, err := controllerScheme()
+	scheme, err := controller.NewScheme()
 	if err != nil {
 		t.Fatal(err)
 	}

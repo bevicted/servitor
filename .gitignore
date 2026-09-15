@@ -12,6 +12,7 @@ runtime/
 events.json
 lifecycles.json
 *.log
+/bin/
 
 # Terraform and ICT workspaces.
 .terraform/
