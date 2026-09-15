@@ -102,9 +102,11 @@ Excluded behavior is intentional: no local compatibility or allocation migration
 
 ```sh
 gofmt -d $(find api cmd internal -name '*.go')
-go test ./...
+make test
 go test -race ./...
 kubectl kustomize config/default
 ```
+
+`make test` runs the unit suite and the RBAC-enforced controller runtime contract in `internal/controller/runtime_integration_test.go`. The integration test starts a local Kubernetes API server and etcd, then exercises the production scheme, cached and direct clients, publication, delivery, and cleanup using `config/rbac/role.yaml`. Its pinned envtest binaries are downloaded into `bin/` on the first run. Use `make test-unit` or `make test-integration` to run either suite separately.
 
 Live OpenShift, Tekton, COS, and Slack checks require the designated cluster namespace, COS key prefix, and credentials. Do not treat missing or pruned task logs as proof that a cloud operation did not run.
