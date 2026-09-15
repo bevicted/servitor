@@ -11,7 +11,7 @@ import (
 
 func authCommandCluster(eligible bool) *servitorv1alpha1.ServitorCluster {
 	return &servitorv1alpha1.ServitorCluster{
-		ObjectMeta: metav1.ObjectMeta{Name: ownerClusterName("U1"), Namespace: "servitor"},
+		ObjectMeta: metav1.ObjectMeta{Name: allocationClusterName("C1", "root"), Namespace: "servitor"},
 		Spec: servitorv1alpha1.ServitorClusterSpec{
 			Slack:     servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"},
 			Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 3600, RetrySeconds: []int64{60}},
@@ -61,7 +61,7 @@ func TestPrivateOrSatelliteThreadAuthIsUnsupportedWithoutIntent(t *testing.T) {
 		cluster *servitorv1alpha1.ServitorCluster
 	}{
 		{name: "frozen private", cluster: authCommandCluster(false)},
-		{name: "unfrozen satellite", cluster: &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: ownerClusterName("U1"), Namespace: "servitor"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}, UserOptions: servitorv1alpha1.UserOptions{Provider: "satellite"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 3600, RetrySeconds: []int64{60}}}}},
+		{name: "unfrozen satellite", cluster: &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: allocationClusterName("C1", "root"), Namespace: "servitor"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}, UserOptions: servitorv1alpha1.UserOptions{Provider: "satellite"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 3600, RetrySeconds: []int64{60}}}}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			bot, responses := botForTest(t, test.cluster)

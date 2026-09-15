@@ -39,8 +39,33 @@ type Config struct {
 }
 
 type SlackConfig struct {
-	ChannelID     string   `yaml:"channel_id"`
-	MaintainerIDs []string `yaml:"maintainer_ids"`
+	ChannelID             string   `yaml:"channel_id"`
+	MaintainerIDs         []string `yaml:"maintainer_ids"`
+	MaxAllocationsPerUser int      `yaml:"max_allocations_per_user"`
+}
+
+// UnmarshalYAML keeps the allocation cap an integer instead of accepting YAML
+// floats that the decoder would otherwise silently coerce.
+func (c *SlackConfig) UnmarshalYAML(node *yaml.Node) error {
+	type slackConfig SlackConfig
+	var decoded slackConfig
+	if err := node.Decode(&decoded); err != nil {
+		return err
+	}
+	for index := 0; index+1 < len(node.Content); index += 2 {
+		key, value := node.Content[index].Value, node.Content[index+1]
+		switch key {
+		case "channel_id", "maintainer_ids":
+		case "max_allocations_per_user":
+			if value.Tag != "!!int" {
+				return fmt.Errorf("slack.max_allocations_per_user must be an integer")
+			}
+		default:
+			return fmt.Errorf("field %q not found in type config.SlackConfig", key)
+		}
+	}
+	*c = SlackConfig(decoded)
+	return nil
 }
 
 type DefaultsConfig struct {
@@ -75,6 +100,7 @@ type AuthConfig struct {
 const (
 	DefaultInventoryRefreshInterval = time.Hour
 	DefaultInventoryMaximumAge      = 24 * time.Hour
+	DefaultMaxAllocationsPerUser    = 3
 )
 
 // ICTConfig names the ConfigMap-mounted ICT target configuration used only by tasks.
@@ -198,6 +224,9 @@ func (c Config) Validate() error {
 	if c.Slack.ChannelID == "" {
 		return errors.New("config: slack.channel_id is required")
 	}
+	if c.Slack.MaxAllocationsPerUser < 0 {
+		return errors.New("config: slack.max_allocations_per_user must be positive or zero for the default")
+	}
 	maintainers := make(map[string]struct{}, len(c.Slack.MaintainerIDs))
 	for _, id := range c.Slack.MaintainerIDs {
 		if !slackMemberID.MatchString(id) {
@@ -300,6 +329,14 @@ func (c Config) InventoryMaximumAge() time.Duration {
 		return c.Inventory.MaximumAge
 	}
 	return DefaultInventoryMaximumAge
+}
+
+// MaxAllocationsPerUser returns the configured Slack admission cap or its safe default.
+func (c Config) MaxAllocationsPerUser() int {
+	if c.Slack.MaxAllocationsPerUser > 0 {
+		return c.Slack.MaxAllocationsPerUser
+	}
+	return DefaultMaxAllocationsPerUser
 }
 
 // PublicAuthEligible reports whether this configured target permits Phase 1 public auth.

@@ -94,6 +94,36 @@ func TestNewApplyRunUsesFrozenPlanningInputs(t *testing.T) {
 	}
 }
 
+func TestOperationRunsKeepEachAllocationBackend(t *testing.T) {
+	allocations := []*servitorv1alpha1.ServitorCluster{
+		{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", UID: types.UID("allocation-one")}, Status: servitorv1alpha1.ServitorClusterStatus{ResolvedOptions: &servitorv1alpha1.ResolvedOptions{}, Backend: &servitorv1alpha1.BackendIdentity{Version: 1, Bucket: "bucket", Key: "servitor/allocation-one.tfstate", Region: "us-south", Endpoint: "https://s3.example.invalid"}, ExecutionImage: "registry.example/ict@sha256:one", Recovery: &servitorv1alpha1.RecoveryMetadata{Version: 1, Target: "target", TFVarsSHA256: "digest"}}},
+		{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", UID: types.UID("allocation-two")}, Status: servitorv1alpha1.ServitorClusterStatus{ResolvedOptions: &servitorv1alpha1.ResolvedOptions{}, Backend: &servitorv1alpha1.BackendIdentity{Version: 1, Bucket: "bucket", Key: "servitor/allocation-two.tfstate", Region: "us-south", Endpoint: "https://s3.example.invalid"}, ExecutionImage: "registry.example/ict@sha256:two", Recovery: &servitorv1alpha1.RecoveryMetadata{Version: 1, Target: "target", TFVarsSHA256: "digest"}}},
+	}
+	for _, allocation := range allocations {
+		for _, operation := range []struct {
+			kind  string
+			build func(*servitorv1alpha1.ServitorCluster, TaskConfig) (*tektonv1.PipelineRun, error)
+		}{
+			{"plan", NewPlanningRun}, {"apply", NewApplyRun}, {"destroy", NewDestroyRun},
+		} {
+			allocation.Status.Operation = &servitorv1alpha1.OperationReference{ID: operation.kind + "-id", Kind: operation.kind, PipelineRunName: operation.kind + "-run"}
+			run, err := operation.build(allocation, testTaskConfig)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, parameter := range run.Spec.Params {
+				if parameter.Name != "backend" {
+					continue
+				}
+				var backend servitorv1alpha1.BackendIdentity
+				if err := json.Unmarshal([]byte(parameter.Value.StringVal), &backend); err != nil || backend.Key != allocation.Status.Backend.Key {
+					t.Fatalf("%s backend = %#v, err=%v", operation.kind, backend, err)
+				}
+			}
+		}
+	}
+}
+
 func TestNewDestroyRunUsesFrozenContextAndHasNoOwner(t *testing.T) {
 	cluster := &servitorv1alpha1.ServitorCluster{
 		ObjectMeta: metav1.ObjectMeta{Namespace: "ns", UID: types.UID("cluster-uid")},

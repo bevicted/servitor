@@ -58,9 +58,9 @@ func TestInventoryControllerConfigCarriesValidatedPolicy(t *testing.T) {
 func TestNewSlackBotUsesDirectAPIReader(t *testing.T) {
 	cached := fake.NewClientBuilder().Build()
 	reader := fake.NewClientBuilder().Build()
-	bot := newSlackBot(config.Config{Namespace: "servitor", Slack: config.SlackConfig{ChannelID: "C1"}}, cached, reader, nil, nil)
+	bot := newSlackBot(config.Config{Namespace: "servitor", Slack: config.SlackConfig{ChannelID: "C1", MaxAllocationsPerUser: 7}}, cached, reader, nil, nil)
 	direct, ok := bot.Client.(allocationClient)
-	if !ok || direct.Client != cached || direct.AllocationReader() != reader || bot.Namespace != "servitor" || bot.ChannelID != "C1" {
+	if !ok || direct.Client != cached || direct.AllocationReader() != reader || bot.Namespace != "servitor" || bot.ChannelID != "C1" || bot.MaxAllocationsPerUser != 7 {
 		t.Fatalf("Slack bot wiring = %+v", bot)
 	}
 }

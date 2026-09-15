@@ -104,6 +104,39 @@ func TestLoadAppliesInventoryRefreshDefaults(t *testing.T) {
 	}
 }
 
+func TestSlackAllocationLimitDefaultsAndValidation(t *testing.T) {
+	configuration := validConfig()
+	for _, limit := range []int{0, 1, 3, 7} {
+		configuration.Slack.MaxAllocationsPerUser = limit
+		if err := configuration.Validate(); err != nil {
+			t.Fatalf("Validate(%d) error = %v", limit, err)
+		}
+		want := limit
+		if want == 0 {
+			want = DefaultMaxAllocationsPerUser
+		}
+		if got := configuration.MaxAllocationsPerUser(); got != want {
+			t.Fatalf("MaxAllocationsPerUser(%d) = %d, want %d", limit, got, want)
+		}
+	}
+	configuration.Slack.MaxAllocationsPerUser = -1
+	if err := configuration.Validate(); err == nil {
+		t.Fatal("Validate accepted a negative allocation limit")
+	}
+}
+
+func TestLoadRejectsNonIntegerSlackAllocationLimit(t *testing.T) {
+	directory := t.TempDir()
+	path := filepath.Join(directory, "config.yaml")
+	contents := strings.Replace(validYAML(), "maintainer_ids: [U012AB3CD, W012AB3CD]", "maintainer_ids: [U012AB3CD, W012AB3CD], max_allocations_per_user: 1.5", 1)
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("Load accepted a non-integer allocation limit")
+	}
+}
+
 func TestValidateRejectsUnsafeCOSEndpoints(t *testing.T) {
 	for _, endpoint := range []string{
 		"http://s3.example.invalid",
@@ -154,6 +187,13 @@ func TestLoadRejectsUnknownFieldsAndMultipleDocuments(t *testing.T) {
 	}
 	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "unknown") {
 		t.Fatalf("Load() error = %v, want unknown-field error", err)
+	}
+	contents = strings.Replace(validYAML(), "channel_id: C123", "channel_id: C123, unknown: value", 1)
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "unknown") {
+		t.Fatalf("Load() nested Slack error = %v, want unknown-field error", err)
 	}
 	if err := os.WriteFile(path, []byte(validYAML()+"---\n"+validYAML()), 0o600); err != nil {
 		t.Fatal(err)

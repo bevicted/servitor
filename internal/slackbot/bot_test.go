@@ -72,7 +72,7 @@ func TestCreateAcknowledgesBeforeCreatingOneDeterministicCluster(t *testing.T) {
 		t.Fatalf("responses=%+v", responses.responses)
 	}
 	cluster := &servitorv1alpha1.ServitorCluster{}
-	if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: ownerClusterName("U1")}, cluster); err != nil {
+	if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: allocationClusterName("C1", "123")}, cluster); err != nil {
 		t.Fatal(err)
 	}
 	if cluster.Spec.Slack.OwnerID != "U1" || cluster.Spec.Slack.ThreadTimestamp != "123" || cluster.Spec.UserOptions.Version != "4.22" || cluster.Spec.UserOptions.Provider != "" || cluster.Spec.Lifecycle.InitialLeaseSeconds != int64(bot.Lease/time.Second) || cluster.Spec.Lifecycle.RetrySeconds[0] != int64(time.Minute/time.Second) {
@@ -89,6 +89,141 @@ func TestCreateAcknowledgesBeforeCreatingOneDeterministicCluster(t *testing.T) {
 		t.Fatalf("clusters=%d", len(clusters.Items))
 	}
 }
+func TestCreateAllocationLimitsAndCompletedCapacity(t *testing.T) {
+	bot, responses := botForTest(t)
+	bot.MaxAllocationsPerUser = 1
+	first := Envelope{ID: "first", Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "<@BOT> create version=4.22", Timestamp: "100.000001"}}
+	if err := bot.Handle(context.Background(), first); err != nil {
+		t.Fatal(err)
+	}
+	if err := bot.Handle(context.Background(), Envelope{ID: "over-cap", Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "<@BOT> create version=4.22", Timestamp: "100.000002"}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := responses.responses[len(responses.responses)-1].Text; !containsText(got, "limit of 1") || containsText(got, "Planning...") {
+		t.Fatalf("one-slot quota response = %q", got)
+	}
+	if err := bot.Handle(context.Background(), Envelope{ID: "replay", Message: first.Message}); err != nil {
+		t.Fatal(err)
+	}
+	if got := responses.responses[len(responses.responses)-1].Text; !containsText(got, "already have an allocation") {
+		t.Fatalf("replay at quota = %q", got)
+	}
+	stored := &servitorv1alpha1.ServitorCluster{}
+	if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: allocationClusterName("C1", "100.000001")}, stored); err != nil {
+		t.Fatal(err)
+	}
+	stored.Status.Phase = servitorv1alpha1.PhaseCleanupComplete
+	if err := bot.Client.Update(context.Background(), stored); err != nil {
+		t.Fatal(err)
+	}
+	if err := bot.Handle(context.Background(), Envelope{ID: "capacity-restored", Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "<@BOT> create version=4.22", Timestamp: "100.000003"}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := responses.responses[len(responses.responses)-1].Text; got != "Planning..." {
+		t.Fatalf("completed allocation did not free capacity: %q", got)
+	}
+
+	more, moreResponses := botForTest(t)
+	more.MaxAllocationsPerUser = 5
+	for index := range 4 {
+		if err := more.Handle(context.Background(), Envelope{ID: fmt.Sprintf("more-%d", index), Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "<@BOT> create version=4.22", Timestamp: fmt.Sprintf("200.00000%d", index)}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(moreResponses.responses) != 4 || moreResponses.responses[3].Text != "Planning..." {
+		t.Fatalf("greater-than-three cap responses = %+v", moreResponses.responses)
+	}
+	helpBot, helpResponses := botForTest(t)
+	helpBot.MaxAllocationsPerUser = 5
+	if err := helpBot.Handle(context.Background(), Envelope{ID: "help", Message: Message{Channel: "D1", ChannelType: "im", User: "U1", Text: "help"}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := helpResponses.responses[0].Text; !containsText(got, "up to 5") {
+		t.Fatalf("configured help = %q", got)
+	}
+	if err := helpBot.Handle(context.Background(), Envelope{ID: "unknown", Message: Message{Channel: "D1", ChannelType: "im", User: "U1", Text: "unknown"}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := helpResponses.responses[1].Text; !containsText(got, "up to 5") {
+		t.Fatalf("configured unknown-command help = %q", got)
+	}
+}
+
+func TestCreateUsesDirectReaderForExistingAllocationAndQuota(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := servitorv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	cached := fake.NewClientBuilder().WithScheme(scheme).Build()
+	existing := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: allocationClusterName("C1", "300.000001"), Namespace: "servitor"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "300.000001"}}}
+	direct := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(existing).Build()
+	responses := &memoryResponder{}
+	bot := Bot{ChannelID: "C1", SelfUserID: "BOT", Namespace: "servitor", Client: testAllocationClient{Client: cached, reader: direct}, Events: state.NewEventStore(cached, "servitor"), Responder: responses, MaxAllocationsPerUser: 1}
+	if err := bot.Handle(context.Background(), Envelope{ID: "replay", Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "<@BOT> create invalid=option", Timestamp: "300.000001"}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := responses.responses[len(responses.responses)-1].Text; !containsText(got, "already have an allocation") {
+		t.Fatalf("direct existing lookup = %q", got)
+	}
+	if err := bot.Handle(context.Background(), Envelope{ID: "quota", Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "<@BOT> create version=4.22", Timestamp: "300.000002"}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := responses.responses[len(responses.responses)-1].Text; !containsText(got, "limit of 1") {
+		t.Fatalf("direct quota lookup = %q", got)
+	}
+}
+
+func TestReviewDecisionUsesDirectReader(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := servitorv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
+	deadline := metav1.NewTime(now.Add(time.Hour))
+	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: allocationClusterName("C1", "root"), Namespace: "servitor"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseAwaitingApproval, ReviewDeadline: &deadline}}
+	direct := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(cluster).Build()
+	cached := fake.NewClientBuilder().WithScheme(scheme).WithInterceptorFuncs(interceptor.Funcs{
+		Get: func(ctx context.Context, underlying client.WithWatch, key client.ObjectKey, object client.Object, options ...client.GetOption) error {
+			if _, ok := object.(*servitorv1alpha1.ServitorCluster); ok {
+				return apierrors.NewNotFound(schema.GroupResource{Group: "servitor.bevicted.github.io", Resource: "servitorclusters"}, key.Name)
+			}
+			return underlying.Get(ctx, key, object, options...)
+		},
+		Update: func(ctx context.Context, underlying client.WithWatch, object client.Object, options ...client.UpdateOption) error {
+			return direct.Update(ctx, object, options...)
+		},
+	}).Build()
+	bot := Bot{Namespace: "servitor", Client: testAllocationClient{Client: cached, reader: direct}, Clock: func() time.Time { return now }}
+	outcome, err := bot.recordReviewDecision(context.Background(), cluster.Name, Message{Channel: "C1", User: "U1"}, "root", "approved")
+	if err != nil || outcome != reviewDecisionRecorded {
+		t.Fatalf("recordReviewDecision() = (%q, %v), want (%q, nil)", outcome, err, reviewDecisionRecorded)
+	}
+	stored := &servitorv1alpha1.ServitorCluster{}
+	if err := direct.Get(context.Background(), client.ObjectKey{Namespace: "servitor", Name: cluster.Name}, stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.Spec.Lifecycle.Approval != "approved" {
+		t.Fatalf("direct allocation review intent = %q", stored.Spec.Lifecycle.Approval)
+	}
+}
+
+func TestCountedAllocationsExcludesOnlyCleanupComplete(t *testing.T) {
+	phases := []string{"", servitorv1alpha1.PhasePending, servitorv1alpha1.PhasePlanning, servitorv1alpha1.PhaseAwaitingApproval, servitorv1alpha1.PhaseApplying, servitorv1alpha1.PhaseReady, servitorv1alpha1.PhaseCleanupPending, servitorv1alpha1.PhaseUnresolved, servitorv1alpha1.PhaseCleanupComplete}
+	allocations := make([]servitorv1alpha1.ServitorCluster, len(phases))
+	for index, phase := range phases {
+		allocations[index].Status.Phase = phase
+	}
+	if got := (Bot{}).countedAllocations(allocations); got != len(phases)-1 {
+		t.Fatalf("counted allocations = %d, want %d", got, len(phases)-1)
+	}
+}
+
 func TestCreateAuthOptInQueuesOnlyEligiblePublicRequests(t *testing.T) {
 	for _, test := range []struct {
 		name, text, target, provider string
@@ -114,7 +249,7 @@ func TestCreateAuthOptInQueuesOnlyEligiblePublicRequests(t *testing.T) {
 				t.Fatal(err)
 			}
 			stored := &servitorv1alpha1.ServitorCluster{}
-			key := types.NamespacedName{Namespace: "servitor", Name: ownerClusterName("U1")}
+			key := types.NamespacedName{Namespace: "servitor", Name: allocationClusterName("C1", event.Message.Timestamp)}
 			if err := bot.Client.Get(context.Background(), key, stored); err != nil {
 				t.Fatal(err)
 			}
@@ -166,7 +301,7 @@ func TestHandleCreateNormalizesAssignmentsWithoutDefaults(t *testing.T) {
 		t.Fatalf("responses=%+v", responses.responses)
 	}
 	cluster := &servitorv1alpha1.ServitorCluster{}
-	if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: ownerClusterName("U1")}, cluster); err != nil {
+	if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: allocationClusterName("C1", "123")}, cluster); err != nil {
 		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(cluster.Spec.UserOptions, want) {
@@ -186,7 +321,7 @@ func TestHandleCreateRejectsInvalidWorkerCountWithoutAllocation(t *testing.T) {
 				t.Fatalf("responses=%+v", responses.responses)
 			}
 			cluster := &servitorv1alpha1.ServitorCluster{}
-			if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: ownerClusterName("U1")}, cluster); err == nil {
+			if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: allocationClusterName("C1", "root")}, cluster); err == nil {
 				t.Fatal("invalid worker count recorded an allocation")
 			}
 		})
@@ -205,7 +340,7 @@ func TestCreateRejectsInvalidAuthOptionsWithoutAllocation(t *testing.T) {
 				t.Fatalf("responses = %+v", responses.responses)
 			}
 			cluster := &servitorv1alpha1.ServitorCluster{}
-			if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: ownerClusterName("U1")}, cluster); !apierrors.IsNotFound(err) {
+			if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: allocationClusterName("C1", "root")}, cluster); !apierrors.IsNotFound(err) {
 				t.Fatalf("invalid auth create recorded allocation: %v", err)
 			}
 		})
@@ -221,7 +356,7 @@ func TestCreateRejectsCallerSelectedName(t *testing.T) {
 		t.Fatalf("responses=%+v", responses.responses)
 	}
 	cluster := &servitorv1alpha1.ServitorCluster{}
-	if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: ownerClusterName("U1")}, cluster); err == nil {
+	if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: allocationClusterName("C1", "root")}, cluster); err == nil {
 		t.Fatal("Slack create with name recorded an allocation")
 	}
 }
@@ -234,7 +369,7 @@ func TestCreateDoesNotProceedWhenAcceptanceDeliveryFails(t *testing.T) {
 		t.Fatal(err)
 	}
 	cluster := &servitorv1alpha1.ServitorCluster{}
-	name := types.NamespacedName{Namespace: "servitor", Name: ownerClusterName("U1")}
+	name := types.NamespacedName{Namespace: "servitor", Name: allocationClusterName("C1", "123")}
 	if err := bot.Client.Get(context.Background(), name, cluster); err == nil {
 		t.Fatal("create proceeded after Slack acceptance delivery failed")
 	}
@@ -303,7 +438,7 @@ func TestHandleCommandProgressAndPersistenceOrdering(t *testing.T) {
 		return Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: text, Timestamp: timestamp}
 	}
 	cluster := func() *servitorv1alpha1.ServitorCluster {
-		return &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: ownerClusterName("U1"), Namespace: "servitor"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 14400}}}
+		return &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: allocationClusterName("C1", "root"), Namespace: "servitor"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 14400}}}
 	}
 
 	t.Run("create delivers planning before Kubernetes creation", func(t *testing.T) {
@@ -330,7 +465,7 @@ func TestHandleCommandProgressAndPersistenceOrdering(t *testing.T) {
 			t.Fatalf("events=%q, want %q", recorder.events, want)
 		}
 		current := &servitorv1alpha1.ServitorCluster{}
-		if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: ownerClusterName("U1")}, current); err != nil || !current.Spec.Lifecycle.CleanupRequested {
+		if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: allocationClusterName("C1", "root")}, current); err != nil || !current.Spec.Lifecycle.CleanupRequested {
 			t.Fatalf("cleanup request = (%t, %v), want (true, nil)", current.Spec.Lifecycle.CleanupRequested, err)
 		}
 	})
@@ -359,7 +494,7 @@ func TestHandleCommandProgressAndPersistenceOrdering(t *testing.T) {
 			t.Fatalf("events=%q, want %q", recorder.events, want)
 		}
 		current := &servitorv1alpha1.ServitorCluster{}
-		if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: ownerClusterName("U1")}, current); err == nil {
+		if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: allocationClusterName("C1", "root")}, current); err == nil {
 			t.Fatal("failed reply created an allocation")
 		}
 	})
@@ -374,7 +509,7 @@ func TestHandleCommandProgressAndPersistenceOrdering(t *testing.T) {
 			t.Fatalf("create events=%q, want %q", recorder.events, want)
 		}
 		current := &servitorv1alpha1.ServitorCluster{}
-		if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: ownerClusterName("U1")}, current); err == nil {
+		if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: allocationClusterName("C1", "root")}, current); err == nil {
 			t.Fatal("failed persistence created an allocation")
 		}
 
@@ -387,7 +522,7 @@ func TestHandleCommandProgressAndPersistenceOrdering(t *testing.T) {
 			t.Fatalf("cleanup events=%q, want %q", recorder.events, want)
 		}
 		current = &servitorv1alpha1.ServitorCluster{}
-		if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: ownerClusterName("U1")}, current); err != nil || current.Spec.Lifecycle.CleanupRequested {
+		if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: allocationClusterName("C1", "root")}, current); err != nil || current.Spec.Lifecycle.CleanupRequested {
 			t.Fatalf("cleanup request = (%t, %v), want (false, nil)", current.Spec.Lifecycle.CleanupRequested, err)
 		}
 	})
@@ -534,8 +669,8 @@ func TestChannelCleanupReportsNoMatchesAndListFailure(t *testing.T) {
 }
 
 func TestThreadCleanupTargetsOnlyItsLifecycleThread(t *testing.T) {
-	primary := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: ownerClusterName("U1"), Namespace: "servitor"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "primary"}}}
-	sibling := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "sibling", Namespace: "servitor"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "sibling"}}}
+	primary := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: allocationClusterName("C1", "primary"), Namespace: "servitor"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "primary"}}}
+	sibling := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: allocationClusterName("C1", "sibling"), Namespace: "servitor"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "sibling"}}}
 	bot, responses := botForTest(t, primary, sibling)
 	if err := bot.Handle(context.Background(), Envelope{ID: "thread-cleanup", Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "done", Timestamp: "reply", ThreadTimestamp: "primary"}}); err != nil {
 		t.Fatal(err)
@@ -562,7 +697,7 @@ func TestReviewDecisionRecordsIntentAndAcknowledges(t *testing.T) {
 		{"no", "rejected", "Plan rejected.\nCleaning up..."},
 	} {
 		t.Run(test.command, func(t *testing.T) {
-			cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: ownerClusterName("U1"), Namespace: "servitor"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 14400}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseAwaitingApproval, LifecycleSnapshot: &servitorv1alpha1.LifecycleSnapshot{InitialLeaseSeconds: 14400}, ReviewDeadline: &deadline}}
+			cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: allocationClusterName("C1", "root"), Namespace: "servitor"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 14400}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseAwaitingApproval, LifecycleSnapshot: &servitorv1alpha1.LifecycleSnapshot{InitialLeaseSeconds: 14400}, ReviewDeadline: &deadline}}
 			bot, responses := botForTest(t, cluster)
 			if err := bot.Handle(context.Background(), Envelope{ID: test.command, Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: test.command, Timestamp: "reply", ThreadTimestamp: "root"}}); err != nil {
 				t.Fatal(err)
@@ -593,7 +728,7 @@ func TestReviewDecisionRejectsExpiredAndInvalidReviews(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			deadline := metav1.NewTime(test.deadline)
-			cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: ownerClusterName("U1"), Namespace: "servitor"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 14400}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: test.phase, ReviewDeadline: &deadline}}
+			cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: allocationClusterName("C1", "root"), Namespace: "servitor"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 14400}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: test.phase, ReviewDeadline: &deadline}}
 			bot, responses := botForTest(t, cluster)
 			if err := bot.Handle(context.Background(), Envelope{ID: test.name, Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "yes", Timestamp: "reply", ThreadTimestamp: "root"}}); err != nil {
 				t.Fatal(err)
@@ -614,7 +749,7 @@ func TestReviewDecisionRejectsExpiredAndInvalidReviews(t *testing.T) {
 func TestReviewDecisionRechecksStateAfterConflict(t *testing.T) {
 	now := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
 	deadline := metav1.NewTime(now.Add(time.Hour))
-	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: ownerClusterName("U1"), Namespace: "servitor"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 14400}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseAwaitingApproval, ReviewDeadline: &deadline}}
+	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: allocationClusterName("C1", "root"), Namespace: "servitor"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 14400}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseAwaitingApproval, ReviewDeadline: &deadline}}
 	scheme := runtime.NewScheme()
 	if err := corev1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
@@ -657,7 +792,7 @@ func TestReviewDecisionRechecksStateAfterConflict(t *testing.T) {
 func TestUnauthorizedAndUnrelatedReviewThreadMessagesRemainSilent(t *testing.T) {
 	now := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
 	deadline := metav1.NewTime(now.Add(time.Hour))
-	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: ownerClusterName("U1"), Namespace: "servitor"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 14400}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseAwaitingApproval, ReviewDeadline: &deadline}}
+	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: allocationClusterName("C1", "root"), Namespace: "servitor"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 14400}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseAwaitingApproval, ReviewDeadline: &deadline}}
 	bot, responses := botForTest(t, cluster)
 	for _, message := range []Message{
 		{Channel: "C1", ChannelType: "channel", User: "U2", Text: "yes", Timestamp: "reply", ThreadTimestamp: "root"},
@@ -692,7 +827,7 @@ func TestReviewDecisionControllerInterleavings(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			deadline := metav1.NewTime(test.deadline)
-			cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: ownerClusterName("U1"), Namespace: "servitor", UID: "uid", Generation: 1, Finalizers: []string{servitorv1alpha1.CleanupFinalizer}}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 14400, RetrySeconds: []int64{60}}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseAwaitingApproval, ResolvedOptions: &servitorv1alpha1.ResolvedOptions{}, LifecycleSnapshot: &servitorv1alpha1.LifecycleSnapshot{InitialLeaseSeconds: 14400, RetrySeconds: []int64{60}}, ReviewDeadline: &deadline, ReviewGeneration: 1}}
+			cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: allocationClusterName("C1", "root"), Namespace: "servitor", UID: "uid", Generation: 1, Finalizers: []string{servitorv1alpha1.CleanupFinalizer}}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 14400, RetrySeconds: []int64{60}}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseAwaitingApproval, ResolvedOptions: &servitorv1alpha1.ResolvedOptions{}, LifecycleSnapshot: &servitorv1alpha1.LifecycleSnapshot{InitialLeaseSeconds: 14400, RetrySeconds: []int64{60}}, ReviewDeadline: &deadline, ReviewGeneration: 1}}
 			scheme := runtime.NewScheme()
 			if err := corev1.AddToScheme(scheme); err != nil {
 				t.Fatal(err)
@@ -757,7 +892,7 @@ func TestReviewDecisionControllerInterleavings(t *testing.T) {
 func TestRejectedCommandReceiptSuppressesNotifierCauseDuplicate(t *testing.T) {
 	now := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
 	deadline := metav1.NewTime(now.Add(time.Hour))
-	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: ownerClusterName("U1"), Namespace: "servitor", UID: "uid"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseAwaitingApproval, ReviewDeadline: &deadline}}
+	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: allocationClusterName("C1", "root"), Namespace: "servitor", UID: "uid"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseAwaitingApproval, ReviewDeadline: &deadline}}
 	bot, responses := botForTest(t, cluster)
 	if err := bot.Handle(context.Background(), Envelope{ID: "reject", Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "no", Timestamp: "reply", ThreadTimestamp: "root"}}); err != nil {
 		t.Fatal(err)
@@ -789,7 +924,7 @@ func TestRejectedCommandReceiptSuppressesNotifierCauseDuplicate(t *testing.T) {
 func TestFailedCommandCauseReplyRemainsRetryable(t *testing.T) {
 	now := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
 	deadline := metav1.NewTime(now.Add(time.Hour))
-	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: ownerClusterName("U1"), Namespace: "servitor", UID: "uid"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseAwaitingApproval, ReviewDeadline: &deadline}}
+	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: allocationClusterName("C1", "root"), Namespace: "servitor", UID: "uid"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseAwaitingApproval, ReviewDeadline: &deadline}}
 	bot, responses := botForTest(t, cluster)
 	responses.err = errors.New("Slack unavailable")
 	if err := bot.Handle(context.Background(), Envelope{ID: "reject", Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "no", Timestamp: "reply", ThreadTimestamp: "root"}}); err != nil {
@@ -826,7 +961,7 @@ func TestFailedCommandCauseReplyRemainsRetryable(t *testing.T) {
 func TestThreadOwnerMutatesOnlySpecIntent(t *testing.T) {
 	expiry := metav1.NewTime(time.Date(2026, 9, 8, 4, 0, 0, 0, time.UTC))
 	deadline := metav1.NewTime(time.Date(2026, 9, 8, 1, 0, 0, 0, time.UTC))
-	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: ownerClusterName("U1"), Namespace: "servitor"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 14400}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseAwaitingApproval, LifecycleSnapshot: &servitorv1alpha1.LifecycleSnapshot{InitialLeaseSeconds: 14400}, ReviewDeadline: &deadline}}
+	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: allocationClusterName("C1", "root"), Namespace: "servitor"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 14400}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseAwaitingApproval, LifecycleSnapshot: &servitorv1alpha1.LifecycleSnapshot{InitialLeaseSeconds: 14400}, ReviewDeadline: &deadline}}
 	bot, _ := botForTest(t, cluster)
 	if err := bot.Handle(context.Background(), Envelope{ID: "yes", Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "yes", Timestamp: "reply", ThreadTimestamp: "root"}}); err != nil {
 		t.Fatal(err)
@@ -861,7 +996,7 @@ func TestThreadOwnerMutatesOnlySpecIntent(t *testing.T) {
 func TestChannelAndDMExtensionsDoNotMutateIntent(t *testing.T) {
 	now := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
 	expiry := metav1.NewTime(now.Add(time.Hour))
-	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: ownerClusterName("U1"), Namespace: "servitor"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 3600}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseReady, LeaseExpiresAt: &expiry, LifecycleSnapshot: &servitorv1alpha1.LifecycleSnapshot{InitialLeaseSeconds: 3600}}}
+	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: allocationClusterName("C1", "root"), Namespace: "servitor"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 3600}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseReady, LeaseExpiresAt: &expiry, LifecycleSnapshot: &servitorv1alpha1.LifecycleSnapshot{InitialLeaseSeconds: 3600}}}
 	bot, responses := botForTest(t, cluster)
 	for _, event := range []Envelope{
 		{ID: "channel-bare", Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "<@BOT> extend", Timestamp: "100.000001"}},
@@ -875,7 +1010,7 @@ func TestChannelAndDMExtensionsDoNotMutateIntent(t *testing.T) {
 	if len(responses.responses) != 3 {
 		t.Fatalf("extension responses = %+v", responses.responses)
 	}
-	if got := []string{responses.responses[0].Text, responses.responses[1].Text}; !reflect.DeepEqual(got, []string{unknownText(), unknownText()}) {
+	if got := []string{responses.responses[0].Text, responses.responses[1].Text}; !reflect.DeepEqual(got, []string{bot.unknownText(), bot.unknownText()}) {
 		t.Fatalf("channel extension responses = %q", got)
 	}
 	if got := responses.responses[2].Text; got != rejectedText("`extend [N[h]]` is available only in your lifecycle thread.") {
@@ -892,7 +1027,7 @@ func TestChannelAndDMExtensionsDoNotMutateIntent(t *testing.T) {
 
 func TestStaleExtensionDoesNotRecomputeTargetAfterReceiptEviction(t *testing.T) {
 	expiry := metav1.NewTime(time.Date(2026, 9, 8, 4, 0, 0, 0, time.UTC))
-	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: ownerClusterName("U1"), Namespace: "servitor"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 14400}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseReady, LeaseExpiresAt: &expiry, LifecycleSnapshot: &servitorv1alpha1.LifecycleSnapshot{InitialLeaseSeconds: 14400}}}
+	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: allocationClusterName("C1", "root"), Namespace: "servitor"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 14400}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseReady, LeaseExpiresAt: &expiry, LifecycleSnapshot: &servitorv1alpha1.LifecycleSnapshot{InitialLeaseSeconds: 14400}}}
 	bot, _ := botForTest(t, cluster)
 	store := bot.Events.(*state.EventStore)
 	now := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
@@ -938,7 +1073,7 @@ func TestCreateRejectsPlatformAndHelpDoesNotAdvertiseIt(t *testing.T) {
 	if len(responses.responses) != 1 || !containsText(responses.responses[0].Text, `unknown create option "platform"`) {
 		t.Fatalf("responses=%+v", responses.responses)
 	}
-	for _, page := range createHelp(command.CreateDefaults{}) {
+	for _, page := range createHelp(command.CreateDefaults{}, 3) {
 		if containsText(page, "platform=") {
 			t.Fatalf("create help advertises platform: %s", page)
 		}
@@ -946,7 +1081,7 @@ func TestCreateRejectsPlatformAndHelpDoesNotAdvertiseIt(t *testing.T) {
 }
 
 func TestCreateHelpDistinguishesDefaultsAliasesStreamsAndProvider(t *testing.T) {
-	help := strings.Join(createHelp(command.CreateDefaults{}), "\n")
+	help := strings.Join(createHelp(command.CreateDefaults{}, 3), "\n")
 	for _, wanted := range []string{"Configured defaults", "provider=", "key=value", "target=synthetic-target", "resource-group=\"Platform Team\"", "auth=true", "auth=false", "Public `auth`", "Private-only and Satellite", "roks", "iks", "k8s", "default_openshift", "default_kubernetes", "4.17"} {
 		if !containsText(help, wanted) {
 			t.Fatalf("create help missing %q: %s", wanted, help)
@@ -969,7 +1104,7 @@ func TestCreateRejectsIncompatibleAliasVersionWithoutAllocation(t *testing.T) {
 		t.Fatalf("responses=%+v", responses.responses)
 	}
 	cluster := &servitorv1alpha1.ServitorCluster{}
-	if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: ownerClusterName("U1")}, cluster); err == nil {
+	if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: allocationClusterName("C1", "root")}, cluster); err == nil {
 		t.Fatal("incompatible alias/version recorded an allocation")
 	}
 }
@@ -1119,7 +1254,7 @@ func TestCreateMatchesPublishedInventoryBareValues(t *testing.T) {
 		t.Fatal(err)
 	}
 	cluster := &servitorv1alpha1.ServitorCluster{}
-	if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: ownerClusterName("U1")}, cluster); err != nil {
+	if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: allocationClusterName("C1", "123")}, cluster); err != nil {
 		t.Fatal(err)
 	}
 	want := servitorv1alpha1.UserOptions{Target: "target-a", Provider: "vpc-gen2", Version: "4.22", ResourceGroup: "Platform Team", Zone: "us-south-1", Flavor: "bx2.4x16"}
@@ -1132,7 +1267,7 @@ func TestCreateMatchesPublishedInventoryBareValues(t *testing.T) {
 		t.Fatal(err)
 	}
 	explicitCluster := &servitorv1alpha1.ServitorCluster{}
-	if err := explicit.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: ownerClusterName("U1")}, explicitCluster); err != nil || !reflect.DeepEqual(explicitCluster.Spec.UserOptions, want) {
+	if err := explicit.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: allocationClusterName("C1", "123")}, explicitCluster); err != nil || !reflect.DeepEqual(explicitCluster.Spec.UserOptions, want) {
 		t.Fatalf("explicit create = %+v, %v", explicitCluster.Spec.UserOptions, err)
 	}
 
@@ -1141,7 +1276,7 @@ func TestCreateMatchesPublishedInventoryBareValues(t *testing.T) {
 		t.Fatal(err)
 	}
 	defaultCluster := &servitorv1alpha1.ServitorCluster{}
-	if err := defaults.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: ownerClusterName("U2")}, defaultCluster); err != nil || !reflect.DeepEqual(defaultCluster.Spec.UserOptions, servitorv1alpha1.UserOptions{ResourceGroup: "Platform Team"}) {
+	if err := defaults.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: allocationClusterName("C1", "124")}, defaultCluster); err != nil || !reflect.DeepEqual(defaultCluster.Spec.UserOptions, servitorv1alpha1.UserOptions{ResourceGroup: "Platform Team"}) {
 		t.Fatalf("default create = %+v, %v", defaultCluster.Spec.UserOptions, err)
 	}
 }
@@ -1162,7 +1297,7 @@ func TestCreateBareValuesRequireCurrentInventoryButKeysProceed(t *testing.T) {
 				t.Fatalf("bare response=%+v", responses.responses)
 			}
 			cluster := &servitorv1alpha1.ServitorCluster{}
-			if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: ownerClusterName("U1")}, cluster); err == nil {
+			if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: allocationClusterName("C1", "123")}, cluster); err == nil {
 				t.Fatal("bare value created an allocation without a usable snapshot")
 			}
 		})
@@ -1177,7 +1312,7 @@ func TestCreateBareValuesRequireCurrentInventoryButKeysProceed(t *testing.T) {
 		t.Fatal(err)
 	}
 	cluster := &servitorv1alpha1.ServitorCluster{}
-	if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: ownerClusterName("U2")}, cluster); err != nil || cluster.Spec.UserOptions.ResourceGroup != "Uncatalogued" {
+	if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: allocationClusterName("C1", "124")}, cluster); err != nil || cluster.Spec.UserOptions.ResourceGroup != "Uncatalogued" {
 		t.Fatalf("keyed create = %+v, %v", cluster.Spec.UserOptions, err)
 	}
 	for _, text := range []string{"<@BOT> create target=unknown resource-group=value", "<@BOT> create provider=classic resource-group=value"} {
@@ -1227,7 +1362,7 @@ func TestLifecycleCommandsExplainStateAndRecordOnlyAcceptedIntent(t *testing.T) 
 	expiry := metav1.NewTime(now.Add(time.Hour))
 	cluster := func(phase string) *servitorv1alpha1.ServitorCluster {
 		return &servitorv1alpha1.ServitorCluster{
-			ObjectMeta: metav1.ObjectMeta{Name: ownerClusterName("U1"), Namespace: "servitor"},
+			ObjectMeta: metav1.ObjectMeta{Name: allocationClusterName("C1", "root"), Namespace: "servitor"},
 			Spec:       servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 3600}},
 			Status:     servitorv1alpha1.ServitorClusterStatus{Phase: phase, LeaseExpiresAt: expiry.DeepCopy(), LifecycleSnapshot: &servitorv1alpha1.LifecycleSnapshot{InitialLeaseSeconds: 3600}},
 		}
@@ -1300,7 +1435,7 @@ func TestLifecycleCommandsExplainStateAndRecordOnlyAcceptedIntent(t *testing.T) 
 
 func TestLifecycleCommandsKeepForeignAndWrongThreadRequestsSilent(t *testing.T) {
 	expiry := metav1.NewTime(time.Date(2026, 9, 8, 1, 0, 0, 0, time.UTC))
-	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: ownerClusterName("U1"), Namespace: "servitor"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 3600}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseReady, LeaseExpiresAt: &expiry, LifecycleSnapshot: &servitorv1alpha1.LifecycleSnapshot{InitialLeaseSeconds: 3600}}}
+	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: allocationClusterName("C1", "root"), Namespace: "servitor"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 3600}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseReady, LeaseExpiresAt: &expiry, LifecycleSnapshot: &servitorv1alpha1.LifecycleSnapshot{InitialLeaseSeconds: 3600}}}
 	bot, responses := botForTest(t, cluster)
 	for _, event := range []Envelope{
 		{ID: "foreign", Message: Message{Channel: "C1", ChannelType: "channel", User: "U2", Text: "extend nonsense", Timestamp: "100.000001", ThreadTimestamp: "root"}},
@@ -1326,7 +1461,7 @@ func TestExtensionFeedbackAfterPersistenceFailureAndConflict(t *testing.T) {
 	now := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
 	expiry := metav1.NewTime(now.Add(time.Hour))
 	cluster := func() *servitorv1alpha1.ServitorCluster {
-		return &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: ownerClusterName("U1"), Namespace: "servitor"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 3600}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseReady, LeaseExpiresAt: expiry.DeepCopy(), LifecycleSnapshot: &servitorv1alpha1.LifecycleSnapshot{InitialLeaseSeconds: 3600}}}
+		return &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: allocationClusterName("C1", "root"), Namespace: "servitor"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 3600}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseReady, LeaseExpiresAt: expiry.DeepCopy(), LifecycleSnapshot: &servitorv1alpha1.LifecycleSnapshot{InitialLeaseSeconds: 3600}}}
 	}
 	event := Envelope{ID: "extend", Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "extend 1h", Timestamp: "100.000001", ThreadTimestamp: "root"}}
 	t.Run("persistence failure", func(t *testing.T) {
@@ -1341,7 +1476,7 @@ func TestExtensionFeedbackAfterPersistenceFailureAndConflict(t *testing.T) {
 			t.Fatalf("events=%q, want %q", recorder.events, want)
 		}
 		stored := &servitorv1alpha1.ServitorCluster{}
-		if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: ownerClusterName("U1")}, stored); err != nil {
+		if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: allocationClusterName("C1", "root")}, stored); err != nil {
 			t.Fatal(err)
 		}
 		if stored.Spec.Lifecycle.RequestedExpiry != nil {

@@ -110,7 +110,7 @@ func TestCreateAuthOptInDrivesOneReadyDelivery(t *testing.T) {
 func TestOwnerThreadAuthDrivesControllerAndExternalDMUpload(t *testing.T) {
 	now := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
 	cluster := &servitorv1alpha1.ServitorCluster{
-		ObjectMeta: metav1.ObjectMeta{Name: "slack-316ca0efda6296d8f2c11d1e", Namespace: "ns", UID: "allocation-uid"},
+		ObjectMeta: metav1.ObjectMeta{Name: "slack-28205610339efb8b5404f514", Namespace: "ns", UID: "allocation-uid"},
 		Spec: servitorv1alpha1.ServitorClusterSpec{
 			Slack:     servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"},
 			Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 3600, RetrySeconds: []int64{60}},
@@ -185,7 +185,7 @@ func TestOwnerThreadAuthDrivesControllerAndExternalDMUpload(t *testing.T) {
 
 	api := slack.New("synthetic-token", slack.OptionAPIURL(server.URL+"/"))
 	reconciler := &controller.Reconciler{Client: kube, DirectReader: kube, AuthDelivery: slackbot.NewAuthDelivery(api), Config: controller.Config{Namespace: "ns"}, Now: func() time.Time { return now }}
-	request := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "ns", Name: "slack-316ca0efda6296d8f2c11d1e"}}
+	request := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "ns", Name: "slack-28205610339efb8b5404f514"}}
 	if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
 		t.Fatal(err)
 	}

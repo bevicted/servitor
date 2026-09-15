@@ -16,6 +16,7 @@ import (
 
 	servitorv1alpha1 "github.com/bevicted/servitor/api/v1alpha1"
 	"github.com/bevicted/servitor/internal/command"
+	"github.com/bevicted/servitor/internal/config"
 	"github.com/bevicted/servitor/internal/inventory"
 	"github.com/bevicted/servitor/internal/lifecycle"
 	"github.com/bevicted/servitor/internal/state"
@@ -56,6 +57,7 @@ type Bot struct {
 	ChannelID, SelfUserID string
 	Namespace             string
 	Client                client.Client
+	MaxAllocationsPerUser int
 	Events                EventStore
 	Defaults              command.CreateDefaults
 	InventoryConfigMap    string
@@ -149,7 +151,7 @@ func (b Bot) Handle(ctx context.Context, envelope Envelope) error {
 	case "destroy":
 		b.cleanup(ctx, message, thread, false)
 	default:
-		reply(unknownText())
+		reply(b.unknownText())
 	}
 	return claim()
 }
@@ -173,7 +175,7 @@ func (b Bot) handleDM(ctx context.Context, message Message, eventID string) {
 	case "extend":
 		respond(rejectedText("`extend [N[h]]` is available only in your lifecycle thread."))
 	default:
-		respond(unknownText())
+		respond(b.unknownText())
 	}
 }
 
@@ -241,6 +243,22 @@ func (b Bot) requestInventoryRefresh(ctx context.Context, message Message, event
 }
 
 func (b Bot) create(ctx context.Context, message Message, text string, respond func(string)) bool {
+	if b.Client == nil || b.Namespace == "" {
+		respond(rejectedText("Create is unavailable. Inspect the allocation CR status and private cluster logs."))
+		return true
+	}
+	name := allocationClusterName(message.Channel, message.Timestamp)
+	existing := &servitorv1alpha1.ServitorCluster{}
+	err := b.allocationReader().Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: name}, existing)
+	if err == nil {
+		respond(b.existingAllocationNotice(ctx, existing, message.User))
+		return true
+	}
+	if !apierrors.IsNotFound(err) {
+		b.logf("get existing allocation: %v", err)
+		respond(rejectedText("Unable to check an existing allocation. No operation was started."))
+		return false
+	}
 	options, err := command.ParseCreateOptions(text)
 	if err != nil {
 		respond(rejectedText(err.Error()))
@@ -262,21 +280,15 @@ func (b Bot) create(ctx context.Context, message Message, text string, respond f
 		return true
 	}
 	authRequested := options.AuthRequested()
-	if b.Client == nil || b.Namespace == "" {
-		respond(rejectedText("Create is unavailable. Inspect the allocation CR status and private cluster logs."))
-		return true
-	}
-	name := ownerClusterName(message.User)
-	existing := &servitorv1alpha1.ServitorCluster{}
-	err = b.Client.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: name}, existing)
-	if err == nil {
-		respond(b.existingAllocationNotice(ctx, existing, message.User))
-		return true
-	}
-	if !apierrors.IsNotFound(err) {
-		b.logf("get existing allocation: %v", err)
-		respond(rejectedText("Unable to check an existing allocation. No operation was started."))
+	allocations, err := b.ownerAllocations(ctx, message.User)
+	if err != nil {
+		b.logf("list allocations for admission: %v", err)
+		respond(rejectedText("Unable to check your allocation limit. No operation was started."))
 		return false
+	}
+	if b.countedAllocations(allocations) >= b.maxAllocationsPerUser() {
+		respond(rejectedText(fmt.Sprintf("You have reached your allocation limit of %d. Wait for cleanup to complete, then create a new allocation.", b.maxAllocationsPerUser())))
+		return true
 	}
 	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: b.Namespace}, Spec: servitorv1alpha1.ServitorClusterSpec{
 		Slack:       servitorv1alpha1.SlackIdentity{OwnerID: message.User, ChannelID: message.Channel, ThreadTimestamp: message.Timestamp},
@@ -303,7 +315,7 @@ func (b Bot) create(ctx context.Context, message Message, text string, respond f
 	}
 	if err := b.Client.Create(ctx, cluster); err != nil {
 		if apierrors.IsAlreadyExists(err) {
-			if getErr := b.Client.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: name}, existing); getErr == nil {
+			if getErr := b.allocationReader().Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: name}, existing); getErr == nil {
 				respond(b.existingAllocationNotice(ctx, existing, message.User))
 				return true
 			}
@@ -328,7 +340,7 @@ const (
 )
 
 func (b Bot) confirm(ctx context.Context, message Message, thread string) {
-	cluster, err := b.ownerCluster(ctx, message.User)
+	cluster, err := b.ownerCluster(ctx, message, thread)
 	if err != nil || !ownsThread(cluster, message, thread, true) {
 		return
 	}
@@ -361,7 +373,7 @@ func (b Bot) recordReviewDecision(ctx context.Context, name string, message Mess
 	outcome := reviewDecisionInvalid
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		current := &servitorv1alpha1.ServitorCluster{}
-		if err := b.Client.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: name}, current); err != nil {
+		if err := b.allocationReader().Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: name}, current); err != nil {
 			return err
 		}
 		switch {
@@ -391,7 +403,7 @@ func (b Bot) cleanup(ctx context.Context, message Message, thread string, acknow
 }
 
 func (b Bot) cleanupThread(ctx context.Context, message Message, thread string, acknowledge bool) {
-	cluster, err := b.ownerCluster(ctx, message.User)
+	cluster, err := b.ownerCluster(ctx, message, thread)
 	if err != nil {
 		return
 	}
@@ -526,7 +538,7 @@ func (s cleanupSummary) text() string {
 // auth records one owner-thread request. The controller consumes it before
 // reading the allocation Secret or calling Slack, so intake never handles credentials.
 func (b Bot) auth(ctx context.Context, message Message, thread string, respond func(string)) {
-	cluster, err := b.ownerCluster(ctx, message.User)
+	cluster, err := b.ownerCluster(ctx, message, thread)
 	if err != nil || !ownsThread(cluster, message, thread, true) {
 		return
 	}
@@ -589,7 +601,7 @@ func (b Bot) publicAuthEligible(cluster *servitorv1alpha1.ServitorCluster) bool 
 }
 
 func (b Bot) extend(ctx context.Context, message Message, thread string, respond func(string)) {
-	cluster, err := b.ownerCluster(ctx, message.User)
+	cluster, err := b.ownerCluster(ctx, message, thread)
 	if err != nil {
 		return
 	}
@@ -693,20 +705,20 @@ func (b Bot) list(ctx context.Context, user string, respond func(string)) {
 		respond(rejectedText("List is unavailable. Inspect the allocation CR status and private cluster logs."))
 		return
 	}
-	var clusters servitorv1alpha1.ServitorClusterList
-	if err := b.Client.List(ctx, &clusters, client.InNamespace(b.Namespace)); err != nil {
+	clusters, err := b.ownerAllocations(ctx, user)
+	if err != nil {
 		b.logf("list allocations: %v", err)
 		respond(rejectedText("Unable to list clusters. No operation was started."))
 		return
 	}
-	for _, text := range clusterListMessages(clusters.Items, user, b.now()) {
+	for _, text := range clusterListMessages(clusters, user, b.now()) {
 		respond(text)
 	}
 }
 
-func (b Bot) ownerCluster(ctx context.Context, owner string) (*servitorv1alpha1.ServitorCluster, error) {
+func (b Bot) ownerCluster(ctx context.Context, message Message, thread string) (*servitorv1alpha1.ServitorCluster, error) {
 	cluster := &servitorv1alpha1.ServitorCluster{}
-	if err := b.allocationReader().Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: ownerClusterName(owner)}, cluster); err != nil {
+	if err := b.allocationReader().Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: allocationClusterName(message.Channel, thread)}, cluster); err != nil {
 		return nil, err
 	}
 	return cluster, nil
@@ -771,9 +783,29 @@ func ownsThread(cluster *servitorv1alpha1.ServitorCluster, message Message, thre
 	}
 	return !requireThread || cluster.Spec.Slack.ThreadTimestamp == thread
 }
-func ownerClusterName(owner string) string {
-	digest := sha256.Sum256([]byte(owner))
+
+// allocationClusterName identifies one initiating Slack channel/thread pair.
+// A NUL separator makes pairs such as ("ab", "c") and ("a", "bc") distinct.
+func allocationClusterName(channel, thread string) string {
+	digest := sha256.Sum256([]byte(channel + "\x00" + thread))
 	return "slack-" + hex.EncodeToString(digest[:])[:24]
+}
+
+func (b Bot) countedAllocations(allocations []servitorv1alpha1.ServitorCluster) int {
+	count := 0
+	for _, allocation := range allocations {
+		if allocation.Status.Phase != servitorv1alpha1.PhaseCleanupComplete {
+			count++
+		}
+	}
+	return count
+}
+
+func (b Bot) maxAllocationsPerUser() int {
+	if b.MaxAllocationsPerUser > 0 {
+		return b.MaxAllocationsPerUser
+	}
+	return config.DefaultMaxAllocationsPerUser
 }
 
 // staleExtensionEvent rejects a redelivery even after the bounded receipt
@@ -962,7 +994,7 @@ func (b Bot) respondCleanupCause(ctx context.Context, channel, thread string, cl
 func (b Bot) respondHelp(text string, respond func(string), maintainer bool) {
 	words := strings.Fields(text)
 	if len(words) > 2 {
-		respond(unknownText())
+		respond(b.unknownText())
 		return
 	}
 	topic := ""
@@ -972,9 +1004,9 @@ func (b Bot) respondHelp(text string, respond func(string), maintainer bool) {
 	var messages []string
 	switch topic {
 	case "":
-		messages = helpOverview(maintainer)
+		messages = helpOverview(maintainer, b.maxAllocationsPerUser())
 	case "create":
-		messages = createHelp(b.Defaults)
+		messages = createHelp(b.Defaults, b.maxAllocationsPerUser())
 	case "done":
 		messages = []string{"`done` in a lifecycle thread releases that allocation. `@servitor done` in the configured channel requests cleanup for all of your allocations in that channel. It is unavailable after cleanup completes; repeated requests report cleanup in progress."}
 	case "extend":
@@ -987,11 +1019,11 @@ func (b Bot) respondHelp(text string, respond func(string), maintainer bool) {
 		if maintainer {
 			messages = []string{"`refresh inventory` starts or joins a private inventory refresh. Use it only in a DM; a safe completion summary follows."}
 		} else {
-			respond(unknownText())
+			respond(b.unknownText())
 			return
 		}
 	default:
-		respond(unknownText())
+		respond(b.unknownText())
 		return
 	}
 	for _, message := range messages {
@@ -1061,17 +1093,20 @@ func firstToken(text string) string {
 	}
 	return words[0]
 }
-func unknownText() string               { return "Command unknown.\n\n" + helpOverview(false)[0] }
+func (b Bot) unknownText() string {
+	return "Command unknown.\n\n" + helpOverview(false, b.maxAllocationsPerUser())[0]
+}
 func rejectedText(reason string) string { return "Command rejected.\n\n" + reason }
-func helpOverview(maintainer bool) []string {
-	text := "Servitor provisions one temporary IBM Cloud cluster per Slack user.\n\nCommands\n```\nDM\n  help [command]          print help\n  list                    list clusters\n\nConfigured channel\n  @servitor help [command]  print help\n  @servitor create [safe options]  provision a new cluster\n  @servitor done            request cleanup for all your allocations in this channel\n  @servitor list            list clusters\n\nLifecycle thread\n  yes                       approve the cluster plan\n  no                        reject the cluster plan\n  done                      release this allocation\n  extend [N[h]]             extend your lease\n  auth                      send stored public access to your DM\n"
+func helpOverview(maintainer bool, maxAllocationsPerUser int) []string {
+	text := fmt.Sprintf("Servitor provisions up to %d temporary IBM Cloud clusters per Slack user, one per initiating lifecycle thread.\n\nCommands\n```\nDM\n  help [command]          print help\n  list                    list clusters\n\nConfigured channel\n  @servitor help [command]  print help\n  @servitor create [safe options]  provision a new cluster\n  @servitor done            request cleanup for all your allocations in this channel\n  @servitor list            list clusters\n\nLifecycle thread\n  yes                       approve the cluster plan\n  no                        reject the cluster plan\n  done                      release this allocation\n  extend [N[h]]             extend your lease\n  auth                      send stored public access to your DM\n", maxAllocationsPerUser)
 	if maintainer {
 		text += "\nMaintainer DM\n  refresh inventory         refresh private inventory\n"
 	}
 	return []string{text + "```"}
 }
-func createHelp(defaults command.CreateDefaults) []string {
-	return []string{"`create` starts planning from the configured channel root. Configured defaults: version " + safeHelpCell(defaults.Version) + ", target " + safeHelpCell(defaults.Target) + ", provider " + safeHelpCell(defaults.Provider) + ". `provider=value` chooses infrastructure; version chooses Kubernetes or OpenShift. Cluster names are generated internally.\n\nSpecify provisioning options as `key=value`. A current common-option inventory also recognizes unique bare values, for example `create target=synthetic-target vpc-gen2 us-south-1 bx2.4x16 resource-group=\"Platform Team\"`. `auth`, `auth=true`, and `auth=false` control only public kubeconfig delivery; the default is no delivery. Public `auth` queues one owner-DM delivery after Ready. Private-only and Satellite auth opt-ins continue creating the cluster but report that VPN-backed authentication is not implemented yet. Unknown or colliding shorthand must use a key such as `flavor=value`; worker counts and uncommon Satellite values stay keyed. Use `roks` (also `openshift` or `default_openshift`) for the cloud default OpenShift stream, or `iks` (also `kubernetes`, `k8s`, or `default_kubernetes`) for Kubernetes. A compatible numeric stream can refine an alias: `create roks 4.17`. These reserved aliases require a key when used as resource names.\n\nReview the resolved stream and configuration in its thread. The review prompt shows the persisted approval deadline; reply with exact `yes` or `no` before that deadline.", "Safe create options\n```\nCommon\n  target= provider= version= resource-group= worker-count=\n  auth | auth=true | auth=false (public delivery only)\n\nVPC Gen 2\n  zone= flavor= vpc-id= subnet-id= public-gateway-id=\n\nClassic\n  datacenter= machine-type= public-vlan-id= private-vlan-id=\n\nSatellite\n  satellite-zone= satellite-managed-from= satellite-location-id=\n  satellite-host-image= satellite-host-profile= satellite-ssh-key-id=\n  satellite-worker-instance-id= satellite-worker-operating-system=\n```"}
+func createHelp(defaults command.CreateDefaults, maxAllocationsPerUser int) []string {
+	intro := fmt.Sprintf("`create` starts planning from the configured channel root, up to %d active allocations per user. Repeating create in the same thread preserves that allocation. Configured defaults: version %s, target %s, provider %s.", maxAllocationsPerUser, safeHelpCell(defaults.Version), safeHelpCell(defaults.Target), safeHelpCell(defaults.Provider))
+	return []string{intro + " `provider=value` chooses infrastructure; version chooses Kubernetes or OpenShift. Cluster names are generated internally.\n\nSpecify provisioning options as `key=value`. A current common-option inventory also recognizes unique bare values, for example `create target=synthetic-target vpc-gen2 us-south-1 bx2.4x16 resource-group=\"Platform Team\"`. `auth`, `auth=true`, and `auth=false` control only public kubeconfig delivery; the default is no delivery. Public `auth` queues one owner-DM delivery after Ready. Private-only and Satellite auth opt-ins continue creating the cluster but report that VPN-backed authentication is not implemented yet. Unknown or colliding shorthand must use a key such as `flavor=value`; worker counts and uncommon Satellite values stay keyed. Use `roks` (also `openshift` or `default_openshift`) for the cloud default OpenShift stream, or `iks` (also `kubernetes`, `k8s`, or `default_kubernetes`) for Kubernetes. A compatible numeric stream can refine an alias: `create roks 4.17`. These reserved aliases require a key when used as resource names.\n\nReview the resolved stream and configuration in its thread. The review prompt shows the persisted approval deadline; reply with exact `yes` or `no` before that deadline.", "Safe create options\n```\nCommon\n  target= provider= version= resource-group= worker-count=\n  auth | auth=true | auth=false (public delivery only)\n\nVPC Gen 2\n  zone= flavor= vpc-id= subnet-id= public-gateway-id=\n\nClassic\n  datacenter= machine-type= public-vlan-id= private-vlan-id=\n\nSatellite\n  satellite-zone= satellite-managed-from= satellite-location-id=\n  satellite-host-image= satellite-host-profile= satellite-ssh-key-id=\n  satellite-worker-instance-id= satellite-worker-operating-system=\n```"}
 }
 func safeHelpCell(value string) string {
 	value = strings.Map(func(character rune) rune {

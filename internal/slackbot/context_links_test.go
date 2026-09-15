@@ -36,7 +36,7 @@ func (p *permalinkRecorder) Permalink(_ context.Context, channel, timestamp stri
 func existingAllocation(owner string) *servitorv1alpha1.ServitorCluster {
 	expires := metav1.NewTime(time.Date(2026, 9, 8, 4, 0, 0, 0, time.UTC))
 	return &servitorv1alpha1.ServitorCluster{
-		ObjectMeta: metav1.ObjectMeta{Name: ownerClusterName("U1"), Namespace: "servitor"},
+		ObjectMeta: metav1.ObjectMeta{Name: allocationClusterName("C1", "1710000000.000100"), Namespace: "servitor"},
 		Spec:       servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: owner, ChannelID: "C1", ThreadTimestamp: "1710000000.000100"}},
 		Status:     servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseReady, LeaseExpiresAt: &expires},
 	}
@@ -48,7 +48,7 @@ func TestExistingAllocationLinksOnlyOwnerLifecycleThread(t *testing.T) {
 	links := &permalinkRecorder{value: "https://slack.example.invalid/archives/C1/p1710000000000100"}
 	bot.Permalinks = links
 
-	if err := bot.Handle(context.Background(), Envelope{ID: "existing", Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "<@BOT> create", Timestamp: "1710000010.000100"}}); err != nil {
+	if err := bot.Handle(context.Background(), Envelope{ID: "existing", Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "<@BOT> create", Timestamp: "1710000000.000100"}}); err != nil {
 		t.Fatal(err)
 	}
 	if len(responses.responses) != 1 {
@@ -78,7 +78,7 @@ func TestExistingAllocationUsesSharedLeasePresentation(t *testing.T) {
 			cluster := existingAllocation("U1")
 			cluster.Status.LeaseExpiresAt = test.expiry
 			bot, responses := botForTest(t, cluster)
-			if err := bot.Handle(context.Background(), Envelope{ID: "existing-" + test.name, Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "<@BOT> create", Timestamp: "1710000010.000100"}}); err != nil {
+			if err := bot.Handle(context.Background(), Envelope{ID: "existing-" + test.name, Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "<@BOT> create", Timestamp: "1710000000.000100"}}); err != nil {
 				t.Fatal(err)
 			}
 			if len(responses.responses) != 1 || !strings.Contains(responses.responses[0].Text, test.want) {
@@ -101,7 +101,7 @@ func TestExistingAllocationNavigationFallsBackWithoutCrossOwnerLink(t *testing.T
 		t.Run(test.name, func(t *testing.T) {
 			bot, responses := botForTest(t, existingAllocation(test.owner))
 			bot.Permalinks = test.links
-			if err := bot.Handle(context.Background(), Envelope{ID: test.name, Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "<@BOT> create", Timestamp: "1710000010.000100"}}); err != nil {
+			if err := bot.Handle(context.Background(), Envelope{ID: test.name, Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "<@BOT> create", Timestamp: "1710000000.000100"}}); err != nil {
 				t.Fatal(err)
 			}
 			if len(responses.responses) != 1 {
@@ -173,13 +173,13 @@ func TestExistingAllocationNavigationUsesSlackTransportAndFallsBack(t *testing.T
 			bot, _ := botForTest(t, cluster)
 			bot.Responder = transport
 			bot.Permalinks = transport
-			if err := bot.Handle(context.Background(), Envelope{ID: "existing-" + test.name, Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "<@BOT> create", Timestamp: "1710000010.000100"}}); err != nil {
+			if err := bot.Handle(context.Background(), Envelope{ID: "existing-" + test.name, Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "<@BOT> create", Timestamp: "1710000000.000100"}}); err != nil {
 				t.Fatal(err)
 			}
 			if permalinkQuery.Get("channel") != "C1" || permalinkQuery.Get("message_ts") != "1710000000.000100" || permalinkAuthorization != "Bearer synthetic-token" {
 				t.Fatalf("permalink request = query=%v authorization=%q", permalinkQuery, permalinkAuthorization)
 			}
-			if posted.Get("channel") != "C1" || posted.Get("thread_ts") != "1710000010.000100" || posted.Get("mrkdwn") == "false" {
+			if posted.Get("channel") != "C1" || posted.Get("thread_ts") != "1710000000.000100" || posted.Get("mrkdwn") == "false" {
 				t.Fatalf("posted Slack mrkdwn = %v", posted)
 			}
 			if test.wantLinked {

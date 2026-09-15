@@ -23,7 +23,7 @@ func TestMaintainerInventoryRefreshIsDMOnlyAndDoesNotAllocate(t *testing.T) {
 	if err := withoutMaintainers.Handle(context.Background(), Envelope{ID: "disabled", Message: Message{Channel: "D0", ChannelType: "im", User: "U-maintainer", Text: "refresh inventory", Timestamp: "0"}}); err != nil {
 		t.Fatal(err)
 	}
-	if got := noMaintainerResponses.responses[0].Text; got != helpOverview(false)[0] {
+	if got := noMaintainerResponses.responses[0].Text; got != helpOverview(false, 3)[0] {
 		t.Fatalf("disabled response = %q", got)
 	}
 
@@ -37,7 +37,7 @@ func TestMaintainerInventoryRefreshIsDMOnlyAndDoesNotAllocate(t *testing.T) {
 	}
 
 	request("no-maintainers", Message{Channel: "D1", ChannelType: "im", User: "U-other", Text: "refresh inventory", Timestamp: "1"})
-	if got := responses.responses[len(responses.responses)-1].Text; got != helpOverview(false)[0] {
+	if got := responses.responses[len(responses.responses)-1].Text; got != helpOverview(false, 3)[0] {
 		t.Fatalf("unauthorized response = %q", got)
 	}
 	request("channel", Message{Channel: "C1", ChannelType: "channel", User: "U-maintainer", Text: "<@BOT> refresh inventory", Timestamp: "2"})

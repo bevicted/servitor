@@ -5,6 +5,8 @@
 namespace: servitor
 slack:
   channel_id: C_REPLACE_ME
+  # Up to this many active per-thread allocations per user. Zero uses default 3; restart after changing it.
+  max_allocations_per_user: 3
   # Optional exact Slack user IDs allowed to run `refresh inventory` in a DM.
   maintainer_ids: []
 defaults:
