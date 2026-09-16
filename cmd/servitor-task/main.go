@@ -271,6 +271,9 @@ func run(ctx context.Context, uid, operation, kind, optionsFile, backendFile, re
 }
 
 func runPlan(ctx context.Context, uid, operation string, options servitorv1alpha1.ResolvedOptions, backendFile, resultFile, reportFile, ictPath, terraformPath, planningInventoryConfig, apiKey string) error {
+	if options.Provider == "satellite" {
+		return writeReport(reportFile, pipeline.Report{Version: 1, ClusterUID: uid, OperationID: operation, PlanRejection: &servitorv1alpha1.PlanRejection{ReasonCode: "provider_not_supported", OptionKey: "provider"}})
+	}
 	options, rejection, err := validatePlanOptions(ctx, planningInventoryConfig, apiKey, options)
 	if err != nil {
 		return err
@@ -456,6 +459,9 @@ func selectedSatelliteRegion(zones []string) string {
 }
 
 func runApply(ctx context.Context, uid, operation string, options servitorv1alpha1.ResolvedOptions, backendFile, recoveryFile, resultFile, reportFile, ictPath, terraformPath string, publicAuthEligible bool, authManifestFile, authOutputDir string) error {
+	if options.Provider == "satellite" {
+		return errors.New("Satellite provisioning is not supported")
+	}
 	recovery, contextFile, err := frozenContext(operation, backendFile, recoveryFile, resultFile)
 	if err != nil {
 		return err

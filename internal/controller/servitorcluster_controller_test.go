@@ -143,6 +143,34 @@ func TestSnapshotOmitsVPCDefaultForClassic(t *testing.T) {
 	}
 }
 
+func TestReconcileRejectsNewSatelliteBeforeOperationDispatch(t *testing.T) {
+	scheme := cleanupScheme(t)
+	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "satellite", Namespace: "ns", UID: "satellite-uid"}, Spec: servitorv1alpha1.ServitorClusterSpec{
+		Slack:       servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "1.2"},
+		UserOptions: servitorv1alpha1.UserOptions{Provider: "satellite", Version: "4.22"},
+		Lifecycle:   servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 3600, RetrySeconds: []int64{60}, AutoApprove: true, AuthRequestTimestamp: "1.2"},
+	}}
+	client := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&servitorv1alpha1.ServitorCluster{}).WithObjects(cluster).Build()
+	reconciler := &Reconciler{Client: client, Config: Config{Namespace: "ns", Defaults: servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Provider: "vpc-gen2", Version: "4.22"}}}}
+	request := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "ns", Name: "satellite"}}
+	for range 2 {
+		if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stored := &servitorv1alpha1.ServitorCluster{}
+	if err := client.Get(context.Background(), request.NamespacedName, stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status.Phase != servitorv1alpha1.PhaseUnresolved || stored.Status.Diagnostic != "InvalidResolvedOptions" || stored.Status.Operation != nil || stored.Status.ResolvedOptions != nil {
+		t.Fatalf("Satellite admission state = %+v", stored.Status)
+	}
+	var runs tektonv1.PipelineRunList
+	if err := client.List(context.Background(), &runs); err != nil || len(runs.Items) != 0 {
+		t.Fatalf("Satellite admission dispatched runs=%+v, err=%v", runs.Items, err)
+	}
+}
+
 func TestSnapshotDerivesPlatformAndWorkerDefaultsFromVersion(t *testing.T) {
 	for _, test := range []struct {
 		version, platform, flavor string

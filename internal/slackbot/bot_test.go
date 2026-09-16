@@ -236,7 +236,6 @@ func TestCreateAuthOptInQueuesOnlyEligiblePublicRequests(t *testing.T) {
 		{name: "public disabled", text: "auth=false", target: "public", provider: "vpc-gen2", public: true},
 		{name: "public ordinary", text: "version=4.22", target: "public", provider: "vpc-gen2", public: true},
 		{name: "private", text: "auth", target: "private", provider: "vpc-gen2", unsupported: true},
-		{name: "satellite", text: "auth=true", target: "public", provider: "satellite", public: true, unsupported: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			bot, responses := botForTest(t)
@@ -265,7 +264,7 @@ func TestCreateAuthOptInQueuesOnlyEligiblePublicRequests(t *testing.T) {
 			}
 			if test.unsupported {
 				if len(responses.responses) != 2 || responses.responses[1].Text != "VPN-backed authentication is not implemented yet" {
-					t.Fatalf("private or Satellite auth response = %+v", responses.responses)
+					t.Fatalf("private auth response = %+v", responses.responses)
 				}
 			} else if len(responses.responses) != 1 {
 				t.Fatalf("unexpected auth create response = %+v", responses.responses)
@@ -284,6 +283,41 @@ func TestCreateAuthOptInQueuesOnlyEligiblePublicRequests(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCreateRejectsSatelliteBeforePlanning(t *testing.T) {
+	assertRejected := func(t *testing.T, bot Bot, responses *memoryResponder, text string) {
+		t.Helper()
+		event := Envelope{ID: "satellite", Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "<@BOT> create " + text, Timestamp: "1710000000.000100"}}
+		if err := bot.Handle(context.Background(), event); err != nil {
+			t.Fatal(err)
+		}
+		if len(responses.responses) != 1 || !containsText(responses.responses[0].Text, "Satellite provisioning is not supported") || containsText(responses.responses[0].Text, "Planning") {
+			t.Fatalf("responses=%+v", responses.responses)
+		}
+		cluster := &servitorv1alpha1.ServitorCluster{}
+		if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: bot.Namespace, Name: allocationClusterName("C1", event.Message.Timestamp)}, cluster); !apierrors.IsNotFound(err) {
+			t.Fatalf("Satellite create persisted an allocation: %v", err)
+		}
+	}
+
+	explicit, responses := botForTest(t)
+	assertRejected(t, explicit, responses, "provider=satellite auth approve")
+
+	defaulted, responses := botForTest(t)
+	defaulted.Defaults.Provider = "satellite"
+	assertRejected(t, defaulted, responses, "auth=true approve=true")
+
+	matched, responses := botWithPublishedInventory(t, false)
+	configMap := &corev1.ConfigMap{}
+	if err := matched.Client.Get(context.Background(), types.NamespacedName{Namespace: matched.Namespace, Name: matched.InventoryConfigMap}, configMap); err != nil {
+		t.Fatal(err)
+	}
+	configMap.Data[matched.InventoryConfigKey] = strings.Replace(configMap.Data[matched.InventoryConfigKey], "providers: [vpc-gen2]", "providers: [vpc-gen2, satellite]", 1) + "      satellite: https://satellite.example.invalid\n      satellite_config: https://satellite-config.example.invalid\n"
+	if err := matched.Client.Update(context.Background(), configMap); err != nil {
+		t.Fatal(err)
+	}
+	assertRejected(t, matched, responses, "satellite auth approve")
 }
 
 func TestCreateAutoApprovePersistsImmutableIntentAndEarlyYesDoesNotMutate(t *testing.T) {
@@ -1119,12 +1153,12 @@ func TestCreateRejectsPlatformAndHelpDoesNotAdvertiseIt(t *testing.T) {
 
 func TestCreateHelpDistinguishesDefaultsAliasesStreamsAndProvider(t *testing.T) {
 	help := strings.Join(createHelp(command.CreateDefaults{}, 3), "\n")
-	for _, wanted := range []string{"Configured defaults", "provider=", "key=value", "target=synthetic-target", "resource-group=\"Platform Team\"", "auth=true", "auth=false", "Public `auth`", "Private-only and Satellite", "roks", "iks", "k8s", "default_openshift", "default_kubernetes", "4.17", "prestage", "pretest", "test`/`stage", "dev target"} {
+	for _, wanted := range []string{"Configured defaults", "provider=", "key=value", "target=synthetic-target", "resource-group=\"Platform Team\"", "auth=true", "auth=false", "Public `auth`", "Satellite provisioning is not supported", "roks", "iks", "k8s", "default_openshift", "default_kubernetes", "4.17", "prestage", "pretest", "test`/`stage", "dev target"} {
 		if !containsText(help, wanted) {
 			t.Fatalf("create help missing %q: %s", wanted, help)
 		}
 	}
-	for _, forbidden := range []string{"--key=value", "--key value", "--provider", "config="} {
+	for _, forbidden := range []string{"--key=value", "--key value", "--provider", "config=", "satellite-zone=", "Satellite\n  "} {
 		if containsText(help, forbidden) {
 			t.Fatalf("create help advertises unsupported form %q: %s", forbidden, help)
 		}

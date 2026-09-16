@@ -402,6 +402,35 @@ targets:
 	}
 }
 
+func TestSatellitePlanAndApplyRejectBeforeICTExecution(t *testing.T) {
+	directory := t.TempDir()
+	ictTrace := filepath.Join(directory, "ict.trace")
+	ict := filepath.Join(directory, "ict")
+	if err := os.WriteFile(ict, []byte("#!/bin/sh\nprintf invoked > \"$ICT_TRACE_FILE\"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("ICT_TRACE_FILE", ictTrace)
+	options := servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Provider: "satellite", Version: "4.22"}}
+	reportFile := filepath.Join(directory, "plan-report.json")
+	if err := runPlan(context.Background(), "uid", "satellite-plan", options, filepath.Join(directory, "backend.json"), filepath.Join(directory, "result.json"), reportFile, ict, filepath.Join(directory, "terraform"), "", ""); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(reportFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	report, err := pipeline.DecodeReport(data, "uid", "satellite-plan")
+	if err != nil || report.PlanRejection == nil || report.PlanRejection.ReasonCode != "provider_not_supported" || report.PlanRejection.OptionKey != "provider" {
+		t.Fatalf("Satellite plan report=%+v, err=%v", report, err)
+	}
+	if err := runApply(context.Background(), "uid", "satellite-apply", options, filepath.Join(directory, "backend.json"), filepath.Join(directory, "recovery.json"), filepath.Join(directory, "result.json"), filepath.Join(directory, "apply-report.json"), ict, filepath.Join(directory, "terraform"), true, "", ""); err == nil || !strings.Contains(err.Error(), "Satellite provisioning is not supported") {
+		t.Fatalf("Satellite apply error=%v", err)
+	}
+	if _, err := os.Stat(ictTrace); !os.IsNotExist(err) {
+		t.Fatalf("Satellite task invoked ICT: %v", err)
+	}
+}
+
 func TestSupportedPlanVersionRequiresOneApplicableCloudDefault(t *testing.T) {
 	versions := []inventory.Version{
 		{Name: "4.16_openshift", Platform: "openshift", Default: false, Supported: true},
@@ -615,7 +644,7 @@ func TestEmitValidatedInventoryReportRejectsUnknownFields(t *testing.T) {
 	}
 }
 
-func TestRunDestroyUsesFrozenContextAndProducesValidatedReport(t *testing.T) {
+func TestRunDestroyUsesStoredSatelliteRecoveryAndProducesValidatedReport(t *testing.T) {
 	directory := t.TempDir()
 	backendFile := filepath.Join(directory, "backend.json")
 	recoveryFile := filepath.Join(directory, "recovery.json")
@@ -627,20 +656,29 @@ func TestRunDestroyUsesFrozenContextAndProducesValidatedReport(t *testing.T) {
 	recovery := servitorv1alpha1.RecoveryMetadata{
 		Version: 1, Target: "target", TFVarsSHA256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
 		Endpoints: map[string]string{
-			"IAM": "https://iam.example.invalid", "ContainerService": "https://containers.example.invalid", "GlobalTagging": "https://tagging.example.invalid", "ResourceManagement": "https://management.example.invalid", "ResourceController": "https://controller.example.invalid", "VPC": "https://vpc.example.invalid",
+			"IAM": "https://iam.example.invalid", "ContainerService": "https://containers.example.invalid", "GlobalTagging": "https://tagging.example.invalid", "ResourceManagement": "https://management.example.invalid", "ResourceController": "https://controller.example.invalid", "VPC": "https://vpc.example.invalid", "Satellite": "https://satellite.example.invalid", "SatelliteConfig": "https://satellite-config.example.invalid",
 		},
-		Values: servitorv1alpha1.RecoveryValues{ClusterName: "cluster", ResourceGroupName: "Default", Region: "us-south", ClusterMode: "vpc", Platform: "openshift", KubeVersion: "4.22_openshift", WorkerCount: 2, Zone: "us-south-1", Flavor: "bx2.4x16"},
+		Values: servitorv1alpha1.RecoveryValues{ClusterName: "cluster", ResourceGroupName: "Default", Region: "us-south", ClusterMode: "satellite", Platform: "openshift", KubeVersion: "4.22_openshift", WorkerCount: 3, VPCID: "vpc", SubnetIDs: []string{"subnet-a", "subnet-b", "subnet-c"}, PublicGatewayIDs: []string{"gateway-a", "gateway-b", "gateway-c"}, SatelliteZones: []string{"us-south-1", "us-south-2", "us-south-3"}, SatelliteManagedFrom: "us-south", SatelliteLocationID: "location", SatelliteHostImage: "image", SatelliteHostProfile: "bx2-4x16", SatelliteSSHKeyID: "key", SatelliteWorkerInstanceIDs: []string{"worker-a", "worker-b", "worker-c"}, SatelliteWorkerOperatingSystem: "RHCOS"},
 	}
 	if err := writeJSON(recoveryFile, recovery); err != nil {
 		t.Fatal(err)
 	}
+	ictTrace := filepath.Join(directory, "ict.trace")
+	t.Setenv("ICT_TRACE_FILE", ictTrace)
 	ict := filepath.Join(directory, "ict")
-	if err := os.WriteFile(ict, []byte("#!/bin/sh\n[ \"$1\" = destroy ] && [ \"$2\" = destroy-a ] || exit 2\n[ -f \"$4\" ] || exit 3\nprintf '%s' '{\"version\":1,\"operation\":\"destroy\"}' > \"$8\"\n"), 0o700); err != nil {
+	if err := os.WriteFile(ict, []byte("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$ICT_TRACE_FILE\"\n[ \"$1\" = destroy ] && [ \"$2\" = destroy-a ] || exit 2\n[ -f \"$4\" ] || exit 3\nprintf '%s' '{\"version\":1,\"operation\":\"destroy\"}' > \"$8\"\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	options := servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Provider: "vpc-gen2", Version: "4.22"}, ClusterName: "frozen"}
+	if err := recovery.Validate(); err != nil {
+		t.Fatalf("Satellite recovery fixture is invalid: %v", err)
+	}
+	options := servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Provider: "satellite", Version: "4.22"}, ClusterName: "frozen"}
 	if err := runDestroy(context.Background(), "uid", "destroy-a", options, backendFile, recoveryFile, resultFile, reportFile, ict); err != nil {
 		t.Fatal(err)
+	}
+	trace, err := os.ReadFile(ictTrace)
+	if err != nil || !strings.HasPrefix(string(trace), "destroy\ndestroy-a\n") {
+		t.Fatalf("Satellite destroy invocation=%q, err=%v", trace, err)
 	}
 	data, err := os.ReadFile(reportFile)
 	if err != nil {

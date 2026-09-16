@@ -622,6 +622,9 @@ func (r *Reconciler) snapshot(cluster *servitorv1alpha1.ServitorCluster) error {
 	resolved.Platform = ""
 	resolved.Flavor = ""
 	overlay(&resolved.UserOptions, cluster.Spec.UserOptions)
+	if resolved.Provider == "satellite" {
+		return errors.New("Satellite provisioning is not supported")
+	}
 	platform, err := command.InferPlatform(resolved.Version)
 	if err != nil {
 		return fmt.Errorf("infer platform: %w", err)
