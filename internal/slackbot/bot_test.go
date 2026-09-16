@@ -1298,6 +1298,21 @@ func TestCreateMatchesPublishedInventoryBareValues(t *testing.T) {
 	}
 }
 
+func TestCreateUnknownShorthandNamesValue(t *testing.T) {
+	bot, responses := botWithPublishedInventory(t, false)
+	event := Envelope{ID: "unknown-bare", Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "<@BOT> create stage 4.20", Timestamp: "123"}}
+	if err := bot.Handle(context.Background(), event); err != nil {
+		t.Fatal(err)
+	}
+	if len(responses.responses) != 1 || !containsText(responses.responses[0].Text, `unknown shorthand value "stage"`) {
+		t.Fatalf("response=%+v", responses.responses)
+	}
+	cluster := &servitorv1alpha1.ServitorCluster{}
+	if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: allocationClusterName("C1", "123")}, cluster); !apierrors.IsNotFound(err) {
+		t.Fatalf("create request persisted after rejection: %v", err)
+	}
+}
+
 func TestCreateBareValuesRequireCurrentInventoryButKeysProceed(t *testing.T) {
 	for _, expired := range []bool{false, true} {
 		t.Run(fmt.Sprintf("snapshot expired=%t", expired), func(t *testing.T) {

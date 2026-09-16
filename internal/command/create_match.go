@@ -101,7 +101,7 @@ func MatchBareCreateOptions(options ExplicitCreateOptions, defaults CreateDefaul
 	for _, value := range options.bare {
 		roles := matchingRoles(catalog, provider, zone, datacenter, satelliteRegion, value)
 		if len(roles) == 0 {
-			return ExplicitCreateOptions{}, fmt.Errorf("unknown shorthand value; use an explicit key such as resource-group=value")
+			return ExplicitCreateOptions{}, fmt.Errorf("unknown shorthand value %q; use an explicit key such as resource-group=value", value)
 		}
 		if len(roles) != 1 {
 			return ExplicitCreateOptions{}, fmt.Errorf("ambiguous shorthand value; use an explicit key such as resource-group=value")

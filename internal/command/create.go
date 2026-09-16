@@ -188,7 +188,7 @@ func ParseCreate(text string, defaults CreateDefaults) (CreateRequest, error) {
 // ResolveCreateOptions overlays startup defaults once onto explicit options.
 func ResolveCreateOptions(options ExplicitCreateOptions, defaults CreateDefaults) (CreateRequest, error) {
 	if len(options.bare) != 0 {
-		return CreateRequest{}, fmt.Errorf("unknown shorthand value; use an explicit key such as resource-group=value")
+		return CreateRequest{}, fmt.Errorf("unknown shorthand value %q; use an explicit key such as resource-group=value", options.bare[0])
 	}
 	values := make(map[string][]string, len(options.values))
 	for flag, supplied := range options.values {

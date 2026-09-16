@@ -54,7 +54,7 @@ func TestAuthIsConsumedBeforeInventoryMatching(t *testing.T) {
 func TestBareValuesRequireOneExactRoleAndCurrentInventory(t *testing.T) {
 	targets := map[string]inventory.TargetConfig{"target-a": {Providers: []string{"vpc-gen2", "classic", "satellite"}}}
 	for _, test := range []struct{ text, want string }{
-		{"create group", "unknown shorthand"},
+		{"create stage 4.20", `unknown shorthand value "stage"`},
 		{"create shared", "ambiguous shorthand"},
 		{"create target-a target-a", "target may only be supplied once"},
 		{"create provider=classic vpc-gen2", "provider may only be supplied once"},
