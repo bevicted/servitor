@@ -55,6 +55,34 @@ func TestOwnerThreadAuthQueuesLatestEligibleRequestWithoutReplay(t *testing.T) {
 	}
 }
 
+func TestAuthRejectsCleanupStatesWithoutIntent(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		phase    string
+		response string
+	}{
+		{name: "cleanup pending", phase: servitorv1alpha1.PhaseCleanupPending, response: "Cleanup is in progress. Authentication delivery is unavailable."},
+		{name: "cleanup complete", phase: servitorv1alpha1.PhaseCleanupComplete, response: "Cleanup is complete. Use @servitor create to start a new allocation."},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cluster := authCommandCluster(true)
+			cluster.Status.Phase = test.phase
+			bot, responses := botForTest(t, cluster)
+			message := Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "auth", Timestamp: "1710000000.000100", ThreadTimestamp: "root"}
+			if err := bot.Handle(context.Background(), Envelope{ID: test.name, Message: message}); err != nil {
+				t.Fatal(err)
+			}
+			stored := &servitorv1alpha1.ServitorCluster{}
+			if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: cluster.Name}, stored); err != nil {
+				t.Fatal(err)
+			}
+			if stored.Spec.Lifecycle.AuthRequestTimestamp != "" || len(responses.responses) != 1 || responses.responses[0].Text != test.response {
+				t.Fatalf("cleanup auth recorded state=%#v responses=%+v", stored.Spec.Lifecycle, responses.responses)
+			}
+		})
+	}
+}
+
 func TestPrivateOrSatelliteThreadAuthIsUnsupportedWithoutIntent(t *testing.T) {
 	for _, test := range []struct {
 		name    string

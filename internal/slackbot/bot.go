@@ -542,6 +542,10 @@ func (b Bot) auth(ctx context.Context, message Message, thread string, respond f
 	if err != nil || !ownsThread(cluster, message, thread, true) {
 		return
 	}
+	if text := authUnavailableText(cluster); text != "" {
+		respond(text)
+		return
+	}
 	if !b.publicAuthEligible(cluster) {
 		respond("VPN-backed authentication is not implemented yet")
 		return
@@ -553,6 +557,10 @@ func (b Bot) auth(ctx context.Context, message Message, thread string, respond f
 	stateText := ""
 	updated, err := b.updateIntent(ctx, cluster.Name, func(current *servitorv1alpha1.ServitorCluster) (bool, error) {
 		if !ownsThread(current, message, thread, true) {
+			return false, nil
+		}
+		if text := authUnavailableText(current); text != "" {
+			stateText = text
 			return false, nil
 		}
 		if !b.publicAuthEligible(current) {
@@ -579,6 +587,17 @@ func (b Bot) auth(ctx context.Context, message Message, thread string, respond f
 		respond("Authentication delivery has been queued for your DM.")
 	} else if stateText != "" {
 		respond(stateText)
+	}
+}
+
+func authUnavailableText(cluster *servitorv1alpha1.ServitorCluster) string {
+	switch {
+	case cluster.Status.Phase == servitorv1alpha1.PhaseCleanupComplete:
+		return "Cleanup is complete. Use @servitor create to start a new allocation."
+	case cluster.Spec.Lifecycle.CleanupRequested || cluster.Status.CleanupRequested || cluster.Status.Cleanup != nil || cluster.Status.Phase == servitorv1alpha1.PhaseCleanupPending:
+		return "Cleanup is in progress. Authentication delivery is unavailable."
+	default:
+		return ""
 	}
 }
 
