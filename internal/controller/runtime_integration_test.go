@@ -45,6 +45,8 @@ const runtimeContractNamespace = "servitor-runtime-contract"
 type runtimeContractResponder struct {
 	mu                   sync.Mutex
 	thread               string
+	manualThread         string
+	manualReplies        int
 	failingThread        string
 	failingThreadReplies int
 	responses            []slackbot.Response
@@ -63,6 +65,9 @@ func (r *runtimeContractResponder) Reply(_ context.Context, response slackbot.Re
 	if r.thread == "" || r.thread == response.ThreadTimestamp {
 		r.responses = append(r.responses, response)
 	}
+	if r.manualThread == response.ThreadTimestamp {
+		r.manualReplies++
+	}
 	return nil
 }
 
@@ -70,6 +75,12 @@ func (r *runtimeContractResponder) count() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return len(r.responses)
+}
+
+func (r *runtimeContractResponder) manualCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.manualReplies
 }
 
 func (r *runtimeContractResponder) failureCount() int {
@@ -135,7 +146,8 @@ func TestRuntimeContract(t *testing.T) {
 	installControllerRBAC(t, ctx, admin)
 	verifyAutoApproveTransitionContract(t, ctx, admin)
 	autoKey, autoResponses := seedAutoApproveContract(t, ctx, admin)
-	timeoutKey := seedAutoApproveContractWithResponder(t, ctx, admin, "timeout", "1710000000.000101", autoResponses, 3*time.Second)
+	manualKey := seedManualApproveFalseContract(t, ctx, admin, autoResponses)
+	timeoutKey := seedApprovalContractWithResponder(t, ctx, admin, "timeout", "1710000000.000101", "approve", true, autoResponses, 3*time.Second)
 
 	publicationKey := seedPublicationContract(t, ctx, admin)
 	deliveryKey := seedDeliveryContract(t, ctx, admin)
@@ -221,6 +233,24 @@ func TestRuntimeContract(t *testing.T) {
 			return err
 		}
 		if len(runs.Items) != 1 {
+			return fmt.Errorf("apply PipelineRuns=%d", len(runs.Items))
+		}
+		return nil
+	})
+
+	eventually(t, managerDone, "approve=false remains manual", func() error {
+		cluster := &servitorv1alpha1.ServitorCluster{}
+		if err := admin.Get(ctx, manualKey, cluster); err != nil {
+			return err
+		}
+		if autoResponses.manualCount() != 3 || cluster.Spec.Lifecycle.AutoApprove || cluster.Spec.Lifecycle.Approval != "" || cluster.Status.Phase != servitorv1alpha1.PhaseAwaitingApproval {
+			return fmt.Errorf("manual replies=%d autoApprove=%t approval=%q phase=%q", autoResponses.manualCount(), cluster.Spec.Lifecycle.AutoApprove, cluster.Spec.Lifecycle.Approval, cluster.Status.Phase)
+		}
+		var runs tektonv1.PipelineRunList
+		if err := admin.List(ctx, &runs, client.InNamespace(runtimeContractNamespace), client.MatchingLabels{pipeline.ClusterUIDLabel: string(cluster.UID), pipeline.OperationLabel: applyID(string(cluster.UID))}); err != nil {
+			return err
+		}
+		if len(runs.Items) != 0 {
 			return fmt.Errorf("apply PipelineRuns=%d", len(runs.Items))
 		}
 		return nil
@@ -340,18 +370,23 @@ func verifyAutoApproveTransitionContract(t *testing.T, ctx context.Context, kube
 
 func seedAutoApproveContract(t *testing.T, ctx context.Context, kube client.Client) (types.NamespacedName, *runtimeContractResponder) {
 	t.Helper()
-	responses := &runtimeContractResponder{thread: "1710000000.000100", failingThread: "1710000000.000101"}
-	return seedAutoApproveContractWithResponder(t, ctx, kube, "auto", "1710000000.000100", responses, time.Minute), responses
+	responses := &runtimeContractResponder{thread: "1710000000.000100", manualThread: "1710000000.000102", failingThread: "1710000000.000101"}
+	return seedApprovalContractWithResponder(t, ctx, kube, "auto", "1710000000.000100", "approve", true, responses, time.Minute), responses
 }
 
-func seedAutoApproveContractWithResponder(t *testing.T, ctx context.Context, kube client.Client, name, thread string, responder slackbot.Responder, reviewTimeout time.Duration) types.NamespacedName {
+func seedManualApproveFalseContract(t *testing.T, ctx context.Context, kube client.Client, responder slackbot.Responder) types.NamespacedName {
+	t.Helper()
+	return seedApprovalContractWithResponder(t, ctx, kube, "manual", "1710000000.000102", "approve=false", false, responder, time.Minute)
+}
+
+func seedApprovalContractWithResponder(t *testing.T, ctx context.Context, kube client.Client, name, thread, approvalOption string, wantAutoApprove bool, responder slackbot.Responder, reviewTimeout time.Duration) types.NamespacedName {
 	t.Helper()
 	bot := slackbot.Bot{
 		ChannelID: "CCHANNEL", SelfUserID: "BOT", Namespace: runtimeContractNamespace, Client: kube,
 		Events: state.NewEventStore(kube, runtimeContractNamespace), Responder: responder,
 		Defaults: command.CreateDefaults{Version: "4.22"}, Lease: time.Hour, RetryIntervals: []time.Duration{time.Minute},
 	}
-	message := slackbot.Message{Channel: "CCHANNEL", ChannelType: "channel", User: "UAUTO", Text: "<@BOT> create approve version=4.22", Timestamp: thread}
+	message := slackbot.Message{Channel: "CCHANNEL", ChannelType: "channel", User: "UAUTO", Text: fmt.Sprintf("<@BOT> create %s version=4.22", approvalOption), Timestamp: thread}
 	if err := bot.Handle(ctx, slackbot.Envelope{ID: "auto-create-" + name, Message: message}); err != nil {
 		t.Fatal(err)
 	}
@@ -364,8 +399,8 @@ func seedAutoApproveContractWithResponder(t *testing.T, ctx context.Context, kub
 		if cluster.Spec.Slack.ThreadTimestamp != message.Timestamp {
 			continue
 		}
-		if !cluster.Spec.Lifecycle.AutoApprove || cluster.Spec.Lifecycle.Approval != "" {
-			t.Fatalf("create auto approval state = lifecycle=%+v", cluster.Spec.Lifecycle)
+		if cluster.Spec.Lifecycle.AutoApprove != wantAutoApprove || cluster.Spec.Lifecycle.Approval != "" {
+			t.Fatalf("create approval state = lifecycle=%+v", cluster.Spec.Lifecycle)
 		}
 		key := client.ObjectKeyFromObject(cluster)
 		now := time.Now().UTC()
@@ -417,7 +452,7 @@ func seedAutoApproveContractWithResponder(t *testing.T, ctx context.Context, kub
 		}
 		return key
 	}
-	t.Fatal("bot did not create auto-approve allocation")
+	t.Fatal("bot did not create allocation")
 	return types.NamespacedName{}
 }
 

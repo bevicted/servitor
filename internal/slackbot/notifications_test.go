@@ -100,7 +100,7 @@ func TestStatusNotifierAutoApproveWaitsForEveryDeliveredReviewChunk(t *testing.T
 	kube := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(cluster).Build()
 	responses := &memoryResponder{}
 	notifier := &StatusNotifier{Client: kube, Namespace: "servitor", Responder: responses, Receipts: state.NewEventStore(kube, "servitor"), Clock: func() time.Time { return now }}
-	ids := reviewNoticeIDs(cluster)
+	ids := reviewNoticeIDsAt(cluster, now)
 	if len(ids) < 2 {
 		t.Fatalf("review ids = %v, want multipart summary", ids)
 	}
@@ -131,6 +131,66 @@ func TestStatusNotifierAutoApproveWaitsForEveryDeliveredReviewChunk(t *testing.T
 	}
 	if text := joinNotices(statusNoticesAt(cluster, now)); !strings.Contains(text, "approved automatically after all plan-summary messages are delivered") || strings.Contains(text, "Reply with exact `yes`") {
 		t.Fatalf("automatic review text = %q", text)
+	}
+}
+
+func TestStatusNotifierAutoApproveRequiresRenderedBoundaryChunk(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := servitorv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
+	deadline := metav1.NewTime(time.Date(2300, 9, 8, 0, 0, 0, 0, time.UTC))
+	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "boundary", Namespace: "servitor", UID: "boundary-uid"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{AutoApprove: true}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseAwaitingApproval, ResolvedOptions: &servitorv1alpha1.ResolvedOptions{}, Review: &servitorv1alpha1.ReviewSummary{}, ReviewDeadline: &deadline, ReviewGeneration: 1}}
+	boundaryFound := false
+	for rowCount := 1; rowCount < 50 && !boundaryFound; rowCount++ {
+		resources := make([]servitorv1alpha1.SummaryResource, rowCount, rowCount+1)
+		for index := range resources {
+			resources[index] = servitorv1alpha1.SummaryResource{Role: "resource", Actions: []string{strings.Repeat("x", 100)}}
+		}
+		for padding := 0; padding <= listSafeCellLimit; padding++ {
+			cluster.Status.Review.Resources = append(resources, servitorv1alpha1.SummaryResource{Role: "boundary", Actions: []string{strings.Repeat("x", padding)}})
+			if len(reviewNoticeIDsAt(cluster, now)) > len(reviewNoticeIDsAt(cluster, deadline.Time)) {
+				boundaryFound = true
+				break
+			}
+		}
+	}
+	if !boundaryFound {
+		t.Fatal("could not create a rendered review boundary")
+	}
+	deliveredIDs := reviewNoticeIDsAt(cluster, now)
+	if len(deliveredIDs) < 2 {
+		t.Fatalf("rendered review ids = %v, want multipart summary", deliveredIDs)
+	}
+	kube := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(cluster).Build()
+	responses := &memoryResponder{}
+	notifier := &StatusNotifier{Client: kube, Namespace: "servitor", Responder: responses, Receipts: state.NewEventStore(kube, "servitor"), Clock: func() time.Time { return now }}
+	lastID := deliveredIDs[len(deliveredIDs)-1]
+	if claimed, err := notifier.Receipts.Claim(context.Background(), lastID); err != nil || !claimed {
+		t.Fatalf("claim final rendered review chunk = (%t, %v)", claimed, err)
+	}
+	if err := notifier.notify(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	stored := &servitorv1alpha1.ServitorCluster{}
+	if err := kube.Get(context.Background(), client.ObjectKeyFromObject(cluster), stored); err != nil {
+		t.Fatal(err)
+	}
+	if len(responses.responses) != len(deliveredIDs)-1 || stored.Spec.Lifecycle.Approval != "" {
+		t.Fatalf("undelivered rendered chunk allowed approval: responses=%d ids=%d lifecycle=%+v", len(responses.responses), len(deliveredIDs), stored.Spec.Lifecycle)
+	}
+	if err := notifier.Receipts.Release(context.Background(), lastID); err != nil {
+		t.Fatal(err)
+	}
+	if err := notifier.notify(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := kube.Get(context.Background(), client.ObjectKeyFromObject(cluster), stored); err != nil || stored.Spec.Lifecycle.Approval != "approved" {
+		t.Fatalf("all rendered review chunks did not approve: lifecycle=%+v err=%v", stored.Spec.Lifecycle, err)
 	}
 }
 

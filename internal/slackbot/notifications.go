@@ -58,7 +58,8 @@ func (n *StatusNotifier) notify(ctx context.Context) error {
 	}
 	for i := range clusters.Items {
 		cluster := &clusters.Items[i]
-		for _, notice := range statusNoticesAt(cluster, n.now()) {
+		now := n.now()
+		for _, notice := range statusNoticesAt(cluster, now) {
 			if notice.reviewDeadline != nil && !n.now().Before(notice.reviewDeadline.Time) {
 				continue
 			}
@@ -92,7 +93,7 @@ func (n *StatusNotifier) notify(ctx context.Context) error {
 			}
 		}
 		if cluster.Spec.Lifecycle.AutoApprove {
-			if err := n.approveDeliveredReview(ctx, cluster); err != nil {
+			if err := n.approveDeliveredReview(ctx, cluster, now); err != nil {
 				return err
 			}
 		}
@@ -117,11 +118,11 @@ func (n *StatusNotifier) now() time.Time {
 
 // approveDeliveredReview records approval only after every persisted review
 // notice is known delivered. The controller remains responsible for apply.
-func (n *StatusNotifier) approveDeliveredReview(ctx context.Context, cluster *servitorv1alpha1.ServitorCluster) error {
-	if !cluster.Spec.Lifecycle.AutoApprove || cluster.Status.Phase != servitorv1alpha1.PhaseAwaitingApproval || cluster.Status.ResolvedOptions == nil || cluster.Status.Review == nil || cluster.Status.ReviewDeadline == nil || cluster.Status.ReviewGeneration == 0 || !n.now().Before(cluster.Status.ReviewDeadline.Time) {
+func (n *StatusNotifier) approveDeliveredReview(ctx context.Context, cluster *servitorv1alpha1.ServitorCluster, renderedAt time.Time) error {
+	if !cluster.Spec.Lifecycle.AutoApprove || cluster.Status.Phase != servitorv1alpha1.PhaseAwaitingApproval || cluster.Status.ResolvedOptions == nil || cluster.Status.Review == nil || cluster.Status.ReviewDeadline == nil || cluster.Status.ReviewGeneration == 0 || !renderedAt.Before(cluster.Status.ReviewDeadline.Time) {
 		return nil
 	}
-	ids := reviewNoticeIDs(cluster)
+	ids := reviewNoticeIDsAt(cluster, renderedAt)
 	if len(ids) == 0 {
 		return nil
 	}
@@ -149,11 +150,11 @@ func (n *StatusNotifier) approveDeliveredReview(ctx context.Context, cluster *se
 	})
 }
 
-func reviewNoticeIDs(cluster *servitorv1alpha1.ServitorCluster) []string {
+func reviewNoticeIDsAt(cluster *servitorv1alpha1.ServitorCluster, renderedAt time.Time) []string {
 	if cluster.Status.ReviewDeadline == nil {
 		return nil
 	}
-	texts := reviewNoticeTexts(cluster.Status.ResolvedOptions, cluster.Status.Review, cluster.Status.ReviewDeadline.Time, cluster.Status.ReviewDeadline.Time, cluster.Spec.Lifecycle.AutoApprove)
+	texts := reviewNoticeTexts(cluster.Status.ResolvedOptions, cluster.Status.Review, cluster.Status.ReviewDeadline.Time, renderedAt, cluster.Spec.Lifecycle.AutoApprove)
 	notices := phaseNotices(clusterNoticeUID(cluster), servitorv1alpha1.PhaseAwaitingApproval, texts)
 	ids := make([]string, len(notices))
 	for index := range notices {
