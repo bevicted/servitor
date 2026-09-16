@@ -76,6 +76,21 @@ func TestAuthIsConsumedBeforeInventoryMatching(t *testing.T) {
 	}
 }
 
+func TestApproveMetadataSurvivesShorthandMatching(t *testing.T) {
+	options, err := ParseCreateOptions("create approve target-a vpc-gen2 bx2.4x16 Platform\\ Team us-south-1 version=4.22")
+	if err != nil {
+		t.Fatal(err)
+	}
+	options, _, err = ResolveBareSelectors(options, matchDefaults, map[string]inventory.TargetConfig{"target-a": {Providers: []string{"vpc-gen2", "classic", "satellite"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	options, err = MatchBareCreateOptions(options, matchDefaults, matchCatalog)
+	if err != nil || !options.ApproveRequested() || len(options.BareValues()) != 0 {
+		t.Fatalf("matched options = %#v, approve=%t, err=%v", options, options.ApproveRequested(), err)
+	}
+}
+
 func TestBareValuesRequireOneExactRoleAndCurrentInventory(t *testing.T) {
 	targets := map[string]inventory.TargetConfig{"target-a": {Providers: []string{"vpc-gen2", "classic", "satellite"}}}
 	for _, test := range []struct{ text, want string }{

@@ -62,6 +62,7 @@ type UserOptions struct {
 type LifecyclePolicy struct {
 	InitialLeaseSeconds int64   `json:"initialLeaseSeconds"`
 	RetrySeconds        []int64 `json:"retrySeconds"`
+	AutoApprove         bool    `json:"autoApprove,omitempty"`
 	Approval            string  `json:"approval,omitempty"`
 	// RequestedExpiry is an absolute extension target. Its value is stable across
 	// Slack redelivery, controller restarts, and optimistic-concurrency retries.

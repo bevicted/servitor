@@ -128,6 +128,9 @@ spec:
                 lifecycle:
                   type: object
                   required: [initialLeaseSeconds, retrySeconds]
+                  x-kubernetes-validations:
+                    - rule: "(has(self.autoApprove) ? self.autoApprove : false) == (has(oldSelf.autoApprove) ? oldSelf.autoApprove : false)"
+                      message: autoApprove is immutable
                   properties:
                     initialLeaseSeconds:
                       type: integer
@@ -145,6 +148,7 @@ spec:
                       x-kubernetes-validations:
                         - rule: self == oldSelf
                           message: retrySeconds is immutable
+                    autoApprove: { type: boolean }
                     approval: { type: string, enum: ["", approved, rejected] }
                     requestedExpiry: { type: string, format: date-time }
                     extensionEventTimestamp:

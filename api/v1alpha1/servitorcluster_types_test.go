@@ -104,6 +104,36 @@ func TestServitorClusterDeepCopyDoesNotAliasSummaryActions(t *testing.T) {
 	}
 }
 
+func TestLifecycleAutoApproveRoundTripsAndCRDProtectsItsEffectiveValue(t *testing.T) {
+	cluster := ServitorCluster{Spec: ServitorClusterSpec{Lifecycle: LifecyclePolicy{AutoApprove: true}}}
+	data, err := json.Marshal(cluster)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded ServitorCluster
+	if err := json.Unmarshal(data, &decoded); err != nil || !decoded.Spec.Lifecycle.AutoApprove {
+		t.Fatalf("autoApprove round trip = %+v, %v", decoded.Spec.Lifecycle, err)
+	}
+	contents, err := os.ReadFile(filepath.Join("..", "..", "config", "crd", "bases", "servitor.bevicted.github.io_servitorclusters.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]any
+	if err := yaml.Unmarshal(contents, &document); err != nil {
+		t.Fatal(err)
+	}
+	versions := yamlList(t, yamlMap(t, document["spec"])["versions"])
+	lifecycle := yamlMap(t, yamlMap(t, yamlMap(t, yamlMap(t, versions[0])["schema"])["openAPIV3Schema"])["properties"])
+	lifecycle = yamlMap(t, yamlMap(t, yamlMap(t, lifecycle["spec"])["properties"])["lifecycle"])
+	if autoApprove := yamlMap(t, lifecycle["properties"])["autoApprove"]; yamlMap(t, autoApprove)["type"] != "boolean" {
+		t.Fatalf("autoApprove schema = %#v", autoApprove)
+	}
+	validations := yamlList(t, lifecycle["x-kubernetes-validations"])
+	if len(validations) != 1 || !strings.Contains(yamlMap(t, validations[0])["rule"].(string), "has(self.autoApprove)") {
+		t.Fatalf("autoApprove transition validation = %#v", validations)
+	}
+}
+
 func TestServitorClusterCRDDefinesBoundedPublicAuthAvailability(t *testing.T) {
 	contents, err := os.ReadFile(filepath.Join("..", "..", "config", "crd", "bases", "servitor.bevicted.github.io_servitorclusters.yaml"))
 	if err != nil {

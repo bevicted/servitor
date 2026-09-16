@@ -59,9 +59,10 @@ var numericVersion = regexp.MustCompile(`^[0-9]+\.[0-9]+(?:\.[0-9]+)?(?:_openshi
 
 // ExplicitCreateOptions contains only user-supplied, safe options. It never includes defaults.
 type ExplicitCreateOptions struct {
-	values        map[string][]string
-	bare          []string
-	authRequested bool
+	values           map[string][]string
+	bare             []string
+	authRequested    bool
+	approveRequested bool
 }
 
 // Values returns a copy of the explicitly supplied safe flag values.
@@ -80,6 +81,9 @@ func (o ExplicitCreateOptions) BareValues() []string {
 
 // AuthRequested reports whether create requested public auth delivery.
 func (o ExplicitCreateOptions) AuthRequested() bool { return o.authRequested }
+
+// ApproveRequested reports whether create requested automatic approval after review delivery.
+func (o ExplicitCreateOptions) ApproveRequested() bool { return o.approveRequested }
 
 // WorkerCount returns the explicit worker count, or zero when it was omitted.
 func (o ExplicitCreateOptions) WorkerCount() (int, error) {
@@ -106,15 +110,20 @@ func ParseCreateOptions(text string) (ExplicitCreateOptions, error) {
 	seen, values := map[string]bool{}, map[string][]string{}
 	var bare []string
 	authRequested := false
+	approveRequested := false
 	for _, word := range words[1:] {
 		key, value, assigned := strings.Cut(word, "=")
 		if !assigned {
-			if word == "auth" {
-				if seen["auth"] {
-					return ExplicitCreateOptions{}, fmt.Errorf("auth may only be supplied once")
+			if word == "auth" || word == "approve" {
+				if seen[word] {
+					return ExplicitCreateOptions{}, fmt.Errorf("%s may only be supplied once", word)
 				}
-				seen["auth"] = true
-				authRequested = true
+				seen[word] = true
+				if word == "auth" {
+					authRequested = true
+				} else {
+					approveRequested = true
+				}
 				continue
 			}
 			if strings.HasPrefix(word, "-") {
@@ -132,15 +141,19 @@ func ParseCreateOptions(text string) (ExplicitCreateOptions, error) {
 		if strings.HasPrefix(key, "-") {
 			return ExplicitCreateOptions{}, fmt.Errorf("create options must use key=value without leading dashes")
 		}
-		if key == "auth" {
-			if seen["auth"] {
-				return ExplicitCreateOptions{}, fmt.Errorf("auth may only be supplied once")
+		if key == "auth" || key == "approve" {
+			if seen[key] {
+				return ExplicitCreateOptions{}, fmt.Errorf("%s may only be supplied once", key)
 			}
 			if value != "true" && value != "false" {
-				return ExplicitCreateOptions{}, fmt.Errorf("auth must be true or false")
+				return ExplicitCreateOptions{}, fmt.Errorf("%s must be true or false", key)
 			}
-			seen["auth"] = true
-			authRequested = value == "true"
+			seen[key] = true
+			if key == "auth" {
+				authRequested = value == "true"
+			} else {
+				approveRequested = value == "true"
+			}
 			continue
 		}
 		flag := "--" + key
@@ -169,7 +182,7 @@ func ParseCreateOptions(text string) (ExplicitCreateOptions, error) {
 		seen[flag] = true
 		values[flag] = append(values[flag], value)
 	}
-	options := ExplicitCreateOptions{values: values, bare: bare, authRequested: authRequested}
+	options := ExplicitCreateOptions{values: values, bare: bare, authRequested: authRequested, approveRequested: approveRequested}
 	if _, err := options.WorkerCount(); err != nil {
 		return ExplicitCreateOptions{}, err
 	}

@@ -286,6 +286,43 @@ func TestCreateAuthOptInQueuesOnlyEligiblePublicRequests(t *testing.T) {
 	}
 }
 
+func TestCreateAutoApprovePersistsImmutableIntentAndEarlyYesDoesNotMutate(t *testing.T) {
+	bot, responses := botForTest(t)
+	event := Envelope{ID: "auto-create", Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "<@BOT> create approve version=4.22", Timestamp: "1710000000.000100"}}
+	if err := bot.Handle(context.Background(), event); err != nil {
+		t.Fatal(err)
+	}
+	key := types.NamespacedName{Namespace: "servitor", Name: allocationClusterName("C1", event.Message.Timestamp)}
+	stored := &servitorv1alpha1.ServitorCluster{}
+	if err := bot.Client.Get(context.Background(), key, stored); err != nil {
+		t.Fatal(err)
+	}
+	if !stored.Spec.Lifecycle.AutoApprove || stored.Spec.Lifecycle.Approval != "" {
+		t.Fatalf("create lifecycle = %+v", stored.Spec.Lifecycle)
+	}
+	deadline := metav1.NewTime(bot.now().Add(time.Hour))
+	stored.Status.Phase = servitorv1alpha1.PhaseAwaitingApproval
+	stored.Status.ReviewDeadline = &deadline
+	if err := bot.Client.Update(context.Background(), stored); err != nil {
+		t.Fatal(err)
+	}
+	if err := bot.Handle(context.Background(), Envelope{ID: "early-yes", Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "yes", Timestamp: "1710000001.000100", ThreadTimestamp: event.Message.Timestamp}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := bot.Client.Get(context.Background(), key, stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.Spec.Lifecycle.Approval != "" || !containsText(responses.responses[len(responses.responses)-1].Text, "approved automatically after the plan summary is delivered") {
+		t.Fatalf("early yes changed auto review: lifecycle=%+v responses=%+v", stored.Spec.Lifecycle, responses.responses)
+	}
+	if err := bot.Handle(context.Background(), Envelope{ID: "auto-repeat", Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "<@BOT> create approve=false version=4.22", Timestamp: event.Message.Timestamp}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := bot.Client.Get(context.Background(), key, stored); err != nil || !stored.Spec.Lifecycle.AutoApprove {
+		t.Fatalf("repeat create changed automatic mode: lifecycle=%+v err=%v", stored.Spec.Lifecycle, err)
+	}
+}
+
 func TestHandleCreateNormalizesAssignmentsWithoutDefaults(t *testing.T) {
 	want := servitorv1alpha1.UserOptions{
 		Target: "synthetic-target", Version: "4.22", ResourceGroup: "Platform Team=Core", WorkerCount: 3,

@@ -14,7 +14,9 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
 func TestStatusNotifierDeliversTransitionOnceAcrossRestart(t *testing.T) {
@@ -81,6 +83,90 @@ func TestReviewNoticesUsePersistedDeadlineAndSkipExpiredDelivery(t *testing.T) {
 	}
 	if len(responses.responses) != 0 {
 		t.Fatalf("delayed review delivery sent an expired prompt: %+v", responses.responses)
+	}
+}
+
+func TestStatusNotifierAutoApproveWaitsForEveryDeliveredReviewChunk(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := servitorv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
+	deadline := metav1.NewTime(now.Add(time.Hour))
+	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "auto", Namespace: "servitor", UID: "auto-uid"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{AutoApprove: true}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseAwaitingApproval, ResolvedOptions: &servitorv1alpha1.ResolvedOptions{}, Review: &servitorv1alpha1.ReviewSummary{}, ReviewDeadline: &deadline, ReviewGeneration: 1}}
+	kube := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(cluster).Build()
+	responses := &memoryResponder{}
+	notifier := &StatusNotifier{Client: kube, Namespace: "servitor", Responder: responses, Receipts: state.NewEventStore(kube, "servitor"), Clock: func() time.Time { return now }}
+	ids := reviewNoticeIDs(cluster)
+	if len(ids) < 2 {
+		t.Fatalf("review ids = %v, want multipart summary", ids)
+	}
+	if claimed, err := notifier.Receipts.Claim(context.Background(), ids[1]); err != nil || !claimed {
+		t.Fatalf("claim later review chunk = (%t, %v)", claimed, err)
+	}
+	if err := notifier.notify(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	stored := &servitorv1alpha1.ServitorCluster{}
+	if err := kube.Get(context.Background(), client.ObjectKeyFromObject(cluster), stored); err != nil {
+		t.Fatal(err)
+	}
+	if len(responses.responses) != 1 || stored.Spec.Lifecycle.Approval != "" {
+		t.Fatalf("claimed chunk allowed early approval: responses=%+v lifecycle=%+v", responses.responses, stored.Spec.Lifecycle)
+	}
+	if err := notifier.Receipts.Release(context.Background(), ids[1]); err != nil {
+		t.Fatal(err)
+	}
+	if err := notifier.notify(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := kube.Get(context.Background(), client.ObjectKeyFromObject(cluster), stored); err != nil {
+		t.Fatal(err)
+	}
+	if len(responses.responses) != 2 || stored.Spec.Lifecycle.Approval != "approved" {
+		t.Fatalf("all delivered review chunks did not approve: responses=%+v lifecycle=%+v", responses.responses, stored.Spec.Lifecycle)
+	}
+	if text := joinNotices(statusNoticesAt(cluster, now)); !strings.Contains(text, "approved automatically after all plan-summary messages are delivered") || strings.Contains(text, "Reply with exact `yes`") {
+		t.Fatalf("automatic review text = %q", text)
+	}
+}
+
+func TestStatusNotifierRetriesApprovalWithoutResendingDeliveredReview(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := servitorv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
+	deadline := metav1.NewTime(now.Add(time.Hour))
+	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "retry", Namespace: "servitor", UID: "retry-uid"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{AutoApprove: true}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseAwaitingApproval, ResolvedOptions: &servitorv1alpha1.ResolvedOptions{}, Review: &servitorv1alpha1.ReviewSummary{}, ReviewDeadline: &deadline, ReviewGeneration: 1}}
+	failUpdate := true
+	kube := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(cluster).WithInterceptorFuncs(interceptor.Funcs{Update: func(ctx context.Context, underlying client.WithWatch, object client.Object, options ...client.UpdateOption) error {
+		if current, ok := object.(*servitorv1alpha1.ServitorCluster); ok && current.Spec.Lifecycle.Approval == "approved" && failUpdate {
+			failUpdate = false
+			return errors.New("transient update failure")
+		}
+		return underlying.Update(ctx, object, options...)
+	}}).Build()
+	responses := &memoryResponder{}
+	notifier := &StatusNotifier{Client: kube, Namespace: "servitor", Responder: responses, Receipts: state.NewEventStore(kube, "servitor"), Clock: func() time.Time { return now }}
+	if err := notifier.notify(context.Background()); err == nil {
+		t.Fatal("first approval update unexpectedly succeeded")
+	}
+	if len(responses.responses) != 2 {
+		t.Fatalf("review delivery = %+v, want both chunks", responses.responses)
+	}
+	if err := notifier.notify(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	stored := &servitorv1alpha1.ServitorCluster{}
+	if err := kube.Get(context.Background(), client.ObjectKeyFromObject(cluster), stored); err != nil || stored.Spec.Lifecycle.Approval != "approved" || len(responses.responses) != 2 {
+		t.Fatalf("approval retry = lifecycle=%+v responses=%+v err=%v", stored.Spec.Lifecycle, responses.responses, err)
 	}
 }
 

@@ -280,6 +280,7 @@ func (b Bot) create(ctx context.Context, message Message, text string, respond f
 		return true
 	}
 	authRequested := options.AuthRequested()
+	autoApprove := options.ApproveRequested()
 	allocations, err := b.ownerAllocations(ctx, message.User)
 	if err != nil {
 		b.logf("list allocations for admission: %v", err)
@@ -293,7 +294,7 @@ func (b Bot) create(ctx context.Context, message Message, text string, respond f
 	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: b.Namespace}, Spec: servitorv1alpha1.ServitorClusterSpec{
 		Slack:       servitorv1alpha1.SlackIdentity{OwnerID: message.User, ChannelID: message.Channel, ThreadTimestamp: message.Timestamp},
 		UserOptions: userOptions,
-		Lifecycle:   servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: int64(b.lease() / time.Second), RetrySeconds: seconds(b.RetryIntervals)},
+		Lifecycle:   servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: int64(b.lease() / time.Second), RetrySeconds: seconds(b.RetryIntervals), AutoApprove: autoApprove},
 	}}
 	publicAuthEligible := b.publicAuthEligible(cluster)
 	if authRequested && publicAuthEligible {
@@ -333,10 +334,11 @@ func (b Bot) create(ctx context.Context, message Message, text string, respond f
 type reviewDecisionOutcome string
 
 const (
-	reviewDecisionRecorded reviewDecisionOutcome = "recorded"
-	reviewDecisionExpired  reviewDecisionOutcome = "expired"
-	reviewDecisionInvalid  reviewDecisionOutcome = "invalid"
-	reviewDecisionStale    reviewDecisionOutcome = "stale"
+	reviewDecisionRecorded  reviewDecisionOutcome = "recorded"
+	reviewDecisionExpired   reviewDecisionOutcome = "expired"
+	reviewDecisionInvalid   reviewDecisionOutcome = "invalid"
+	reviewDecisionStale     reviewDecisionOutcome = "stale"
+	reviewDecisionAutomatic reviewDecisionOutcome = "automatic"
 )
 
 func (b Bot) confirm(ctx context.Context, message Message, thread string) {
@@ -366,6 +368,8 @@ func (b Bot) confirm(ctx context.Context, message Message, thread string) {
 		b.respond(ctx, message.Channel, thread, "This plan is no longer awaiting review. No decision was recorded.")
 	case reviewDecisionStale:
 		b.respond(ctx, message.Channel, thread, "A review decision has already been recorded. No decision was recorded.")
+	case reviewDecisionAutomatic:
+		b.respond(ctx, message.Channel, thread, "This request will be approved automatically after the plan summary is delivered.")
 	}
 }
 
@@ -385,6 +389,9 @@ func (b Bot) recordReviewDecision(ctx context.Context, name string, message Mess
 			return nil
 		case current.Spec.Lifecycle.Approval != "":
 			outcome = reviewDecisionStale
+			return nil
+		case approval == "approved" && current.Spec.Lifecycle.AutoApprove:
+			outcome = reviewDecisionAutomatic
 			return nil
 		}
 		current.Spec.Lifecycle.Approval = approval
@@ -1125,7 +1132,7 @@ func helpOverview(maintainer bool, maxAllocationsPerUser int) []string {
 }
 func createHelp(defaults command.CreateDefaults, maxAllocationsPerUser int) []string {
 	intro := fmt.Sprintf("`create` starts planning from the configured channel root, up to %d active allocations per user. Repeating create in the same thread preserves that allocation. Configured defaults: version %s, target %s, provider %s.", maxAllocationsPerUser, safeHelpCell(defaults.Version), safeHelpCell(defaults.Target), safeHelpCell(defaults.Provider))
-	return []string{intro + " `provider=value` chooses infrastructure; version chooses Kubernetes or OpenShift. Cluster names are generated internally.\n\nSpecify provisioning options as `key=value`. A current common-option inventory also recognizes unique bare values, for example `create target=synthetic-target vpc-gen2 us-south-1 bx2.4x16 resource-group=\"Platform Team\"`. The environment target synonyms `prestage`/`pretest` and `test`/`stage` are interchangeable; `dev` selects the configured dev target. `auth`, `auth=true`, and `auth=false` control only public kubeconfig delivery; the default is no delivery. Public `auth` queues one owner-DM delivery after Ready. Private-only and Satellite auth opt-ins continue creating the cluster but report that VPN-backed authentication is not implemented yet. Unknown or colliding shorthand must use a key such as `flavor=value`; worker counts and uncommon Satellite values stay keyed. Use `roks` (also `openshift` or `default_openshift`) for the cloud default OpenShift stream, or `iks` (also `kubernetes`, `k8s`, or `default_kubernetes`) for Kubernetes. A compatible numeric stream can refine an alias: `create roks 4.17`. These reserved aliases require a key when used as resource names.\n\nReview the resolved stream and configuration in its thread. The review prompt shows the persisted approval deadline; reply with exact `yes` or `no` before that deadline.", "Safe create options\n```\nCommon\n  target= provider= version= resource-group= worker-count=\n  auth | auth=true | auth=false (public delivery only)\n\nVPC Gen 2\n  zone= flavor= vpc-id= subnet-id= public-gateway-id=\n\nClassic\n  datacenter= machine-type= public-vlan-id= private-vlan-id=\n\nSatellite\n  satellite-zone= satellite-managed-from= satellite-location-id=\n  satellite-host-image= satellite-host-profile= satellite-ssh-key-id=\n  satellite-worker-instance-id= satellite-worker-operating-system=\n```"}
+	return []string{intro + " `provider=value` chooses infrastructure; version chooses Kubernetes or OpenShift. Cluster names are generated internally.\n\nSpecify provisioning options as `key=value`. A current common-option inventory also recognizes unique bare values, for example `create target=synthetic-target vpc-gen2 us-south-1 bx2.4x16 resource-group=\"Platform Team\"`. The environment target synonyms `prestage`/`pretest` and `test`/`stage` are interchangeable; `dev` selects the configured dev target. `auth`, `auth=true`, and `auth=false` control only public kubeconfig delivery; the default is no delivery. `approve`, `approve=true`, and `approve=false` control create-time automatic approval; the default remains manual. Automatic approval follows successful plan-summary delivery before the persisted deadline. `yes` cannot bypass that delivery; `no` and `done` retain their existing behavior. Public `auth` queues one owner-DM delivery after Ready. Private-only and Satellite auth opt-ins continue creating the cluster but report that VPN-backed authentication is not implemented yet. Unknown or colliding shorthand must use a key such as `flavor=value`; worker counts and uncommon Satellite values stay keyed. Use `roks` (also `openshift` or `default_openshift`) for the cloud default OpenShift stream, or `iks` (also `kubernetes`, `k8s`, or `default_kubernetes`) for Kubernetes. A compatible numeric stream can refine an alias: `create roks 4.17`. These reserved aliases require a key when used as resource names.\n\nReview the resolved stream and configuration in its thread. The review prompt shows the persisted approval deadline; reply with exact `yes` or `no` before that deadline.", "Safe create options\n```\nCommon\n  target= provider= version= resource-group= worker-count=\n  auth | auth=true | auth=false (public delivery only)\n  approve | approve=true | approve=false (automatic after plan-summary delivery)\n\nVPC Gen 2\n  zone= flavor= vpc-id= subnet-id= public-gateway-id=\n\nClassic\n  datacenter= machine-type= public-vlan-id= private-vlan-id=\n\nSatellite\n  satellite-zone= satellite-managed-from= satellite-location-id=\n  satellite-host-image= satellite-host-profile= satellite-ssh-key-id=\n  satellite-worker-instance-id= satellite-worker-operating-system=\n```"}
 }
 func safeHelpCell(value string) string {
 	value = strings.Map(func(character rune) rune {

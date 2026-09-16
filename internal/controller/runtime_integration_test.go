@@ -5,6 +5,7 @@ package controller
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -15,12 +16,16 @@ import (
 	"time"
 
 	servitorv1alpha1 "github.com/bevicted/servitor/api/v1alpha1"
+	"github.com/bevicted/servitor/internal/command"
 	"github.com/bevicted/servitor/internal/pipeline"
+	"github.com/bevicted/servitor/internal/slackbot"
+	"github.com/bevicted/servitor/internal/state"
 	tektonv1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/yaml"
 	"k8s.io/client-go/rest"
@@ -36,6 +41,42 @@ import (
 )
 
 const runtimeContractNamespace = "servitor-runtime-contract"
+
+type runtimeContractResponder struct {
+	mu                   sync.Mutex
+	thread               string
+	failingThread        string
+	failingThreadReplies int
+	responses            []slackbot.Response
+}
+
+func (r *runtimeContractResponder) Reply(_ context.Context, response slackbot.Response) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if response.ThreadTimestamp == r.failingThread {
+		r.failingThreadReplies++
+		if r.failingThreadReplies > 1 {
+			return errors.New("synthetic Slack delivery failure")
+		}
+		return nil
+	}
+	if r.thread == "" || r.thread == response.ThreadTimestamp {
+		r.responses = append(r.responses, response)
+	}
+	return nil
+}
+
+func (r *runtimeContractResponder) count() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.responses)
+}
+
+func (r *runtimeContractResponder) failureCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return max(r.failingThreadReplies-1, 0)
+}
 
 type runtimeContractDelivery struct {
 	mu    sync.Mutex
@@ -92,6 +133,9 @@ func TestRuntimeContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	installControllerRBAC(t, ctx, admin)
+	verifyAutoApproveTransitionContract(t, ctx, admin)
+	autoKey, autoResponses := seedAutoApproveContract(t, ctx, admin)
+	timeoutKey := seedAutoApproveContractWithResponder(t, ctx, admin, "timeout", "1710000000.000101", autoResponses, 3*time.Second)
 
 	publicationKey := seedPublicationContract(t, ctx, admin)
 	deliveryKey := seedDeliveryContract(t, ctx, admin)
@@ -147,6 +191,64 @@ func TestRuntimeContract(t *testing.T) {
 		t.Fatalf("manager cache did not synchronize: %v", managerResult(managerDone))
 	}
 
+	notifier := &slackbot.StatusNotifier{Client: admin, Namespace: runtimeContractNamespace, Responder: autoResponses, Receipts: state.NewEventStore(admin, runtimeContractNamespace), Interval: 10 * time.Millisecond}
+	notifierContext, stopNotifier := context.WithCancel(ctx)
+	notifierDone := make(chan error, 1)
+	go func() { notifierDone <- notifier.Start(notifierContext) }()
+	notifierStopped := false
+	stopStatusNotifier := func() {
+		if notifierStopped {
+			return
+		}
+		notifierStopped = true
+		stopNotifier()
+		if err := <-notifierDone; err != nil {
+			t.Errorf("stop notifier: %v", err)
+		}
+	}
+	t.Cleanup(stopStatusNotifier)
+
+	eventually(t, managerDone, "automatic delivery-gated apply", func() error {
+		cluster := &servitorv1alpha1.ServitorCluster{}
+		if err := admin.Get(ctx, autoKey, cluster); err != nil {
+			return err
+		}
+		if autoResponses.count() != 3 || cluster.Spec.Lifecycle.Approval != "approved" || cluster.Status.Phase != servitorv1alpha1.PhaseApplying {
+			return fmt.Errorf("responses=%d approval=%q phase=%q", autoResponses.count(), cluster.Spec.Lifecycle.Approval, cluster.Status.Phase)
+		}
+		var runs tektonv1.PipelineRunList
+		if err := admin.List(ctx, &runs, client.InNamespace(runtimeContractNamespace), client.MatchingLabels{pipeline.ClusterUIDLabel: string(cluster.UID), pipeline.OperationLabel: applyID(string(cluster.UID))}); err != nil {
+			return err
+		}
+		if len(runs.Items) != 1 {
+			return fmt.Errorf("apply PipelineRuns=%d", len(runs.Items))
+		}
+		return nil
+	})
+
+	stopStatusNotifier()
+
+	if failures := autoResponses.failureCount(); failures == 0 {
+		t.Fatal("failing responder did not reject a review reply")
+	}
+	eventually(t, managerDone, "failed review delivery deadline cleanup", func() error {
+		cluster := &servitorv1alpha1.ServitorCluster{}
+		if err := admin.Get(ctx, timeoutKey, cluster); err != nil {
+			return err
+		}
+		if cluster.Spec.Lifecycle.Approval != "" || cluster.Status.Phase != servitorv1alpha1.PhaseCleanupComplete || cluster.Status.Cleanup == nil || cluster.Status.Cleanup.Reason != servitorv1alpha1.CleanupReasonReviewExpired {
+			return fmt.Errorf("approval=%q phase=%q cleanup=%+v", cluster.Spec.Lifecycle.Approval, cluster.Status.Phase, cluster.Status.Cleanup)
+		}
+		var runs tektonv1.PipelineRunList
+		if err := admin.List(ctx, &runs, client.InNamespace(runtimeContractNamespace), client.MatchingLabels{pipeline.ClusterUIDLabel: string(cluster.UID), pipeline.OperationLabel: applyID(string(cluster.UID))}); err != nil {
+			return err
+		}
+		if len(runs.Items) != 0 {
+			return fmt.Errorf("apply PipelineRuns=%d", len(runs.Items))
+		}
+		return nil
+	})
+
 	eventually(t, managerDone, "publisher resources and Applying status", func() error {
 		cluster := &servitorv1alpha1.ServitorCluster{}
 		if err := admin.Get(ctx, publicationKey, cluster); err != nil {
@@ -194,6 +296,129 @@ func TestRuntimeContract(t *testing.T) {
 		}
 		return nil
 	})
+}
+
+func verifyAutoApproveTransitionContract(t *testing.T, ctx context.Context, kube client.Client) {
+	t.Helper()
+	updateMustFail := func(cluster *servitorv1alpha1.ServitorCluster) {
+		t.Helper()
+		if err := kube.Update(ctx, cluster); err == nil {
+			t.Fatalf("autoApprove transition unexpectedly succeeded: %+v", cluster.Spec.Lifecycle)
+		}
+	}
+	auto := contractCluster("auto-approve-true")
+	auto.Spec.Lifecycle.AutoApprove = true
+	if err := kube.Create(ctx, auto); err != nil {
+		t.Fatal(err)
+	}
+	if err := kube.Get(ctx, client.ObjectKeyFromObject(auto), auto); err != nil || !auto.Spec.Lifecycle.AutoApprove {
+		t.Fatalf("persist autoApprove = %+v, %v", auto.Spec.Lifecycle, err)
+	}
+	auto.Spec.Lifecycle.AutoApprove = false
+	updateMustFail(auto)
+	if err := kube.Get(ctx, client.ObjectKeyFromObject(auto), auto); err != nil {
+		t.Fatal(err)
+	}
+	auto.Spec.Lifecycle.AutoApprove = false
+	updateMustFail(auto)
+
+	manual := contractCluster("auto-approve-omitted")
+	if err := kube.Create(ctx, manual); err != nil {
+		t.Fatal(err)
+	}
+	if err := kube.Get(ctx, client.ObjectKeyFromObject(manual), manual); err != nil || manual.Spec.Lifecycle.AutoApprove {
+		t.Fatalf("omitted autoApprove = %+v, %v", manual.Spec.Lifecycle, err)
+	}
+	manual.Spec.Lifecycle.AutoApprove = true
+	updateMustFail(manual)
+	for _, cluster := range []*servitorv1alpha1.ServitorCluster{auto, manual} {
+		if err := kube.Delete(ctx, cluster); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func seedAutoApproveContract(t *testing.T, ctx context.Context, kube client.Client) (types.NamespacedName, *runtimeContractResponder) {
+	t.Helper()
+	responses := &runtimeContractResponder{thread: "1710000000.000100", failingThread: "1710000000.000101"}
+	return seedAutoApproveContractWithResponder(t, ctx, kube, "auto", "1710000000.000100", responses, time.Minute), responses
+}
+
+func seedAutoApproveContractWithResponder(t *testing.T, ctx context.Context, kube client.Client, name, thread string, responder slackbot.Responder, reviewTimeout time.Duration) types.NamespacedName {
+	t.Helper()
+	bot := slackbot.Bot{
+		ChannelID: "CCHANNEL", SelfUserID: "BOT", Namespace: runtimeContractNamespace, Client: kube,
+		Events: state.NewEventStore(kube, runtimeContractNamespace), Responder: responder,
+		Defaults: command.CreateDefaults{Version: "4.22"}, Lease: time.Hour, RetryIntervals: []time.Duration{time.Minute},
+	}
+	message := slackbot.Message{Channel: "CCHANNEL", ChannelType: "channel", User: "UAUTO", Text: "<@BOT> create approve version=4.22", Timestamp: thread}
+	if err := bot.Handle(ctx, slackbot.Envelope{ID: "auto-create-" + name, Message: message}); err != nil {
+		t.Fatal(err)
+	}
+	var clusters servitorv1alpha1.ServitorClusterList
+	if err := kube.List(ctx, &clusters, client.InNamespace(runtimeContractNamespace)); err != nil {
+		t.Fatal(err)
+	}
+	for index := range clusters.Items {
+		cluster := &clusters.Items[index]
+		if cluster.Spec.Slack.ThreadTimestamp != message.Timestamp {
+			continue
+		}
+		if !cluster.Spec.Lifecycle.AutoApprove || cluster.Spec.Lifecycle.Approval != "" {
+			t.Fatalf("create auto approval state = lifecycle=%+v", cluster.Spec.Lifecycle)
+		}
+		key := client.ObjectKeyFromObject(cluster)
+		now := time.Now().UTC()
+		reconciler := &Reconciler{Client: kube, Config: Config{
+			Namespace:      runtimeContractNamespace,
+			Defaults:       *contractResolvedOptions("auto-cluster"),
+			Backend:        servitorv1alpha1.BackendIdentity{Version: 1, Bucket: "bucket", Region: "us-south", Endpoint: "https://s3.example.invalid"},
+			BackendPrefix:  "runtime-contract",
+			ExecutionImage: "registry.example.invalid/task@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			ReviewTimeout:  reviewTimeout,
+		}, Now: func() time.Time { return now }}
+		request := ctrl.Request{NamespacedName: key}
+		for range 4 {
+			if _, err := reconciler.Reconcile(ctx, request); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := kube.Get(ctx, key, cluster); err != nil {
+			t.Fatal(err)
+		}
+		run := &tektonv1.PipelineRun{}
+		if err := kube.Get(ctx, types.NamespacedName{Namespace: runtimeContractNamespace, Name: cluster.Status.Operation.PipelineRunName}, run); err != nil {
+			t.Fatal(err)
+		}
+		run.Status.Status.Conditions = duckv1.Conditions{{Type: apis.ConditionSucceeded, Status: corev1.ConditionTrue}}
+		run.Status.ChildReferences = []tektonv1.ChildStatusReference{{TypeMeta: k8sruntime.TypeMeta{APIVersion: "tekton.dev/v1", Kind: "TaskRun"}, Name: "auto-plan-report-" + name, PipelineTaskName: "operation"}}
+		if err := kube.Status().Update(ctx, run); err != nil {
+			t.Fatal(err)
+		}
+		task := &tektonv1.TaskRun{ObjectMeta: metav1.ObjectMeta{Name: "auto-plan-report-" + name, Namespace: runtimeContractNamespace}}
+		if err := kube.Create(ctx, task); err != nil {
+			t.Fatal(err)
+		}
+		task.Status.PodName = "auto-plan-pod"
+		task.Status.Steps = []tektonv1.StepState{{Name: pipeline.ReportContainerName, Container: "step-report"}}
+		if err := kube.Status().Update(ctx, task); err != nil {
+			t.Fatal(err)
+		}
+		report, err := json.Marshal(pipeline.Report{Version: 1, ClusterUID: string(cluster.UID), OperationID: cluster.Status.Operation.ID, ResolvedOptions: *cluster.Status.ResolvedOptions, Recovery: *contractRecovery("auto-cluster-" + name), Review: servitorv1alpha1.ReviewSummary{Resources: []servitorv1alpha1.SummaryResource{{Role: "Cluster", Actions: []string{"create"}}}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		reconciler.Logs = reportLogs{data: report}
+		if _, err := reconciler.Reconcile(ctx, request); err != nil {
+			t.Fatal(err)
+		}
+		if err := kube.Get(ctx, key, cluster); err != nil || cluster.Status.Phase != servitorv1alpha1.PhaseAwaitingApproval || cluster.Status.Review == nil || cluster.Status.ReviewDeadline == nil {
+			t.Fatalf("synthetic plan report adoption = status=%+v err=%v", cluster.Status, err)
+		}
+		return key
+	}
+	t.Fatal("bot did not create auto-approve allocation")
+	return types.NamespacedName{}
 }
 
 func seedPublicationContract(t *testing.T, ctx context.Context, kube client.Client) types.NamespacedName {
