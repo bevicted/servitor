@@ -1082,7 +1082,7 @@ func TestCreateRejectsPlatformAndHelpDoesNotAdvertiseIt(t *testing.T) {
 
 func TestCreateHelpDistinguishesDefaultsAliasesStreamsAndProvider(t *testing.T) {
 	help := strings.Join(createHelp(command.CreateDefaults{}, 3), "\n")
-	for _, wanted := range []string{"Configured defaults", "provider=", "key=value", "target=synthetic-target", "resource-group=\"Platform Team\"", "auth=true", "auth=false", "Public `auth`", "Private-only and Satellite", "roks", "iks", "k8s", "default_openshift", "default_kubernetes", "4.17"} {
+	for _, wanted := range []string{"Configured defaults", "provider=", "key=value", "target=synthetic-target", "resource-group=\"Platform Team\"", "auth=true", "auth=false", "Public `auth`", "Private-only and Satellite", "roks", "iks", "k8s", "default_openshift", "default_kubernetes", "4.17", "prestage", "pretest", "test`/`stage", "dev target"} {
 		if !containsText(help, wanted) {
 			t.Fatalf("create help missing %q: %s", wanted, help)
 		}
@@ -1298,13 +1298,39 @@ func TestCreateMatchesPublishedInventoryBareValues(t *testing.T) {
 	}
 }
 
+func TestCreateRecognizesEnvironmentTargetShorthand(t *testing.T) {
+	for _, test := range []struct{ shorthand, target string }{
+		{"prestage", "pretest"},
+		{"pretest", "pretest"},
+		{"stage", "test"},
+		{"test", "test"},
+		{"dev", "dev"},
+	} {
+		t.Run(test.shorthand, func(t *testing.T) {
+			bot, responses := botWithPublishedInventory(t, false)
+			addConfiguredEnvironmentTargets(t, bot)
+			event := Envelope{ID: "environment-target-" + test.shorthand, Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "<@BOT> create " + test.shorthand, Timestamp: "123"}}
+			if err := bot.Handle(context.Background(), event); err != nil {
+				t.Fatal(err)
+			}
+			cluster := &servitorv1alpha1.ServitorCluster{}
+			if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: allocationClusterName("C1", "123")}, cluster); err != nil {
+				t.Fatal(err)
+			}
+			if cluster.Spec.UserOptions.Target != test.target || len(responses.responses) != 1 || responses.responses[0].Text != "Planning..." {
+				t.Fatalf("target=%q, responses=%+v; want target %q and planning", cluster.Spec.UserOptions.Target, responses.responses, test.target)
+			}
+		})
+	}
+}
+
 func TestCreateUnknownShorthandNamesValue(t *testing.T) {
 	bot, responses := botWithPublishedInventory(t, false)
-	event := Envelope{ID: "unknown-bare", Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "<@BOT> create stage 4.20", Timestamp: "123"}}
+	event := Envelope{ID: "unknown-bare", Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "<@BOT> create production 4.20", Timestamp: "123"}}
 	if err := bot.Handle(context.Background(), event); err != nil {
 		t.Fatal(err)
 	}
-	if len(responses.responses) != 1 || !containsText(responses.responses[0].Text, `unknown shorthand value "stage"`) {
+	if len(responses.responses) != 1 || !containsText(responses.responses[0].Text, `unknown shorthand value "production"`) {
 		t.Fatalf("response=%+v", responses.responses)
 	}
 	cluster := &servitorv1alpha1.ServitorCluster{}
@@ -1355,6 +1381,29 @@ func TestCreateBareValuesRequireCurrentInventoryButKeysProceed(t *testing.T) {
 		if len(responses.responses) != 1 || !containsText(responses.responses[0].Text, "not configured") {
 			t.Fatalf("invalid selector response=%+v", responses.responses)
 		}
+	}
+}
+
+func addConfiguredEnvironmentTargets(t *testing.T, bot Bot) {
+	t.Helper()
+	configMap := &corev1.ConfigMap{}
+	if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: bot.Namespace, Name: bot.InventoryConfigMap}, configMap); err != nil {
+		t.Fatal(err)
+	}
+	const targetConfig = `  %s:
+    providers: [vpc-gen2]
+    default_region: us-south
+    endpoints:
+      iam: https://iam.example.invalid
+      container_service: https://containers.example.invalid
+      global_tagging: https://tagging.example.invalid
+      resource_management: https://resource-manager.example.invalid
+      resource_controller: https://resource-controller.example.invalid
+      vpc: https://vpc.{region}.example.invalid
+`
+	configMap.Data[bot.InventoryConfigKey] += fmt.Sprintf(targetConfig, "pretest") + fmt.Sprintf(targetConfig, "test") + fmt.Sprintf(targetConfig, "dev")
+	if err := bot.Client.Update(context.Background(), configMap); err != nil {
+		t.Fatal(err)
 	}
 }
 

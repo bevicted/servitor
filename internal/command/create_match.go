@@ -21,11 +21,12 @@ func ResolveBareSelectors(options ExplicitCreateOptions, defaults CreateDefaults
 	}
 
 	for index := 0; index < len(bare); {
-		if _, ok := targets[bare[index]]; !ok {
+		target, ok := configuredTargetShorthand(targets, bare[index])
+		if !ok {
 			index++
 			continue
 		}
-		if err := set("--target", bare[index]); err != nil {
+		if err := set("--target", target); err != nil {
 			return ExplicitCreateOptions{}, inventory.TargetConfig{}, err
 		}
 		bare = append(bare[:index], bare[index+1:]...)
@@ -182,6 +183,27 @@ func hasLocation(locations []inventory.Location, value string) bool {
 		}
 	}
 	return false
+}
+
+func configuredTargetShorthand(targets map[string]inventory.TargetConfig, value string) (string, bool) {
+	if _, ok := targets[value]; ok {
+		return value, true
+	}
+	var equivalent string
+	switch value {
+	case "prestage":
+		equivalent = "pretest"
+	case "pretest":
+		equivalent = "prestage"
+	case "stage":
+		equivalent = "test"
+	case "test":
+		equivalent = "stage"
+	}
+	if _, ok := targets[equivalent]; equivalent != "" && ok {
+		return equivalent, true
+	}
+	return "", false
 }
 
 func contains(values []string, value string) bool {

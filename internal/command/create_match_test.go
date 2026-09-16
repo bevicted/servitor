@@ -36,6 +36,31 @@ func TestBareValuesResolveSelectorsBeforeOrderIndependentLocationMatching(t *tes
 	}
 }
 
+func TestEnvironmentTargetShorthandUsesConfiguredEquivalent(t *testing.T) {
+	targets := map[string]inventory.TargetConfig{
+		"pretest": {Providers: []string{"vpc-gen2"}},
+		"test":    {Providers: []string{"vpc-gen2"}},
+		"dev":     {Providers: []string{"vpc-gen2"}},
+	}
+	for _, test := range []struct{ shorthand, target string }{
+		{"prestage", "pretest"},
+		{"pretest", "pretest"},
+		{"stage", "test"},
+		{"test", "test"},
+		{"dev", "dev"},
+	} {
+		t.Run(test.shorthand, func(t *testing.T) {
+			options, err := ParseCreateOptions("create " + test.shorthand)
+			if err == nil {
+				options, _, err = ResolveBareSelectors(options, matchDefaults, targets)
+			}
+			if err != nil || one(options.Values(), "--target") != test.target || len(options.BareValues()) != 0 {
+				t.Fatalf("%q resolved as %#v, %v; want target %q", test.shorthand, options.Values(), err, test.target)
+			}
+		})
+	}
+}
+
 func TestAuthIsConsumedBeforeInventoryMatching(t *testing.T) {
 	options, err := ParseCreateOptions("create auth bx2.4x16 Platform\\ Team vpc-gen2 us-south-1 target-a version=4.22")
 	if err != nil {
@@ -54,7 +79,7 @@ func TestAuthIsConsumedBeforeInventoryMatching(t *testing.T) {
 func TestBareValuesRequireOneExactRoleAndCurrentInventory(t *testing.T) {
 	targets := map[string]inventory.TargetConfig{"target-a": {Providers: []string{"vpc-gen2", "classic", "satellite"}}}
 	for _, test := range []struct{ text, want string }{
-		{"create stage 4.20", `unknown shorthand value "stage"`},
+		{"create production 4.20", `unknown shorthand value "production"`},
 		{"create shared", "ambiguous shorthand"},
 		{"create target-a target-a", "target may only be supplied once"},
 		{"create provider=classic vpc-gen2", "provider may only be supplied once"},
