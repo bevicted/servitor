@@ -8,7 +8,7 @@ import (
 	"github.com/bevicted/servitor/internal/inventory"
 )
 
-var matchDefaults = CreateDefaults{Target: "target-a", Provider: "vpc-gen2", Zone: "us-south-1"}
+var matchDefaults = CreateDefaults{Target: "target-a", Provider: "vpc-gen2"}
 
 var matchCatalog = inventory.Catalog{
 	Version: inventory.CatalogVersion, Target: "target-a", Providers: []string{"vpc-gen2", "classic", "satellite"},
@@ -95,7 +95,6 @@ func TestBareValuesRequireOneExactRoleAndCurrentInventory(t *testing.T) {
 	targets := map[string]inventory.TargetConfig{"target-a": {Providers: []string{"vpc-gen2", "classic", "satellite"}}}
 	for _, test := range []struct{ text, want string }{
 		{"create production 4.20", `unknown shorthand value "production"`},
-		{"create shared", "ambiguous shorthand"},
 		{"create target-a target-a", "target may only be supplied once"},
 		{"create provider=classic vpc-gen2", "provider may only be supplied once"},
 	} {

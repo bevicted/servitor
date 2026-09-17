@@ -29,6 +29,7 @@ type Config struct {
 	Namespace string          `yaml:"namespace"`
 	Slack     SlackConfig     `yaml:"slack"`
 	Defaults  DefaultsConfig  `yaml:"defaults"`
+	Network   NetworkConfig   `yaml:"network"`
 	Lifecycle LifecycleConfig `yaml:"lifecycle"`
 	Inventory InventoryConfig `yaml:"inventory"`
 	Auth      AuthConfig      `yaml:"auth"`
@@ -73,10 +74,33 @@ type DefaultsConfig struct {
 	Target           string `yaml:"target"`
 	Provider         string `yaml:"provider"`
 	ResourceGroup    string `yaml:"resource_group"`
-	Zone             string `yaml:"zone"`
-	VPCID            string `yaml:"vpc_id"`
 	OpenShiftFlavor  string `yaml:"openshift_flavor"`
 	KubernetesFlavor string `yaml:"kubernetes_flavor"`
+}
+
+// NetworkConfig maps each Servitor target to one operator-owned existing network.
+type NetworkConfig struct {
+	Bindings       map[string]NetworkBinding `yaml:"bindings"`
+	TargetBindings map[string]string         `yaml:"target_bindings"`
+}
+
+// NetworkBinding contains only existing shared-network identity and references.
+type NetworkBinding struct {
+	AccountID       string `yaml:"account_id"`
+	VPCID           string `yaml:"vpc_id"`
+	SubnetID        string `yaml:"subnet_id"`
+	PublicGatewayID string `yaml:"public_gateway_id"`
+	Zone            string `yaml:"zone"`
+}
+
+// BindingForTarget returns exactly one configured binding for a target.
+func (c NetworkConfig) BindingForTarget(target string) (string, NetworkBinding, bool) {
+	bindingID, found := c.TargetBindings[target]
+	if !found {
+		return "", NetworkBinding{}, false
+	}
+	binding, found := c.Bindings[bindingID]
+	return bindingID, binding, found
 }
 
 type LifecycleConfig struct {
@@ -261,7 +285,6 @@ func (c Config) Validate() error {
 		{"ict.target_config_key", c.ICT.TargetConfigKey},
 		{"defaults.version", c.Defaults.Version}, {"defaults.target", c.Defaults.Target},
 		{"defaults.provider", c.Defaults.Provider}, {"defaults.resource_group", c.Defaults.ResourceGroup},
-		{"defaults.zone", c.Defaults.Zone}, {"defaults.vpc_id", c.Defaults.VPCID},
 		{"defaults.openshift_flavor", c.Defaults.OpenShiftFlavor}, {"defaults.kubernetes_flavor", c.Defaults.KubernetesFlavor},
 		{"cos.endpoint", c.COS.Endpoint}, {"cos.bucket", c.COS.Bucket}, {"cos.region", c.COS.Region},
 		{"cos.key_prefix", strings.Trim(c.COS.KeyPrefix, "/")}, {"images.execution", c.Images.Execution},
@@ -278,6 +301,9 @@ func (c Config) Validate() error {
 	}
 	if !validExecutionImage(c.Images.Execution) {
 		return errors.New("config: images.execution must have a non-empty image name and a 64-character hexadecimal sha256 digest")
+	}
+	if err := c.Network.validate(); err != nil {
+		return err
 	}
 	if c.COS.UseLockfile {
 		return errors.New("config: cos.use_lockfile is unsupported by the pinned Terraform runtime")
@@ -316,6 +342,39 @@ func (c Config) Validate() error {
 }
 
 // InventoryRefreshInterval returns the configured interval or its safe default.
+func (c NetworkConfig) validate() error {
+	if len(c.Bindings) == 0 && len(c.TargetBindings) == 0 {
+		return nil
+	}
+	if len(c.Bindings) == 0 || len(c.TargetBindings) == 0 {
+		return errors.New("config: network.bindings and network.target_bindings must be configured together")
+	}
+	for bindingID, binding := range c.Bindings {
+		if err := requiredDNSLabel("network.bindings key", bindingID); err != nil {
+			return err
+		}
+		for _, field := range []struct{ name, value string }{
+			{"account_id", binding.AccountID}, {"vpc_id", binding.VPCID}, {"subnet_id", binding.SubnetID}, {"public_gateway_id", binding.PublicGatewayID}, {"zone", binding.Zone},
+		} {
+			if strings.TrimSpace(field.value) == "" || len(field.value) > 128 || strings.TrimSpace(field.value) != field.value {
+				return fmt.Errorf("config: network binding %q %s is required", bindingID, field.name)
+			}
+		}
+		if !regexp.MustCompile(`^[a-z]+(?:-[a-z]+)+-[0-9]+$`).MatchString(binding.Zone) {
+			return fmt.Errorf("config: network binding %q zone is invalid", bindingID)
+		}
+	}
+	for target, bindingID := range c.TargetBindings {
+		if err := requiredDNSLabel("network.target_bindings key", target); err != nil {
+			return err
+		}
+		if _, found := c.Bindings[bindingID]; !found {
+			return fmt.Errorf("config: network target %q references an unknown binding", target)
+		}
+	}
+	return nil
+}
+
 func (c Config) InventoryRefreshInterval() time.Duration {
 	if c.Inventory.RefreshInterval > 0 {
 		return c.Inventory.RefreshInterval

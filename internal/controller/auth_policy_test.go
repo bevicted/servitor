@@ -9,6 +9,7 @@ import (
 func TestSnapshotFreezesPublicAuthEligibility(t *testing.T) {
 	reconciler := Reconciler{Config: Config{
 		Defaults:          servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Target: "public-target", Provider: "vpc-gen2", Version: "4.22"}},
+		NetworkBindings:   map[string]servitorv1alpha1.FrozenNetwork{"public-target": frozenNetwork()},
 		PublicAuthTargets: []string{"public-target"}, OpenShiftFlavor: "bx2.4x16",
 	}}
 	cluster := &servitorv1alpha1.ServitorCluster{}

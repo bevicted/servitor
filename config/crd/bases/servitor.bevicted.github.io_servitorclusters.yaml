@@ -85,7 +85,6 @@ spec:
                         pattern: "^[a-z]+(-[a-z]+)+-[0-9]+$",
                       }
                     flavor: { type: string, maxLength: 64 }
-                    vpcID: { type: string, maxLength: 128 }
                     datacenter:
                       { type: string, maxLength: 32, pattern: "^[a-z]+[0-9]+$" }
                     machineType: { type: string, maxLength: 64 }
@@ -93,18 +92,6 @@ spec:
                       { type: string, maxLength: 64, pattern: "^[0-9]*$" }
                     privateVLANID:
                       { type: string, maxLength: 64, pattern: "^[0-9]*$" }
-                    subnetIDs:
-                      {
-                        type: array,
-                        maxItems: 8,
-                        items: { type: string, maxLength: 128 },
-                      }
-                    publicGatewayIDs:
-                      {
-                        type: array,
-                        maxItems: 8,
-                        items: { type: string, maxLength: 128 },
-                      }
                     satelliteZones:
                       {
                         type: array,
@@ -209,7 +196,15 @@ spec:
                     resourceGroup: { type: string, maxLength: 128 }
                     zone: { type: string, maxLength: 64 }
                     flavor: { type: string, maxLength: 64 }
-                    vpcID: { type: string, maxLength: 128 }
+                    network:
+                      type: object
+                      properties:
+                        bindingID: { type: string, maxLength: 128 }
+                        accountID: { type: string, maxLength: 128 }
+                        vpcID: { type: string, maxLength: 128 }
+                        subnetID: { type: string, maxLength: 128 }
+                        publicGatewayID: { type: string, maxLength: 128 }
+                        zone: { type: string, maxLength: 64 }
                     datacenter: { type: string, maxLength: 32 }
                     machineType: { type: string, maxLength: 64 }
                     publicVLANID: { type: string, maxLength: 64 }

@@ -92,7 +92,8 @@ func TestMultipleThreadAllocationsAdmissionAndCleanup(t *testing.T) {
 
 	reconciler := &controller.Reconciler{Client: kube, DirectReader: kube, Scheme: scheme, Config: controller.Config{
 		Namespace: "ns", Defaults: servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Target: "target", Provider: "vpc-gen2", Version: "4.22", ResourceGroup: "Default"}, Platform: "openshift"},
-		Backend: servitorv1alpha1.BackendIdentity{Version: 1, Bucket: "bucket", Region: "us-south", Endpoint: "https://s3.us-south.example.invalid"}, BackendPrefix: "servitor",
+		NetworkBindings: map[string]servitorv1alpha1.FrozenNetwork{"target": {BindingID: "existing", AccountID: "account", VPCID: "vpc", SubnetID: "subnet", PublicGatewayID: "gateway", Zone: "us-south-1"}},
+		Backend:         servitorv1alpha1.BackendIdentity{Version: 1, Bucket: "bucket", Region: "us-south", Endpoint: "https://s3.us-south.example.invalid"}, BackendPrefix: "servitor",
 		ExecutionImage: "registry.example/ict@sha256:deadbeef", ReviewTimeout: time.Minute,
 	}, Now: func() time.Time { return now }}
 	for _, thread := range threads {

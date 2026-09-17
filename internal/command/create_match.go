@@ -95,10 +95,6 @@ func MatchBareCreateOptions(options ExplicitCreateOptions, defaults CreateDefaul
 			}
 		}
 	}
-	if zone == "" {
-		zone = defaults.Zone
-	}
-
 	for _, value := range options.bare {
 		roles := matchingRoles(catalog, provider, zone, datacenter, satelliteRegion, value)
 		if len(roles) == 0 {

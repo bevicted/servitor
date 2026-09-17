@@ -25,9 +25,12 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/yaml"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
 	"knative.dev/pkg/apis"
 	duckv1 "knative.dev/pkg/apis/duck/v1"
@@ -109,6 +112,37 @@ func (d *runtimeContractDelivery) result() (int, string, []byte) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.calls, d.owner, append([]byte(nil), d.data...)
+}
+
+func TestStrictNetworkUserOptionsAdmission(t *testing.T) {
+	scheme, err := NewScheme()
+	if err != nil {
+		t.Fatal(err)
+	}
+	testEnvironment := &envtest.Environment{
+		Scheme:                scheme,
+		CRDDirectoryPaths:     []string{filepath.Join(repositoryRoot(t), "config", "crd", "bases")},
+		ErrorIfCRDPathMissing: true,
+	}
+	config, err := testEnvironment.Start()
+	if err != nil {
+		t.Fatalf("start envtest: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := testEnvironment.Stop(); err != nil {
+			t.Errorf("stop envtest: %v", err)
+		}
+	})
+	admin, err := client.New(config, client.Options{Scheme: scheme})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	const namespace = "servitor-strict-admission"
+	if err := admin.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}); err != nil {
+		t.Fatal(err)
+	}
+	verifyRemovedNetworkUserOptionsRejected(t, ctx, config, namespace)
 }
 
 func TestRuntimeContract(t *testing.T) {
@@ -405,12 +439,13 @@ func seedApprovalContractWithResponder(t *testing.T, ctx context.Context, kube c
 		key := client.ObjectKeyFromObject(cluster)
 		now := time.Now().UTC()
 		reconciler := &Reconciler{Client: kube, Config: Config{
-			Namespace:      runtimeContractNamespace,
-			Defaults:       *contractResolvedOptions("auto-cluster"),
-			Backend:        servitorv1alpha1.BackendIdentity{Version: 1, Bucket: "bucket", Region: "us-south", Endpoint: "https://s3.example.invalid"},
-			BackendPrefix:  "runtime-contract",
-			ExecutionImage: "registry.example.invalid/task@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-			ReviewTimeout:  reviewTimeout,
+			Namespace:       runtimeContractNamespace,
+			Defaults:        *contractResolvedOptions("auto-cluster"),
+			NetworkBindings: runtimeContractNetworkBindings(),
+			Backend:         servitorv1alpha1.BackendIdentity{Version: 1, Bucket: "bucket", Region: "us-south", Endpoint: "https://s3.example.invalid"},
+			BackendPrefix:   "runtime-contract",
+			ExecutionImage:  "registry.example.invalid/task@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			ReviewTimeout:   reviewTimeout,
 		}, Now: func() time.Time { return now }}
 		request := ctrl.Request{NamespacedName: key}
 		for range 4 {
@@ -420,6 +455,9 @@ func seedApprovalContractWithResponder(t *testing.T, ctx context.Context, kube c
 		}
 		if err := kube.Get(ctx, key, cluster); err != nil {
 			t.Fatal(err)
+		}
+		if cluster.Status.Operation == nil {
+			t.Fatalf("synthetic plan operation missing: status=%+v", cluster.Status)
 		}
 		run := &tektonv1.PipelineRun{}
 		if err := kube.Get(ctx, types.NamespacedName{Namespace: runtimeContractNamespace, Name: cluster.Status.Operation.PipelineRunName}, run); err != nil {
@@ -599,6 +637,19 @@ func contractResolvedOptions(name string) *servitorv1alpha1.ResolvedOptions {
 	}
 }
 
+func runtimeContractNetworkBindings() map[string]servitorv1alpha1.FrozenNetwork {
+	return map[string]servitorv1alpha1.FrozenNetwork{
+		"target": {
+			BindingID:       "runtime-contract-network",
+			AccountID:       "runtime-contract-account",
+			VPCID:           "vpc",
+			SubnetID:        "subnet",
+			PublicGatewayID: "gateway",
+			Zone:            "us-south-1",
+		},
+	}
+}
+
 func contractLifecycleSnapshot(publicAuth bool) *servitorv1alpha1.LifecycleSnapshot {
 	return &servitorv1alpha1.LifecycleSnapshot{InitialLeaseSeconds: 3600, RetrySeconds: []int64{60}, PublicAuthEligible: publicAuth}
 }
@@ -610,7 +661,7 @@ func contractRecovery(clusterName string) *servitorv1alpha1.RecoveryMetadata {
 		Endpoints: map[string]string{
 			"IAM": "https://iam.example.invalid", "ContainerService": "https://containers.example.invalid", "GlobalTagging": "https://tagging.example.invalid", "ResourceManagement": "https://management.example.invalid", "ResourceController": "https://controller.example.invalid", "VPC": "https://vpc.example.invalid",
 		},
-		Values:       servitorv1alpha1.RecoveryValues{ClusterName: clusterName, ResourceGroupName: "Default", Region: "us-south", ClusterMode: "vpc", Platform: "openshift", KubeVersion: "4.22_openshift", WorkerCount: 1, Zone: "us-south-1", Flavor: "bx2.4x16"},
+		Values:       servitorv1alpha1.RecoveryValues{ClusterName: clusterName, ResourceGroupName: "Default", Region: "us-south", ClusterMode: "vpc", Platform: "openshift", KubeVersion: "4.22_openshift", WorkerCount: 1, Zone: "us-south-1", Flavor: "bx2.4x16", VPCID: "vpc", SubnetIDs: []string{"subnet"}, PublicGatewayIDs: []string{"gateway"}},
 		TFVarsSHA256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
 	}
 }
@@ -657,6 +708,62 @@ func installControllerRBAC(t *testing.T, ctx context.Context, kube client.Client
 	}
 	if err := kube.Create(ctx, binding); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func verifyRemovedNetworkUserOptionsRejected(t *testing.T, ctx context.Context, config *rest.Config, namespace string) {
+	t.Helper()
+	clusters, err := dynamic.NewForConfig(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resources := clusters.Resource(schema.GroupVersionResource{
+		Group: "servitor.bevicted.github.io", Version: "v1alpha1", Resource: "servitorclusters",
+	}).Namespace(namespace)
+	for _, test := range []struct {
+		name  string
+		field string
+		value any
+	}{
+		{name: "vpc-id", field: "vpcID", value: "untrusted-vpc"},
+		{name: "subnet-ids", field: "subnetIDs", value: []any{"untrusted-subnet"}},
+		{name: "public-gateway-ids", field: "publicGatewayIDs", value: []any{"untrusted-gateway"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			options := map[string]any{"version": "4.22", test.field: test.value}
+			cluster := &unstructured.Unstructured{Object: map[string]any{
+				"apiVersion": "servitor.bevicted.github.io/v1alpha1",
+				"kind":       "ServitorCluster",
+				"metadata":   map[string]any{"name": "reject-" + test.name},
+				"spec": map[string]any{
+					"slack":       map[string]any{"ownerID": "U1", "channelID": "C1", "threadTimestamp": "1.2"},
+					"userOptions": options,
+					"lifecycle":   map[string]any{"initialLeaseSeconds": int64(3600), "retrySeconds": []any{int64(60)}},
+				},
+			}}
+			_, err := resources.Create(ctx, cluster, metav1.CreateOptions{FieldValidation: metav1.FieldValidationStrict})
+			if !apierrors.IsBadRequest(err) {
+				t.Fatalf("strict direct CR with %s create error = %v, want bad request", test.field, err)
+			}
+			if _, err := resources.Get(ctx, cluster.GetName(), metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+				t.Fatalf("strict direct CR with %s was stored: %v", test.field, err)
+			}
+
+			cluster.SetName("pruned-" + test.name)
+			if _, err := resources.Create(ctx, cluster, metav1.CreateOptions{}); err != nil {
+				t.Fatalf("permissive direct CR with %s create error = %v", test.field, err)
+			}
+			stored, err := resources.Get(ctx, cluster.GetName(), metav1.GetOptions{})
+			if err != nil {
+				t.Fatalf("get permissive direct CR with %s: %v", test.field, err)
+			}
+			if _, found, err := unstructured.NestedFieldNoCopy(stored.Object, "spec", "userOptions", test.field); err != nil || found {
+				t.Fatalf("pruned user option %s persisted: found=%t err=%v", test.field, found, err)
+			}
+			if err := resources.Delete(ctx, cluster.GetName(), metav1.DeleteOptions{}); err != nil {
+				t.Fatalf("delete permissive direct CR with %s: %v", test.field, err)
+			}
+		})
 	}
 }
 

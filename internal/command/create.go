@@ -10,20 +10,18 @@ import (
 
 // CreateDefaults are operator-controlled values supplied to every create.
 type CreateDefaults struct {
-	Version, Target, Provider, ResourceGroup, Zone, VPCID string
-	OpenShiftFlavor, KubernetesFlavor                     string
+	Version, Target, Provider, ResourceGroup string
+	OpenShiftFlavor, KubernetesFlavor        string
 }
 
 // CreateRequest is the validated, shell-free provisioning option vector.
 type CreateRequest struct {
-	Target, Platform, Version, Provider, ResourceGroup      string
-	WorkerShape, WorkerCount                                string
-	Location, Zone, Datacenter                              string
-	SatelliteZones                                          []string
-	VPCID, PublicVLANID, PrivateVLANID, SatelliteLocationID string
-	SubnetIDs, PublicGatewayIDs                             []string
-	ReuseVPC, ReuseSubnet, ReuseGateway                     bool
-	Args                                                    []string
+	Target, Platform, Version, Provider, ResourceGroup string
+	WorkerShape, WorkerCount                           string
+	Location, Zone, Datacenter                         string
+	SatelliteZones                                     []string
+	PublicVLANID, PrivateVLANID, SatelliteLocationID   string
+	Args                                               []string
 }
 
 func normalizedLocation(provider, zone, datacenter string, satelliteZones []string) string {
@@ -44,15 +42,14 @@ func normalizedLocation(provider, zone, datacenter string, satelliteZones []stri
 
 var createFlags = map[string]bool{
 	"--target": true, "--provider": true, "--version": true,
-	"--resource-group": true, "--zone": true, "--flavor": true, "--vpc-id": true,
-	"--subnet-id": true, "--public-gateway-id": true, "--datacenter": true,
+	"--resource-group": true, "--zone": true, "--flavor": true, "--datacenter": true,
 	"--machine-type": true, "--public-vlan-id": true, "--private-vlan-id": true,
 	"--satellite-zone": true, "--satellite-managed-from": true, "--satellite-location-id": true,
 	"--satellite-host-image": true, "--satellite-host-profile": true,
 	"--satellite-ssh-key-id": true, "--satellite-worker-instance-id": true,
 	"--satellite-worker-operating-system": true, "--worker-count": true,
 }
-var repeatableCreateFlags = map[string]bool{"--subnet-id": true, "--public-gateway-id": true, "--satellite-zone": true, "--satellite-worker-instance-id": true}
+var repeatableCreateFlags = map[string]bool{"--satellite-zone": true, "--satellite-worker-instance-id": true}
 var forbiddenCreateFlags = map[string]bool{"--config": true, "--owner": true, "--prefix": true, "--auto-approve": true, "--confirm-stdin": true, "--satellite-ssh-public-key": true}
 
 var numericVersion = regexp.MustCompile(`^[0-9]+\.[0-9]+(?:\.[0-9]+)?(?:_openshift)?$`)
@@ -230,15 +227,13 @@ func ResolveCreateOptions(options ExplicitCreateOptions, defaults CreateDefaults
 	setDefault("--provider", defaults.Provider)
 	setDefault("--resource-group", defaults.ResourceGroup)
 	if one(values, "--provider") == "vpc-gen2" {
-		setDefault("--zone", defaults.Zone)
-		setDefault("--vpc-id", defaults.VPCID)
 		if platform == "openshift" {
 			setDefault("--flavor", defaults.OpenShiftFlavor)
 		} else {
 			setDefault("--flavor", defaults.KubernetesFlavor)
 		}
 	}
-	ordered := []string{"--target", "--provider", "--platform", "--version", "--resource-group", "--zone", "--flavor", "--vpc-id", "--subnet-id", "--public-gateway-id", "--datacenter", "--machine-type", "--public-vlan-id", "--private-vlan-id", "--satellite-zone", "--satellite-managed-from", "--satellite-location-id", "--satellite-host-image", "--satellite-host-profile", "--satellite-ssh-key-id", "--satellite-worker-instance-id", "--satellite-worker-operating-system", "--worker-count"}
+	ordered := []string{"--target", "--provider", "--platform", "--version", "--resource-group", "--zone", "--flavor", "--datacenter", "--machine-type", "--public-vlan-id", "--private-vlan-id", "--satellite-zone", "--satellite-managed-from", "--satellite-location-id", "--satellite-host-image", "--satellite-host-profile", "--satellite-ssh-key-id", "--satellite-worker-instance-id", "--satellite-worker-operating-system", "--worker-count"}
 	args := make([]string, 0, len(values)*2+12)
 	for _, flag := range ordered {
 		for _, value := range values[flag] {
@@ -256,15 +251,9 @@ func ResolveCreateOptions(options ExplicitCreateOptions, defaults CreateDefaults
 		Zone:                one(values, "--zone"),
 		Datacenter:          one(values, "--datacenter"),
 		SatelliteZones:      append([]string(nil), values["--satellite-zone"]...),
-		VPCID:               one(values, "--vpc-id"),
 		PublicVLANID:        one(values, "--public-vlan-id"),
 		PrivateVLANID:       one(values, "--private-vlan-id"),
 		SatelliteLocationID: one(values, "--satellite-location-id"),
-		SubnetIDs:           append([]string(nil), values["--subnet-id"]...),
-		PublicGatewayIDs:    append([]string(nil), values["--public-gateway-id"]...),
-		ReuseVPC:            one(values, "--vpc-id") != "",
-		ReuseSubnet:         len(values["--subnet-id"]) != 0,
-		ReuseGateway:        len(values["--public-gateway-id"]) != 0,
 		Location:            normalizedLocation(one(values, "--provider"), one(values, "--zone"), one(values, "--datacenter"), values["--satellite-zone"]),
 		Args:                args,
 	}, nil

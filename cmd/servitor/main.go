@@ -99,12 +99,18 @@ func controllerConfig(operator config.Config) (controller.Config, error) {
 	if _, err := command.InferPlatform(operator.Defaults.Version); err != nil {
 		return controller.Config{}, fmt.Errorf("resolve controller startup defaults: %w", err)
 	}
+	networkBindings := make(map[string]servitorv1alpha1.FrozenNetwork, len(operator.Network.TargetBindings))
+	for target, bindingID := range operator.Network.TargetBindings {
+		binding := operator.Network.Bindings[bindingID]
+		networkBindings[target] = servitorv1alpha1.FrozenNetwork{BindingID: bindingID, AccountID: binding.AccountID, VPCID: binding.VPCID, SubnetID: binding.SubnetID, PublicGatewayID: binding.PublicGatewayID, Zone: binding.Zone}
+	}
 	return controller.Config{
 		Namespace: operator.Namespace,
 		Defaults: servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{
 			Version: operator.Defaults.Version, Target: operator.Defaults.Target, Provider: operator.Defaults.Provider,
-			ResourceGroup: operator.Defaults.ResourceGroup, Zone: operator.Defaults.Zone, VPCID: operator.Defaults.VPCID,
+			ResourceGroup: operator.Defaults.ResourceGroup,
 		}},
+		NetworkBindings: networkBindings,
 		Backend: servitorv1alpha1.BackendIdentity{
 			Version: 1, Bucket: operator.COS.Bucket, Region: operator.COS.Region, Endpoint: operator.COS.Endpoint,
 			SkipCredentialsValidation: operator.COS.SkipCredentialsValidation, SkipMetadataAPICheck: operator.COS.SkipMetadataAPICheck,
@@ -138,7 +144,7 @@ type allocationClient struct {
 func (c allocationClient) AllocationReader() client.Reader { return c.reader }
 
 func commandDefaults(operator config.Config) command.CreateDefaults {
-	return command.CreateDefaults{Version: operator.Defaults.Version, Target: operator.Defaults.Target, Provider: operator.Defaults.Provider, ResourceGroup: operator.Defaults.ResourceGroup, Zone: operator.Defaults.Zone, VPCID: operator.Defaults.VPCID, OpenShiftFlavor: operator.Defaults.OpenShiftFlavor, KubernetesFlavor: operator.Defaults.KubernetesFlavor}
+	return command.CreateDefaults{Version: operator.Defaults.Version, Target: operator.Defaults.Target, Provider: operator.Defaults.Provider, ResourceGroup: operator.Defaults.ResourceGroup, OpenShiftFlavor: operator.Defaults.OpenShiftFlavor, KubernetesFlavor: operator.Defaults.KubernetesFlavor}
 }
 
 func newSlackBot(operator config.Config, kube client.Client, reader client.Reader, responder slackbot.Responder, permalinks slackbot.PermalinkLookup) slackbot.Bot {

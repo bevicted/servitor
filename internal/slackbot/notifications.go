@@ -368,23 +368,10 @@ func networkDescription(options *servitorv1alpha1.ResolvedOptions) string {
 		}
 		return "Satellite networking"
 	default:
-		parts := make([]string, 0, 3)
-		if options.VPCID != "" {
-			parts = append(parts, "reuse VPC "+options.VPCID)
-		} else {
-			parts = append(parts, "create VPC")
+		if options.Network.BindingID == "" {
+			return "network binding unavailable"
 		}
-		if len(options.SubnetIDs) > 0 {
-			parts = append(parts, "reuse subnet")
-		} else {
-			parts = append(parts, "create subnet")
-		}
-		if len(options.PublicGatewayIDs) > 0 {
-			parts = append(parts, "reuse gateway")
-		} else {
-			parts = append(parts, "create gateway")
-		}
-		return strings.Join(parts, "; ")
+		return "operator-managed existing network"
 	}
 }
 

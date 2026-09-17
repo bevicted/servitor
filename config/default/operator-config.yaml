@@ -1,40 +1,48 @@
 # Non-secret deployment inputs. Edit these values or generate this ConfigMap in an overlay.
 namespace: servitor
 slack:
-  channel_id: C_REPLACE_ME
-  # Up to this many active per-thread allocations per user. Zero uses default 3; restart after changing it.
-  max_allocations_per_user: 3
-  # Optional exact Slack user IDs allowed to run `refresh inventory` in a DM.
-  maintainer_ids: []
+    channel_id: C_REPLACE_ME
+    # Up to this many active per-thread allocations per user. Zero uses default 3; restart after changing it.
+    max_allocations_per_user: 3
+    # Optional exact Slack user IDs allowed to run `refresh inventory` in a DM.
+    maintainer_ids: []
 defaults:
-  version: "4.22"
-  target: REPLACE_ME
-  provider: vpc-gen2
-  resource_group: Default
-  zone: us-south-1
-  vpc_id: REPLACE_ME
-  openshift_flavor: bx2.4x16
-  kubernetes_flavor: bx2.2x8
+    version: "4.22"
+    target: replace-me
+    provider: vpc-gen2
+    resource_group: Default
+    openshift_flavor: bx2.4x16
+    kubernetes_flavor: bx2.2x8
+network:
+    bindings:
+        synthetic-existing-network:
+            account_id: synthetic-account
+            vpc_id: synthetic-vpc-id
+            subnet_id: synthetic-subnet-id
+            public_gateway_id: synthetic-gateway-id
+            zone: us-south-1
+    target_bindings:
+        replace-me: synthetic-existing-network
 lifecycle:
-  confirmation_timeout: 5m
-  lease: 4h
-  retry_intervals: [1m, 5m, 15m]
+    confirmation_timeout: 5m
+    lease: 4h
+    retry_intervals: [1m, 5m, 15m]
 # The leader creates missing target snapshots, refreshes them hourly, and
 # retains only last-good data for at most this usable age.
 inventory:
-  refresh_interval: 1h
-  maximum_age: 24h
+    refresh_interval: 1h
+    maximum_age: 24h
 # ICT and Secret resource names are supplied by operator-references.env in this ConfigMap.
 cos:
-  endpoint: https://s3.us-south.cloud-object-storage.appdomain.cloud
-  bucket: REPLACE_ME
-  region: us-south
-  key_prefix: servitor
-  skip_credentials_validation: true
-  skip_metadata_api_check: true
-  skip_region_validation: true
-  skip_requesting_account_id: true
-  force_path_style: true
-  use_lockfile: false
+    endpoint: https://s3.us-south.cloud-object-storage.appdomain.cloud
+    bucket: REPLACE_ME
+    region: us-south
+    key_prefix: servitor
+    skip_credentials_validation: true
+    skip_metadata_api_check: true
+    skip_region_validation: true
+    skip_requesting_account_id: true
+    force_path_style: true
+    use_lockfile: false
 images:
-  execution: registry.example.invalid/servitor-task@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    execution: registry.example.invalid/servitor-task@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa

@@ -271,6 +271,9 @@ func run(ctx context.Context, uid, operation, kind, optionsFile, backendFile, re
 }
 
 func runPlan(ctx context.Context, uid, operation string, options servitorv1alpha1.ResolvedOptions, backendFile, resultFile, reportFile, ictPath, terraformPath, planningInventoryConfig, apiKey string) error {
+	if err := validateFrozenNetwork(options); err != nil {
+		return err
+	}
 	if options.Provider == "satellite" {
 		return writeReport(reportFile, pipeline.Report{Version: 1, ClusterUID: uid, OperationID: operation, PlanRejection: &servitorv1alpha1.PlanRejection{ReasonCode: "provider_not_supported", OptionKey: "provider"}})
 	}
@@ -303,8 +306,14 @@ func runPlan(ctx context.Context, uid, operation string, options servitorv1alpha
 	if err != nil {
 		return fmt.Errorf("sanitize Terraform plan: %w", err)
 	}
+	if err := rejectManagedNetworkPlan(plan); err != nil {
+		return err
+	}
 	options, err = resolvedOptionsFromValues(options, result.Values)
 	if err != nil {
+		return err
+	}
+	if err := validateRecoveredNetwork(options, result.Values); err != nil {
 		return err
 	}
 	recoveryOptions, err := resolvedOptionsFromValues(options, result.Recovery.Values)
@@ -313,6 +322,9 @@ func runPlan(ctx context.Context, uid, operation string, options servitorv1alpha
 	}
 	if recoveryOptions.Version != options.Version || recoveryOptions.Platform != options.Platform {
 		return errors.New("ICT recovery values are inconsistent with planning result")
+	}
+	if err := validateRecoveredNetwork(options, result.Recovery.Values); err != nil {
+		return err
 	}
 	recovery := servitorv1alpha1.RecoveryMetadata{Version: result.Recovery.Version, Target: result.Recovery.Target, Endpoints: result.Recovery.Endpoints, Values: result.Recovery.Values, SatelliteSSHPublicKeyFingerprint: result.Recovery.SatelliteSSHPublicKeyFingerprint, TFVarsSHA256: result.Recovery.TFVarsSHA256}
 	return writeReport(reportFile, pipeline.Report{Version: 1, ClusterUID: uid, OperationID: operation, ResolvedOptions: options, Recovery: recovery, Review: summaryFromPlan(plan)})
@@ -459,6 +471,9 @@ func selectedSatelliteRegion(zones []string) string {
 }
 
 func runApply(ctx context.Context, uid, operation string, options servitorv1alpha1.ResolvedOptions, backendFile, recoveryFile, resultFile, reportFile, ictPath, terraformPath string, publicAuthEligible bool, authManifestFile, authOutputDir string) error {
+	if err := validateFrozenNetwork(options); err != nil {
+		return err
+	}
 	if options.Provider == "satellite" {
 		return errors.New("Satellite provisioning is not supported")
 	}
@@ -466,13 +481,51 @@ func runApply(ctx context.Context, uid, operation string, options servitorv1alph
 	if err != nil {
 		return err
 	}
+	if err := recovery.Validate(); err != nil {
+		return errors.New("frozen recovery metadata is invalid")
+	}
+	if err := validateRecoveredNetwork(options, recovery.Values); err != nil {
+		return err
+	}
+	if publicAuthEligible && (!filepath.IsAbs(authManifestFile) || !filepath.IsAbs(authOutputDir)) {
+		return errors.New("public auth paths must be absolute")
+	}
 	applyCtx, cancel := context.WithTimeout(ctx, applyTimeout)
 	defer cancel()
+	freshPlanFile := filepath.Join(filepath.Dir(resultFile), "fresh-plan.json")
+	reviewArgs := []string{"review", operation, "--context-file", contextFile, "--backend-config", backendFile, "--result-file", freshPlanFile}
+	review, err := (command.Runner{MaxOutput: 64 * 1024, Stdout: os.Stdout, Stderr: os.Stderr, Log: os.Stderr}).Run(applyCtx, ictPath, reviewArgs...)
+	if err != nil {
+		return err
+	}
+	if review.StdoutTruncated || review.StderrTruncated {
+		return errors.New("ICT fresh plan review output exceeded limit")
+	}
+	fresh, err := readJSON[ictPlanResult](freshPlanFile)
+	if err != nil || fresh.Version != 1 || fresh.StateID != operation || !filepath.IsAbs(fresh.PlanPath) {
+		return errors.New("ICT produced no valid fresh planning result")
+	}
+	if err := validateRecoveredNetwork(options, fresh.Values); err != nil {
+		return err
+	}
+	if err := validateRecoveredNetwork(options, fresh.Recovery.Values); err != nil {
+		return err
+	}
+	workspace := filepath.Dir(filepath.Dir(fresh.PlanPath))
+	planPath := filepath.Join(filepath.Base(filepath.Dir(fresh.PlanPath)), filepath.Base(fresh.PlanPath))
+	shown, err := (command.Runner{MaxOutput: maxTerraformShowBytes}).Run(applyCtx, terraformPath, "-chdir="+workspace, "show", "-json", planPath)
+	if err != nil || shown.StdoutTruncated {
+		return errors.New("cannot obtain bounded Terraform fresh plan review")
+	}
+	plan, err := terraformview.ParsePlan([]byte(shown.Stdout))
+	if err != nil {
+		return fmt.Errorf("sanitize Terraform fresh plan: %w", err)
+	}
+	if err := rejectManagedNetworkPlan(plan); err != nil {
+		return err
+	}
 	args := []string{"apply", operation, "--context-file", contextFile, "--backend-config", backendFile, "--result-file", resultFile, "--auto-approve"}
 	if publicAuthEligible {
-		if !filepath.IsAbs(authManifestFile) || !filepath.IsAbs(authOutputDir) {
-			return errors.New("public auth paths must be absolute")
-		}
 		args = append(args, "--auth-manifest-file", authManifestFile, "--auth-output-dir", authOutputDir)
 	}
 	if _, err := (command.Runner{MaxOutput: 64 * 1024, Stdout: os.Stdout, Stderr: os.Stderr, Log: os.Stderr}).Run(applyCtx, ictPath, args...); err != nil {
@@ -482,13 +535,16 @@ func runApply(ctx context.Context, uid, operation string, options servitorv1alph
 	if err != nil || result.Version != 1 || result.Operation != "apply" || !filepath.IsAbs(result.Workspace) {
 		return errors.New("ICT produced no valid apply result")
 	}
-	shown, err := (command.Runner{MaxOutput: maxTerraformShowBytes}).Run(applyCtx, terraformPath, "-chdir="+result.Workspace, "show", "-json")
+	shown, err = (command.Runner{MaxOutput: maxTerraformShowBytes}).Run(applyCtx, terraformPath, "-chdir="+result.Workspace, "show", "-json")
 	if err != nil || shown.StdoutTruncated {
 		return errors.New("cannot obtain bounded Terraform ready summary")
 	}
 	state, err := terraformview.ParseState([]byte(shown.Stdout))
 	if err != nil {
 		return fmt.Errorf("sanitize Terraform state: %w", err)
+	}
+	if err := rejectManagedNetworkResources(state.Resources); err != nil {
+		return err
 	}
 	report := pipeline.Report{Version: 1, ClusterUID: uid, OperationID: operation, ResolvedOptions: options, Recovery: recovery, Ready: summaryFromState(state)}
 	if publicAuthEligible {
@@ -592,6 +648,48 @@ func summaryFromState(state terraformview.State) servitorv1alpha1.ReadySummary {
 	return summary
 }
 
+func validateFrozenNetwork(options servitorv1alpha1.ResolvedOptions) error {
+	if options.Provider != "vpc-gen2" {
+		if options.Provider == "classic" && options.Network != (servitorv1alpha1.FrozenNetwork{}) {
+			return errors.New("Classic options must not contain VPC networking")
+		}
+		return nil
+	}
+	network := options.Network
+	if network.BindingID == "" || network.AccountID == "" || network.VPCID == "" || network.SubnetID == "" || network.PublicGatewayID == "" || network.Zone == "" || options.Zone != network.Zone {
+		return errors.New("VPC options require one frozen existing network binding")
+	}
+	return nil
+}
+
+func validateRecoveredNetwork(options servitorv1alpha1.ResolvedOptions, values servitorv1alpha1.RecoveryValues) error {
+	if options.Provider != "vpc-gen2" {
+		return nil
+	}
+	network := options.Network
+	if values.VPCID != network.VPCID || values.Zone != network.Zone || len(values.SubnetIDs) != 1 || values.SubnetIDs[0] != network.SubnetID || len(values.PublicGatewayIDs) != 1 || values.PublicGatewayIDs[0] != network.PublicGatewayID {
+		return errors.New("ICT network values do not match the frozen existing network binding")
+	}
+	return nil
+}
+
+func rejectManagedNetworkPlan(plan terraformview.Plan) error {
+	return rejectManagedNetworkResources(plan.Resources)
+}
+
+func rejectManagedNetworkResources(resources []terraformview.Resource) error {
+	for _, resource := range resources {
+		if resource.Mode != "managed" {
+			continue
+		}
+		switch resource.Type {
+		case "ibm_is_vpc", "ibm_is_subnet", "ibm_is_public_gateway", "ibm_is_public_gateways", "ibm_is_subnet_public_gateway_attachment":
+			return errors.New("Terraform plan attempts to manage shared VPC networking")
+		}
+	}
+	return nil
+}
+
 func resolvedOptionsFromValues(options servitorv1alpha1.ResolvedOptions, values servitorv1alpha1.RecoveryValues) (servitorv1alpha1.ResolvedOptions, error) {
 	provider := map[string]string{"vpc": "vpc-gen2", "classic": "classic", "satellite": "satellite"}[values.ClusterMode]
 	if provider == "" {
@@ -608,13 +706,10 @@ func resolvedOptionsFromValues(options servitorv1alpha1.ResolvedOptions, values 
 		ResourceGroup:                  values.ResourceGroupName,
 		Zone:                           values.Zone,
 		Flavor:                         values.Flavor,
-		VPCID:                          values.VPCID,
 		Datacenter:                     values.Datacenter,
 		MachineType:                    values.MachineType,
 		PublicVLANID:                   values.PublicVLANID,
 		PrivateVLANID:                  values.PrivateVLANID,
-		SubnetIDs:                      append([]string(nil), values.SubnetIDs...),
-		PublicGatewayIDs:               append([]string(nil), values.PublicGatewayIDs...),
 		SatelliteZones:                 append([]string(nil), values.SatelliteZones...),
 		SatelliteManagedFrom:           values.SatelliteManagedFrom,
 		SatelliteLocationID:            values.SatelliteLocationID,
@@ -646,7 +741,6 @@ func optionArgs(options servitorv1alpha1.ResolvedOptions) []string {
 	add("--resource-group", o.ResourceGroup)
 	add("--zone", o.Zone)
 	add("--flavor", o.Flavor)
-	add("--vpc-id", o.VPCID)
 	add("--datacenter", o.Datacenter)
 	add("--machine-type", o.MachineType)
 	add("--public-vlan-id", o.PublicVLANID)
@@ -657,11 +751,10 @@ func optionArgs(options servitorv1alpha1.ResolvedOptions) []string {
 	add("--satellite-host-profile", o.SatelliteHostProfile)
 	add("--satellite-ssh-key-id", o.SatelliteSSHKeyID)
 	add("--satellite-worker-operating-system", o.SatelliteWorkerOperatingSystem)
-	for _, value := range o.SubnetIDs {
-		add("--subnet-id", value)
-	}
-	for _, value := range o.PublicGatewayIDs {
-		add("--public-gateway-id", value)
+	if options.Provider == "vpc-gen2" {
+		add("--vpc-id", options.Network.VPCID)
+		add("--subnet-id", options.Network.SubnetID)
+		add("--public-gateway-id", options.Network.PublicGatewayID)
 	}
 	for _, value := range o.SatelliteZones {
 		add("--satellite-zone", value)

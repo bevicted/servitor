@@ -360,11 +360,10 @@ func TestCreateAutoApprovePersistsImmutableIntentAndEarlyYesDoesNotMutate(t *tes
 func TestHandleCreateNormalizesAssignmentsWithoutDefaults(t *testing.T) {
 	want := servitorv1alpha1.UserOptions{
 		Target: "synthetic-target", Version: "4.22", ResourceGroup: "Platform Team=Core", WorkerCount: 3,
-		SubnetIDs: []string{"subnet-one", "subnet-two"},
 	}
 	bot, responses := botForTest(t)
-	bot.Defaults = command.CreateDefaults{Provider: "vpc-gen2", Zone: "operator-zone"}
-	event := Envelope{ID: "assignments", Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: `<@BOT> create target=synthetic-target version=4.22 resource-group="Platform Team=Core" worker-count=3 subnet-id=subnet-one subnet-id=subnet-two`, Timestamp: "123"}}
+	bot.Defaults = command.CreateDefaults{Provider: "vpc-gen2"}
+	event := Envelope{ID: "assignments", Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: `<@BOT> create target=synthetic-target version=4.22 resource-group="Platform Team=Core" worker-count=3`, Timestamp: "123"}}
 	if err := bot.Handle(context.Background(), event); err != nil {
 		t.Fatal(err)
 	}
@@ -1485,7 +1484,7 @@ func botWithPublishedInventory(t *testing.T, expired bool) (Bot, *memoryResponde
 	bot, responses := botForTest(t, configMap)
 	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
 	bot.Clock = func() time.Time { return now }
-	bot.Defaults = command.CreateDefaults{Target: "target-a", Provider: "vpc-gen2", Zone: "us-south-1"}
+	bot.Defaults = command.CreateDefaults{Target: "target-a", Provider: "vpc-gen2"}
 	bot.InventoryConfigMap, bot.InventoryConfigKey, bot.InventoryMaximumAge = "targets", "config.yaml", time.Hour
 	target := inventory.TargetConfig{Providers: []string{"vpc-gen2"}, DefaultRegion: "us-south", Endpoints: inventory.Endpoints{IAM: "https://iam.example.invalid", ContainerService: "https://containers.example.invalid", GlobalTagging: "https://tagging.example.invalid", ResourceManagement: "https://resource-manager.example.invalid", ResourceController: "https://resource-controller.example.invalid", VPC: "https://vpc.{region}.example.invalid"}}
 	revision, err := inventory.Revision(target)

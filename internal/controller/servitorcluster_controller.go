@@ -44,6 +44,7 @@ type Config struct {
 	OpenShiftFlavor   string
 	KubernetesFlavor  string
 	PublicAuthTargets []string
+	NetworkBindings   map[string]servitorv1alpha1.FrozenNetwork
 }
 
 // Reconciler is the sole status writer for ServitorCluster.
@@ -587,6 +588,9 @@ func (r *Reconciler) adoptReport(ctx context.Context, cluster *servitorv1alpha1.
 		return r.requestCleanup(ctx, cluster, servitorv1alpha1.CleanupReasonPlanningFailed)
 	}
 	if cluster.Status.Operation.Kind == "plan" {
+		if cluster.Status.ResolvedOptions == nil || !sameFrozenNetwork(cluster.Status.ResolvedOptions.Network, report.ResolvedOptions.Network) || !networkMatchesRecovery(cluster.Status.ResolvedOptions, report.Recovery.Values) {
+			return r.unresolved(ctx, cluster, "InvalidReport", errors.New("planning report does not match the frozen network binding"))
+		}
 		cluster.Status.ResolvedOptions = &report.ResolvedOptions
 		cluster.Status.Recovery = &report.Recovery
 		cluster.Status.Review = &report.Review
@@ -597,6 +601,9 @@ func (r *Reconciler) adoptReport(ctx context.Context, cluster *servitorv1alpha1.
 		cluster.Status.ReviewApproval = cluster.Spec.Lifecycle.Approval
 		setCondition(cluster, "PlanningSucceeded", metav1.ConditionTrue, "ReportAdopted", "validated planning report adopted")
 	} else {
+		if cluster.Status.ResolvedOptions == nil || !sameFrozenNetwork(cluster.Status.ResolvedOptions.Network, report.ResolvedOptions.Network) || !networkMatchesRecovery(cluster.Status.ResolvedOptions, report.Recovery.Values) {
+			return r.unresolved(ctx, cluster, "InvalidReport", errors.New("apply report does not match the frozen network binding"))
+		}
 		eligible := cluster.Status.LifecycleSnapshot != nil && cluster.Status.LifecycleSnapshot.PublicAuthEligible
 		if eligible != (report.PublicAuth != nil) {
 			return r.unresolved(ctx, cluster, "InvalidReport", errors.New("public auth report does not match the frozen eligibility policy"))
@@ -630,6 +637,17 @@ func (r *Reconciler) snapshot(cluster *servitorv1alpha1.ServitorCluster) error {
 		return fmt.Errorf("infer platform: %w", err)
 	}
 	resolved.Platform = platform
+	if resolved.Provider == "vpc-gen2" {
+		network, found := r.Config.NetworkBindings[resolved.Target]
+		if !found || !validFrozenNetwork(network) {
+			return errors.New("no configured existing network binding for target")
+		}
+		if resolved.Zone != "" && resolved.Zone != network.Zone {
+			return errors.New("requested zone is not configured for the selected network binding")
+		}
+		resolved.Zone = network.Zone
+		resolved.Network = network
+	}
 	if resolved.Provider == "vpc-gen2" && resolved.Flavor == "" {
 		if resolved.Platform == "openshift" {
 			resolved.Flavor = r.Config.OpenShiftFlavor
@@ -638,7 +656,7 @@ func (r *Reconciler) snapshot(cluster *servitorv1alpha1.ServitorCluster) error {
 		}
 	}
 	if resolved.Provider == "classic" {
-		resolved.VPCID = ""
+		resolved.Network = servitorv1alpha1.FrozenNetwork{}
 	}
 	cluster.Status.ResolvedOptions = &resolved
 	cluster.Status.LifecycleSnapshot = &servitorv1alpha1.LifecycleSnapshot{
@@ -654,6 +672,22 @@ func (r *Reconciler) snapshot(cluster *servitorv1alpha1.ServitorCluster) error {
 	cluster.Status.ExecutionImage = r.Config.ExecutionImage
 	cluster.Status.Phase = servitorv1alpha1.PhasePending
 	return nil
+}
+
+func sameFrozenNetwork(left, right servitorv1alpha1.FrozenNetwork) bool {
+	return left == right
+}
+
+func networkMatchesRecovery(options *servitorv1alpha1.ResolvedOptions, values servitorv1alpha1.RecoveryValues) bool {
+	if options.Provider != "vpc-gen2" {
+		return options.Network == (servitorv1alpha1.FrozenNetwork{})
+	}
+	network := options.Network
+	return validFrozenNetwork(network) && values.Zone == network.Zone && values.VPCID == network.VPCID && len(values.SubnetIDs) == 1 && values.SubnetIDs[0] == network.SubnetID && len(values.PublicGatewayIDs) == 1 && values.PublicGatewayIDs[0] == network.PublicGatewayID
+}
+
+func validFrozenNetwork(network servitorv1alpha1.FrozenNetwork) bool {
+	return network.BindingID != "" && network.AccountID != "" && network.VPCID != "" && network.SubnetID != "" && network.PublicGatewayID != "" && network.Zone != ""
 }
 
 func matchesLifecycleSnapshot(policy servitorv1alpha1.LifecyclePolicy, snapshot servitorv1alpha1.LifecycleSnapshot) bool {
@@ -733,9 +767,6 @@ func overlay(dst *servitorv1alpha1.UserOptions, supplied servitorv1alpha1.UserOp
 	if supplied.Flavor != "" {
 		dst.Flavor = supplied.Flavor
 	}
-	if supplied.VPCID != "" {
-		dst.VPCID = supplied.VPCID
-	}
 	if supplied.Datacenter != "" {
 		dst.Datacenter = supplied.Datacenter
 	}
@@ -768,12 +799,6 @@ func overlay(dst *servitorv1alpha1.UserOptions, supplied servitorv1alpha1.UserOp
 	}
 	if supplied.WorkerCount != 0 {
 		dst.WorkerCount = supplied.WorkerCount
-	}
-	if supplied.SubnetIDs != nil {
-		dst.SubnetIDs = append([]string(nil), supplied.SubnetIDs...)
-	}
-	if supplied.PublicGatewayIDs != nil {
-		dst.PublicGatewayIDs = append([]string(nil), supplied.PublicGatewayIDs...)
 	}
 	if supplied.SatelliteZones != nil {
 		dst.SatelliteZones = append([]string(nil), supplied.SatelliteZones...)

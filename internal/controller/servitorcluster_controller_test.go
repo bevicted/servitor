@@ -40,8 +40,12 @@ func validRecoveryMetadata() servitorv1alpha1.RecoveryMetadata {
 		Endpoints: map[string]string{
 			"IAM": "https://iam.example.invalid", "ContainerService": "https://containers.example.invalid", "GlobalTagging": "https://tagging.example.invalid", "ResourceManagement": "https://management.example.invalid", "ResourceController": "https://controller.example.invalid", "VPC": "https://vpc.example.invalid",
 		},
-		Values: servitorv1alpha1.RecoveryValues{ClusterName: "cluster", ResourceGroupName: "Default", Region: "us-south", ClusterMode: "vpc", Platform: "openshift", KubeVersion: "4.22_openshift", WorkerCount: 2, Zone: "us-south-1", Flavor: "bx2.4x16"},
+		Values: servitorv1alpha1.RecoveryValues{ClusterName: "cluster", ResourceGroupName: "Default", Region: "us-south", ClusterMode: "vpc", Platform: "openshift", KubeVersion: "4.22_openshift", WorkerCount: 2, Zone: "us-south-1", Flavor: "bx2.4x16", VPCID: "vpc", SubnetIDs: []string{"subnet"}, PublicGatewayIDs: []string{"gateway"}},
 	}
+}
+
+func frozenNetwork() servitorv1alpha1.FrozenNetwork {
+	return servitorv1alpha1.FrozenNetwork{BindingID: "binding", AccountID: "account", VPCID: "vpc", SubnetID: "subnet", PublicGatewayID: "gateway", Zone: "us-south-1"}
 }
 
 func validRecoveryPointer() *servitorv1alpha1.RecoveryMetadata {
@@ -60,7 +64,7 @@ func TestReconcilePersistsOneOperationAndAdoptsMatchingReport(t *testing.T) {
 	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "cluster", Namespace: "ns", UID: "cluster-uid", Generation: 1}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "1.2"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 3600, RetrySeconds: []int64{60}, Approval: "approved"}}}
 	client := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&servitorv1alpha1.ServitorCluster{}, &tektonv1.PipelineRun{}, &tektonv1.TaskRun{}).WithObjects(cluster).Build()
 	now := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
-	reconciler := &Reconciler{Client: client, Scheme: scheme, Config: Config{Namespace: "ns", Defaults: servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Target: "target", Provider: "vpc-gen2", Version: "4.22", ResourceGroup: "Default"}, Platform: "openshift"}, Backend: servitorv1alpha1.BackendIdentity{Version: 1, Bucket: "ict-state-bucket", Region: "us-south", Endpoint: "https://s3.us-south.example.invalid", SkipCredentialsValidation: true, SkipMetadataAPICheck: true, SkipRegionValidation: true, SkipRequestingAccountID: true, ForcePathStyle: true}, BackendPrefix: "servitor", ExecutionImage: "registry.example/ict@sha256:deadbeef", ReviewTimeout: 5 * time.Minute}, Now: func() time.Time { return now }}
+	reconciler := &Reconciler{Client: client, Scheme: scheme, Config: Config{Namespace: "ns", Defaults: servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Target: "target", Provider: "vpc-gen2", Version: "4.22", ResourceGroup: "Default"}, Platform: "openshift"}, NetworkBindings: map[string]servitorv1alpha1.FrozenNetwork{"target": frozenNetwork()}, Backend: servitorv1alpha1.BackendIdentity{Version: 1, Bucket: "ict-state-bucket", Region: "us-south", Endpoint: "https://s3.us-south.example.invalid", SkipCredentialsValidation: true, SkipMetadataAPICheck: true, SkipRegionValidation: true, SkipRequestingAccountID: true, ForcePathStyle: true}, BackendPrefix: "servitor", ExecutionImage: "registry.example/ict@sha256:deadbeef", ReviewTimeout: 5 * time.Minute}, Now: func() time.Time { return now }}
 	request := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "ns", Name: "cluster"}}
 	for i := 0; i < 4; i++ {
 		if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
@@ -131,14 +135,14 @@ func TestSnapshotOmitsVPCDefaultForClassic(t *testing.T) {
 		UserOptions: servitorv1alpha1.UserOptions{Provider: "classic"},
 	}}
 	reconciler := Reconciler{Config: Config{Defaults: servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{
-		Version: "4.22", Provider: "vpc-gen2", VPCID: "default-vpc",
+		Version: "4.22", Provider: "vpc-gen2",
 	}}, OpenShiftFlavor: "bx2.4x16"}}
 
 	if err := reconciler.snapshot(cluster); err != nil {
 		t.Fatal(err)
 	}
 
-	if cluster.Status.ResolvedOptions.Provider != "classic" || cluster.Status.ResolvedOptions.VPCID != "" {
+	if cluster.Status.ResolvedOptions.Provider != "classic" || cluster.Status.ResolvedOptions.Network != (servitorv1alpha1.FrozenNetwork{}) {
 		t.Fatalf("Classic snapshot retained VPC default: %+v", cluster.Status.ResolvedOptions)
 	}
 }
@@ -185,6 +189,7 @@ func TestSnapshotDerivesPlatformAndWorkerDefaultsFromVersion(t *testing.T) {
 			Defaults:         servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Provider: "vpc-gen2", Version: "4.22"}},
 			OpenShiftFlavor:  "bx2.4x16",
 			KubernetesFlavor: "bx2.2x8",
+			NetworkBindings:  map[string]servitorv1alpha1.FrozenNetwork{"": {BindingID: "binding", AccountID: "account", VPCID: "vpc", SubnetID: "subnet", PublicGatewayID: "gateway", Zone: "us-south-1"}},
 		}}
 		if err := reconciler.snapshot(cluster); err != nil {
 			t.Fatal(err)
@@ -202,8 +207,9 @@ func TestReconcileFreezesDerivedStartupDefaults(t *testing.T) {
 	client := fake.NewClientBuilder().WithScheme(cleanupScheme(t)).WithStatusSubresource(&servitorv1alpha1.ServitorCluster{}).WithObjects(cluster).Build()
 	reconciler := cleanupReconciler(client, now)
 	reconciler.Config.Defaults = servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{
-		Version: "4.22", Target: "target", Provider: "vpc-gen2", ResourceGroup: "Default", Zone: "us-south-1", VPCID: "default-vpc",
+		Version: "4.22", Target: "target", Provider: "vpc-gen2", ResourceGroup: "Default",
 	}}
+	reconciler.Config.NetworkBindings = map[string]servitorv1alpha1.FrozenNetwork{"target": {BindingID: "binding", AccountID: "account", VPCID: "default-vpc", SubnetID: "subnet", PublicGatewayID: "gateway", Zone: "us-south-1"}}
 	reconciler.Config.OpenShiftFlavor = "bx2.4x16"
 	reconciler.Config.KubernetesFlavor = "bx2.2x8"
 	request := cleanupRequest()
@@ -216,7 +222,7 @@ func TestReconcileFreezesDerivedStartupDefaults(t *testing.T) {
 	if err := client.Get(context.Background(), request.NamespacedName, stored); err != nil {
 		t.Fatal(err)
 	}
-	if stored.Status.ResolvedOptions == nil || stored.Status.ResolvedOptions.Platform != "openshift" || stored.Status.ResolvedOptions.Flavor != "bx2.4x16" || stored.Status.ResolvedOptions.Zone != "us-south-1" || stored.Status.ResolvedOptions.VPCID != "default-vpc" {
+	if stored.Status.ResolvedOptions == nil || stored.Status.ResolvedOptions.Platform != "openshift" || stored.Status.ResolvedOptions.Flavor != "bx2.4x16" || stored.Status.ResolvedOptions.Zone != "us-south-1" || stored.Status.ResolvedOptions.Network.VPCID != "default-vpc" {
 		t.Fatalf("startup defaults were not fully resolved: %+v", stored.Status.ResolvedOptions)
 	}
 	reconciler.Config.Defaults.Version = "1.31"
@@ -268,7 +274,7 @@ func TestReconcileApprovedApplyUsesFrozenInputsAndAdoptsReadyReport(t *testing.T
 		Spec:       servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "1.2"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 3600, RetrySeconds: []int64{60}}},
 		Status: servitorv1alpha1.ServitorClusterStatus{
 			Phase:             servitorv1alpha1.PhaseAwaitingApproval,
-			ResolvedOptions:   &servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Provider: "vpc-gen2", Version: "4.22", ResourceGroup: "Default"}, ClusterName: "frozen", Region: "us-south"},
+			ResolvedOptions:   &servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Provider: "vpc-gen2", Version: "4.22", ResourceGroup: "Default"}, ClusterName: "frozen", Region: "us-south", Network: frozenNetwork()},
 			LifecycleSnapshot: &servitorv1alpha1.LifecycleSnapshot{InitialLeaseSeconds: 3600, RetrySeconds: []int64{60}},
 			Backend:           &servitorv1alpha1.BackendIdentity{Version: 1, Bucket: "bucket", Key: "frozen.tfstate", Region: "us-south", Endpoint: "https://s3.example.invalid"},
 			ExecutionImage:    "registry.example/ict@sha256:frozen",

@@ -40,13 +40,10 @@ type UserOptions struct {
 	ResourceGroup                  string   `json:"resourceGroup,omitempty"`
 	Zone                           string   `json:"zone,omitempty"`
 	Flavor                         string   `json:"flavor,omitempty"`
-	VPCID                          string   `json:"vpcID,omitempty"`
 	Datacenter                     string   `json:"datacenter,omitempty"`
 	MachineType                    string   `json:"machineType,omitempty"`
 	PublicVLANID                   string   `json:"publicVLANID,omitempty"`
 	PrivateVLANID                  string   `json:"privateVLANID,omitempty"`
-	SubnetIDs                      []string `json:"subnetIDs,omitempty"`
-	PublicGatewayIDs               []string `json:"publicGatewayIDs,omitempty"`
 	SatelliteZones                 []string `json:"satelliteZones,omitempty"`
 	SatelliteManagedFrom           string   `json:"satelliteManagedFrom,omitempty"`
 	SatelliteLocationID            string   `json:"satelliteLocationID,omitempty"`
@@ -81,12 +78,24 @@ type ServitorClusterSpec struct {
 	Lifecycle   LifecyclePolicy `json:"lifecycle"`
 }
 
+// FrozenNetwork is the operator-selected existing VPC networking for one allocation.
+// It is not user intent and is preserved in status and recovery validation only.
+type FrozenNetwork struct {
+	BindingID       string `json:"bindingID,omitempty"`
+	AccountID       string `json:"accountID,omitempty"`
+	VPCID           string `json:"vpcID,omitempty"`
+	SubnetID        string `json:"subnetID,omitempty"`
+	PublicGatewayID string `json:"publicGatewayID,omitempty"`
+	Zone            string `json:"zone,omitempty"`
+}
+
 // ResolvedOptions are the once-frozen effective planning inputs.
 type ResolvedOptions struct {
 	UserOptions `json:",inline"`
-	Platform    string `json:"platform,omitempty"`
-	ClusterName string `json:"clusterName,omitempty"`
-	Region      string `json:"region,omitempty"`
+	Platform    string        `json:"platform,omitempty"`
+	ClusterName string        `json:"clusterName,omitempty"`
+	Region      string        `json:"region,omitempty"`
+	Network     FrozenNetwork `json:"network,omitempty"`
 }
 
 // LifecycleSnapshot is the immutable policy used throughout an allocation.
@@ -519,8 +528,6 @@ func (in *ServitorClusterSpec) DeepCopy() *ServitorClusterSpec {
 	}
 	out := new(ServitorClusterSpec)
 	*out = *in
-	out.UserOptions.SubnetIDs = append([]string(nil), in.UserOptions.SubnetIDs...)
-	out.UserOptions.PublicGatewayIDs = append([]string(nil), in.UserOptions.PublicGatewayIDs...)
 	out.UserOptions.SatelliteZones = append([]string(nil), in.UserOptions.SatelliteZones...)
 	out.UserOptions.SatelliteWorkerInstanceIDs = append([]string(nil), in.UserOptions.SatelliteWorkerInstanceIDs...)
 	out.Lifecycle.RetrySeconds = append([]int64(nil), in.Lifecycle.RetrySeconds...)
@@ -538,8 +545,6 @@ func (in *ServitorClusterStatus) DeepCopy() *ServitorClusterStatus {
 	out.Conditions = append([]metav1.Condition(nil), in.Conditions...)
 	if in.ResolvedOptions != nil {
 		v := *in.ResolvedOptions
-		v.SubnetIDs = append([]string(nil), v.SubnetIDs...)
-		v.PublicGatewayIDs = append([]string(nil), v.PublicGatewayIDs...)
 		v.SatelliteZones = append([]string(nil), v.SatelliteZones...)
 		v.SatelliteWorkerInstanceIDs = append([]string(nil), v.SatelliteWorkerInstanceIDs...)
 		out.ResolvedOptions = &v

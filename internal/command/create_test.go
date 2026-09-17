@@ -13,8 +13,6 @@ var testCreateDefaults = CreateDefaults{
 	Target:           "synthetic-target",
 	Provider:         "vpc-gen2",
 	ResourceGroup:    "Default",
-	Zone:             "us-south-1",
-	VPCID:            "synthetic-vpc-id",
 	OpenShiftFlavor:  "bx2.4x16",
 	KubernetesFlavor: "bx2.2x8",
 }
@@ -64,14 +62,13 @@ func TestExtensionTargetUsesSnapshotDefaultAndKeepsUTC(t *testing.T) {
 }
 
 func TestParseCreateAcceptsEverySafeFlag(t *testing.T) {
-	request, err := ParseCreate(`create target=test provider=vpc-gen2 version=4.22 resource-group="Platform Team" zone=us-south-3 flavor=custom vpc-id=vpc-id subnet-id=subnet-one subnet-id=subnet-two public-gateway-id=gateway-one public-gateway-id=gateway-two datacenter=dal10 machine-type=b3c.4x16 public-vlan-id=public-vlan private-vlan-id=private-vlan satellite-zone=us-south-1 satellite-zone=us-south-2 satellite-managed-from=managed-from satellite-location-id=location-id satellite-host-image=image-id satellite-host-profile=bx2-4x16 satellite-ssh-key-id=ssh-key satellite-worker-instance-id=worker-one satellite-worker-instance-id=worker-two satellite-worker-operating-system=RHCOS worker-count=3`, testCreateDefaults)
+	request, err := ParseCreate(`create target=test provider=vpc-gen2 version=4.22 resource-group="Platform Team" zone=us-south-3 flavor=custom datacenter=dal10 machine-type=b3c.4x16 public-vlan-id=public-vlan private-vlan-id=private-vlan satellite-zone=us-south-1 satellite-zone=us-south-2 satellite-managed-from=managed-from satellite-location-id=location-id satellite-host-image=image-id satellite-host-profile=bx2-4x16 satellite-ssh-key-id=ssh-key satellite-worker-instance-id=worker-one satellite-worker-instance-id=worker-two satellite-worker-operating-system=RHCOS worker-count=3`, testCreateDefaults)
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := []string{
 		"--target", "test", "--provider", "vpc-gen2", "--platform", "openshift", "--version", "4.22",
-		"--resource-group", "Platform Team", "--zone", "us-south-3", "--flavor", "custom", "--vpc-id", "vpc-id",
-		"--subnet-id", "subnet-one", "--subnet-id", "subnet-two", "--public-gateway-id", "gateway-one", "--public-gateway-id", "gateway-two",
+		"--resource-group", "Platform Team", "--zone", "us-south-3", "--flavor", "custom",
 		"--datacenter", "dal10", "--machine-type", "b3c.4x16", "--public-vlan-id", "public-vlan", "--private-vlan-id", "private-vlan",
 		"--satellite-zone", "us-south-1", "--satellite-zone", "us-south-2", "--satellite-managed-from", "managed-from",
 		"--satellite-location-id", "location-id", "--satellite-host-image", "image-id", "--satellite-host-profile", "bx2-4x16",
@@ -90,9 +87,8 @@ func TestParseCreateOptionsNormalizesAssignments(t *testing.T) {
 		"--version":        {"4.22"},
 		"--resource-group": {`Platform "Team"=Core`},
 		"--worker-count":   {"3"},
-		"--subnet-id":      {"subnet-one", "subnet-two"},
 	}
-	text := `create target=synthetic-target provider=vpc-gen2 version=4.22 resource-group="Platform \"Team\"=Core" worker-count=3 subnet-id=subnet-one subnet-id=subnet-two`
+	text := `create target=synthetic-target provider=vpc-gen2 version=4.22 resource-group="Platform \"Team\"=Core" worker-count=3`
 	options, err := ParseCreateOptions(text)
 	if err != nil {
 		t.Fatalf("ParseCreateOptions(%q): %v", text, err)
@@ -248,23 +244,23 @@ func TestParseCreateAppliesAndOverridesConfiguredDefaults(t *testing.T) {
 	}{
 		{
 			name: "configured version", text: "create", platform: "openshift",
-			want: []string{"--target", "synthetic-target", "--provider", "vpc-gen2", "--platform", "openshift", "--version", "4.22", "--resource-group", "Default", "--zone", "us-south-1", "--flavor", "bx2.4x16", "--vpc-id", "synthetic-vpc-id"},
+			want: []string{"--target", "synthetic-target", "--provider", "vpc-gen2", "--platform", "openshift", "--version", "4.22", "--resource-group", "Default", "--flavor", "bx2.4x16"},
 		},
 		{
 			name: "OpenShift defaults", text: "create version=4.22", platform: "openshift",
-			want: []string{"--target", "synthetic-target", "--provider", "vpc-gen2", "--platform", "openshift", "--version", "4.22", "--resource-group", "Default", "--zone", "us-south-1", "--flavor", "bx2.4x16", "--vpc-id", "synthetic-vpc-id"},
+			want: []string{"--target", "synthetic-target", "--provider", "vpc-gen2", "--platform", "openshift", "--version", "4.22", "--resource-group", "Default", "--flavor", "bx2.4x16"},
 		},
 		{
 			name: "Kubernetes defaults", text: "create version=1.31", platform: "kubernetes",
-			want: []string{"--target", "synthetic-target", "--provider", "vpc-gen2", "--platform", "kubernetes", "--version", "1.31", "--resource-group", "Default", "--zone", "us-south-1", "--flavor", "bx2.2x8", "--vpc-id", "synthetic-vpc-id"},
+			want: []string{"--target", "synthetic-target", "--provider", "vpc-gen2", "--platform", "kubernetes", "--version", "1.31", "--resource-group", "Default", "--flavor", "bx2.2x8"},
 		},
 		{
-			name: "OpenShift overrides", text: "create version=4.22 target=target provider=classic resource-group=group zone=zone vpc-id=vpc flavor=flavor", platform: "openshift",
-			want: []string{"--target", "target", "--provider", "classic", "--platform", "openshift", "--version", "4.22", "--resource-group", "group", "--zone", "zone", "--flavor", "flavor", "--vpc-id", "vpc"},
+			name: "OpenShift overrides", text: "create version=4.22 target=target provider=classic resource-group=group zone=zone flavor=flavor", platform: "openshift",
+			want: []string{"--target", "target", "--provider", "classic", "--platform", "openshift", "--version", "4.22", "--resource-group", "group", "--zone", "zone", "--flavor", "flavor"},
 		},
 		{
 			name: "Kubernetes flavor override", text: "create version=1.31 flavor=kubernetes-flavor", platform: "kubernetes",
-			want: []string{"--target", "synthetic-target", "--provider", "vpc-gen2", "--platform", "kubernetes", "--version", "1.31", "--resource-group", "Default", "--zone", "us-south-1", "--flavor", "kubernetes-flavor", "--vpc-id", "synthetic-vpc-id"},
+			want: []string{"--target", "synthetic-target", "--provider", "vpc-gen2", "--platform", "kubernetes", "--version", "1.31", "--resource-group", "Default", "--flavor", "kubernetes-flavor"},
 		},
 	}
 	for _, test := range tests {
@@ -293,15 +289,12 @@ func TestParseCreateRejectsMalformedConfiguredDefaultVersion(t *testing.T) {
 }
 
 func TestParseCreateExposesNormalizedPresentationFields(t *testing.T) {
-	request, err := ParseCreate("create version=1.36 worker-count=2 subnet-id=subnet public-gateway-id=gateway", testCreateDefaults)
+	request, err := ParseCreate("create version=1.36 worker-count=2", testCreateDefaults)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if request.Target != "synthetic-target" || request.Platform != "kubernetes" || request.Version != "1.36" || request.Provider != "vpc-gen2" || request.ResourceGroup != "Default" || request.WorkerShape != "bx2.2x8" || request.WorkerCount != "2" || request.Location != "us-south/us-south-1" {
+	if request.Target != "synthetic-target" || request.Platform != "kubernetes" || request.Version != "1.36" || request.Provider != "vpc-gen2" || request.ResourceGroup != "Default" || request.WorkerShape != "bx2.2x8" || request.WorkerCount != "2" || request.Location != "" {
 		t.Fatalf("normalized request = %+v", request)
-	}
-	if !request.ReuseVPC || !request.ReuseSubnet || !request.ReuseGateway || request.VPCID != "synthetic-vpc-id" || !reflect.DeepEqual(request.SubnetIDs, []string{"subnet"}) || !reflect.DeepEqual(request.PublicGatewayIDs, []string{"gateway"}) {
-		t.Fatalf("network choices = %+v", request)
 	}
 }
 
@@ -320,6 +313,9 @@ func TestParseCreateRejectsEveryProhibitedOrAmbiguousInput(t *testing.T) {
 		{"SSH public key path", "create version=4.22 satellite-ssh-public-key=/secret"},
 		{"uninferable version", "create version=5.1"},
 		{"removed platform", "create version=4.22 platform=kubernetes"},
+		{"operator VPC", "create version=4.22 vpc-id=vpc"},
+		{"operator subnet", "create version=4.22 subnet-id=subnet"},
+		{"operator gateway", "create version=4.22 public-gateway-id=gateway"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
