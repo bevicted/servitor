@@ -4,66 +4,75 @@
 # into each CR status before planning.
 namespace: servitor
 slack:
-    channel_id: C_REPLACE_ME
-    # Up to this many active per-thread allocations per user. Zero uses default 3; restart after changing it.
-    max_allocations_per_user: 3
-    # Optional exact Slack user IDs allowed to run `refresh inventory` in a DM.
-    maintainer_ids: []
+  channel_id: C_REPLACE_ME
+  # Up to this many active per-thread allocations per user. Zero uses default 3; restart after changing it.
+  max_allocations_per_user: 3
+  # Optional exact Slack user IDs allowed to run `refresh inventory` in a DM.
+  maintainer_ids: []
 defaults:
-    version: "4.22"
-    target: replace-me
-    provider: vpc-gen2
-    resource_group: Default
-    openshift_flavor: bx2.4x16
-    kubernetes_flavor: bx2.2x8
+  version: "4.22"
+  target: replace-me
+  provider: vpc-gen2
+  resource_group: Default
+  openshift_flavor: bx2.4x16
+  kubernetes_flavor: bx2.2x8
 # VPC Gen 2 allocations use only these operator-owned existing network bindings.
 # A target without exactly one mapping is rejected; users cannot override IDs.
 network:
-    bindings:
-        synthetic-existing-network:
-            account_id: synthetic-account
-            vpc_id: synthetic-vpc-id
-            subnet_id: synthetic-subnet-id
-            public_gateway_id: synthetic-gateway-id
-            zone: us-south-1
-    target_bindings:
-        replace-me: synthetic-existing-network
+  bindings:
+    synthetic-existing-network:
+      account_id: synthetic-account
+      vpc_id: synthetic-vpc-id
+      vpc_region: us-south
+      subnet_id: synthetic-subnet-id
+      public_gateway_id: synthetic-gateway-id
+      zone: us-south-1
+      # VPN policy is optional. When present it must be complete and is frozen per allocation.
+      vpn_server_id: synthetic-vpn-server-id
+      secrets_manager_id: synthetic-secrets-manager-id
+      secrets_manager_region: eu-gb
+      secret_group_id: synthetic-secret-group-id
+      certificate_template: synthetic-client-template
+      issuer: synthetic-issuer
+      ttl: 168h
+  target_bindings:
+    replace-me: synthetic-existing-network
 # This policy is copied into spec.lifecycle for each allocation. The controller
 # alone writes observed phase, deadlines, operations, retries, and summaries.
 lifecycle:
-    confirmation_timeout: 5m
-    lease: 4h
-    retry_intervals: [1m, 5m, 15m]
+  confirmation_timeout: 5m
+  lease: 4h
+  retry_intervals: [1m, 5m, 15m]
 # Private target inventory refreshes initially when missing, then hourly. A
 # last-good snapshot is usable for this bounded age after a transient failure.
 inventory:
-    refresh_interval: 1h
-    maximum_age: 24h
-# Phase 1 public kubeconfig publication is opt-in per configured public target.
-# Targets not listed here, and all Satellite allocations, receive no auth Secret.
+  refresh_interval: 1h
+  maximum_age: 24h
+# Public endpoint auth is enabled for listed targets. A complete VPN policy on a
+# VPC binding also enables auth for that target; Satellite allocations receive none.
 auth:
-    public_targets: []
+  public_targets: []
 ict:
-    target_config_map: servitor-ict-config
-    target_config_key: config.yaml
+  target_config_map: servitor-ict-config
+  target_config_key: config.yaml
 # Terraform state is stored in this COS S3 backend. HMAC values belong only in
 # the referenced Secret and never in a CR, status, result, or command argument.
 cos:
-    endpoint: https://s3.us-south.cloud-object-storage.appdomain.cloud
-    bucket: REPLACE_ME
-    region: us-south
-    key_prefix: servitor
-    skip_credentials_validation: true
-    skip_metadata_api_check: true
-    skip_region_validation: true
-    skip_requesting_account_id: true
-    force_path_style: true
-    use_lockfile: false
+  endpoint: https://s3.us-south.cloud-object-storage.appdomain.cloud
+  bucket: REPLACE_ME
+  region: us-south
+  key_prefix: servitor
+  skip_credentials_validation: true
+  skip_metadata_api_check: true
+  skip_region_validation: true
+  skip_requesting_account_id: true
+  force_path_style: true
+  use_lockfile: false
 images:
-    # Use the immutable digest built by `make task-image`; it is frozen per CR.
-    execution: registry.example.invalid/servitor-task@sha256:REPLACE_WITH_64_HEX_DIGEST
+  # Use the immutable digest built by `make task-image`; it is frozen per CR.
+  execution: registry.example.invalid/servitor-task@sha256:REPLACE_WITH_64_HEX_DIGEST
 secrets:
-    # These are names only. Values remain in existing namespace Secrets.
-    slack: servitor-slack-credentials
-    cos: servitor-cos-credentials
-    ibm: servitor-ibm-credentials
+  # These are names only. Values remain in existing namespace Secrets.
+  slack: servitor-slack-credentials
+  cos: servitor-cos-credentials
+  ibm: servitor-ibm-credentials

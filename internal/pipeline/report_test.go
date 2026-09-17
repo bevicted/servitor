@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"io"
 	"testing"
+	"time"
 
 	servitorv1alpha1 "github.com/bevicted/servitor/api/v1alpha1"
 )
@@ -38,7 +39,7 @@ func validRecovery() servitorv1alpha1.RecoveryMetadata {
 		Endpoints: map[string]string{
 			"IAM": "https://iam.example.invalid", "ContainerService": "https://containers.example.invalid", "GlobalTagging": "https://tagging.example.invalid", "ResourceManagement": "https://management.example.invalid", "ResourceController": "https://controller.example.invalid", "VPC": "https://vpc.example.invalid",
 		},
-		Values: servitorv1alpha1.RecoveryValues{ClusterName: "cluster", ResourceGroupName: "Default", Region: "us-south", ClusterMode: "vpc", Platform: "openshift", KubeVersion: "4.22_openshift", WorkerCount: 2, Zone: "us-south-1", Flavor: "bx2.4x16"},
+		Values: servitorv1alpha1.RecoveryValues{ClusterName: "cluster", ResourceGroupName: "Default", Region: "us-south", ClusterMode: "vpc", Platform: "openshift", KubeVersion: "4.22_openshift", WorkerCount: 2, Zone: "us-south-1", Flavor: "bx2.4x16", AccountID: "account", VPCRegion: "us-south"},
 	}
 }
 
@@ -84,6 +85,24 @@ func TestDecodeReportAcceptsOnlyPlanOnlyRejection(t *testing.T) {
 	}
 	if _, err := DecodeReport(data, "uid", "plan-a"); err == nil {
 		t.Fatal("accepted planning rejection with success payload")
+	}
+}
+
+func TestDecodeReportRejectsPartialOrExpiredAuthMetadata(t *testing.T) {
+	for _, status := range []servitorv1alpha1.AuthStatus{
+		{Availability: "available"},
+		{Availability: "unavailable", Mode: "public"},
+		{Availability: "available", Mode: "public", Expiry: time.Now().Add(time.Hour).Format(time.RFC3339)},
+		{Availability: "available", Mode: "vpn", Expiry: time.Now().Add(-time.Hour).Format(time.RFC3339)},
+	} {
+		report := Report{Version: 1, ClusterUID: "uid", OperationID: "plan-a", ResolvedOptions: servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Provider: "vpc-gen2", Version: "4.22"}, ClusterName: "cluster"}, Recovery: validRecovery(), Auth: &status}
+		data, err := json.Marshal(report)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := DecodeReport(data, "uid", "plan-a"); err == nil {
+			t.Fatalf("accepted auth metadata %+v", status)
+		}
 	}
 }
 

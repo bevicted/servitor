@@ -102,7 +102,15 @@ func controllerConfig(operator config.Config) (controller.Config, error) {
 	networkBindings := make(map[string]servitorv1alpha1.FrozenNetwork, len(operator.Network.TargetBindings))
 	for target, bindingID := range operator.Network.TargetBindings {
 		binding := operator.Network.Bindings[bindingID]
-		networkBindings[target] = servitorv1alpha1.FrozenNetwork{BindingID: bindingID, AccountID: binding.AccountID, VPCID: binding.VPCID, SubnetID: binding.SubnetID, PublicGatewayID: binding.PublicGatewayID, Zone: binding.Zone}
+		policy, err := binding.AuthPolicy()
+		if err != nil {
+			return controller.Config{}, err
+		}
+		frozen := servitorv1alpha1.FrozenNetwork{BindingID: bindingID, AccountID: binding.AccountID, VPCID: binding.VPCID, VPCRegion: binding.VPCRegion, SubnetID: binding.SubnetID, PublicGatewayID: binding.PublicGatewayID, Zone: binding.Zone}
+		if policy != nil {
+			frozen.AuthPolicy = &servitorv1alpha1.FrozenAuthPolicy{VPNServerID: policy.VPNServerID, SecretsManagerID: policy.SecretsManagerID, SecretsManagerRegion: policy.SecretsManagerRegion, SecretGroupID: policy.SecretGroupID, CertificateTemplate: policy.CertificateTemplate, Issuer: policy.Issuer, TTL: policy.TTL}
+		}
+		networkBindings[target] = frozen
 	}
 	return controller.Config{
 		Namespace: operator.Namespace,

@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 	"unicode"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -80,13 +81,30 @@ type ServitorClusterSpec struct {
 
 // FrozenNetwork is the operator-selected existing VPC networking for one allocation.
 // It is not user intent and is preserved in status and recovery validation only.
+// FrozenAuthPolicy identifies the existing non-secret VPN issuer policy.
+// It is selected by the operator and never derived from mutable configuration.
+type FrozenAuthPolicy struct {
+	AllocationUID        string `json:"allocation_uid,omitempty"`
+	VPNServerID          string `json:"vpn_server_id,omitempty"`
+	SecretsManagerID     string `json:"secrets_manager_id,omitempty"`
+	SecretsManagerRegion string `json:"secrets_manager_region,omitempty"`
+	SecretGroupID        string `json:"secret_group_id,omitempty"`
+	CertificateTemplate  string `json:"certificate_template,omitempty"`
+	Issuer               string `json:"issuer,omitempty"`
+	TTL                  string `json:"ttl,omitempty"`
+}
+
+// FrozenNetwork is the operator-selected existing VPC networking for one allocation.
+// It is not user intent and is preserved in status and recovery validation only.
 type FrozenNetwork struct {
-	BindingID       string `json:"bindingID,omitempty"`
-	AccountID       string `json:"accountID,omitempty"`
-	VPCID           string `json:"vpcID,omitempty"`
-	SubnetID        string `json:"subnetID,omitempty"`
-	PublicGatewayID string `json:"publicGatewayID,omitempty"`
-	Zone            string `json:"zone,omitempty"`
+	BindingID       string            `json:"bindingID,omitempty"`
+	AccountID       string            `json:"accountID,omitempty"`
+	VPCID           string            `json:"vpcID,omitempty"`
+	VPCRegion       string            `json:"vpcRegion,omitempty"`
+	SubnetID        string            `json:"subnetID,omitempty"`
+	PublicGatewayID string            `json:"publicGatewayID,omitempty"`
+	Zone            string            `json:"zone,omitempty"`
+	AuthPolicy      *FrozenAuthPolicy `json:"authPolicy,omitempty"`
 }
 
 // ResolvedOptions are the once-frozen effective planning inputs.
@@ -102,13 +120,39 @@ type ResolvedOptions struct {
 type LifecycleSnapshot struct {
 	InitialLeaseSeconds int64   `json:"initialLeaseSeconds"`
 	RetrySeconds        []int64 `json:"retrySeconds"`
-	// PublicAuthEligible freezes the non-secret public-access policy selected at creation.
+	// AuthEligible freezes whether this allocation acquires and stores auth material.
+	AuthEligible bool `json:"authEligible,omitempty"`
+	// PublicAuthEligible is retained only to read pre-task-05 status. New snapshots use AuthEligible.
 	PublicAuthEligible bool `json:"publicAuthEligible,omitempty"`
 }
 
-// PublicAuthStatus is the bounded, credential-free result of public kubeconfig publication.
-type PublicAuthStatus struct {
+// AuthStatus is the bounded, credential-free result of bundle publication.
+type AuthStatus struct {
 	Availability string `json:"availability"`
+	Mode         string `json:"mode,omitempty"`
+	Expiry       string `json:"expiry,omitempty"`
+}
+
+// PublicAuthStatus is the pre-task-05 status name retained for decoding old objects.
+type PublicAuthStatus = AuthStatus
+
+func (p FrozenAuthPolicy) Validate() error {
+	for _, field := range []struct {
+		name  string
+		value string
+		limit int
+	}{
+		{"allocation UID", p.AllocationUID, 128}, {"VPN server ID", p.VPNServerID, 256}, {"Secrets Manager ID", p.SecretsManagerID, 256}, {"Secrets Manager region", p.SecretsManagerRegion, 64}, {"secret group ID", p.SecretGroupID, 256}, {"certificate template", p.CertificateTemplate, 256}, {"issuer", p.Issuer, 256}, {"TTL", p.TTL, 32},
+	} {
+		if field.value == "" || len(field.value) > field.limit || strings.TrimSpace(field.value) != field.value || strings.ContainsFunc(field.value, unicode.IsControl) {
+			return fmt.Errorf("invalid auth policy %s", field.name)
+		}
+	}
+	ttl, err := time.ParseDuration(p.TTL)
+	if err != nil || ttl <= 0 || ttl > 30*24*time.Hour {
+		return fmt.Errorf("invalid auth policy TTL")
+	}
+	return nil
 }
 
 // BackendIdentity identifies remote Terraform state without credentials.
@@ -211,6 +255,11 @@ func recoveryEndpointContainsCredentialMarker(endpoint *url.URL) bool {
 }
 
 func (v RecoveryValues) validate() error {
+	if v.AuthPolicy != nil {
+		if err := v.AuthPolicy.Validate(); err != nil {
+			return err
+		}
+	}
 	if !recoveryClusterNamePattern.MatchString(v.ClusterName) || !recoveryRegionPattern.MatchString(v.Region) || !recoveryVersionPattern.MatchString(v.KubeVersion) || v.WorkerCount < 1 || v.WorkerCount > 100 || (v.Platform != "kubernetes" && v.Platform != "openshift") || !validRecoveryText(v.ResourceGroupName, 128, true) {
 		return fmt.Errorf("recovery metadata has invalid values")
 	}
@@ -218,7 +267,7 @@ func (v RecoveryValues) validate() error {
 		value string
 		limit int
 	}{
-		{v.Zone, 64}, {v.Flavor, 64}, {v.VPCID, 128}, {v.Datacenter, 32}, {v.MachineType, 64}, {v.PublicVLANID, 64}, {v.PrivateVLANID, 64}, {v.SatelliteManagedFrom, 128}, {v.SatelliteLocationID, 128}, {v.SatelliteHostImage, 256}, {v.SatelliteHostProfile, 64}, {v.SatelliteSSHKeyID, 128}, {v.SatelliteWorkerOperatingSystem, 64},
+		{v.Zone, 64}, {v.Flavor, 64}, {v.AccountID, 128}, {v.VPCRegion, 64}, {v.VPCID, 128}, {v.Datacenter, 32}, {v.MachineType, 64}, {v.PublicVLANID, 64}, {v.PrivateVLANID, 64}, {v.SatelliteManagedFrom, 128}, {v.SatelliteLocationID, 128}, {v.SatelliteHostImage, 256}, {v.SatelliteHostProfile, 64}, {v.SatelliteSSHKeyID, 128}, {v.SatelliteWorkerOperatingSystem, 64},
 	} {
 		if !validRecoveryText(value.value, value.limit, false) {
 			return fmt.Errorf("recovery metadata has unsafe values")
@@ -229,15 +278,15 @@ func (v RecoveryValues) validate() error {
 	}
 	switch v.ClusterMode {
 	case "vpc":
-		if !recoveryZonePattern.MatchString(v.Zone) || strings.TrimSuffix(v.Zone, v.Zone[strings.LastIndex(v.Zone, "-"):]) != v.Region || !recoveryFlavorPattern.MatchString(v.Flavor) || v.SatelliteManagedFrom != "" || v.SatelliteLocationID != "" || len(v.SatelliteZones) != 0 || len(v.SatelliteWorkerInstanceIDs) != 0 {
+		if !recoveryZonePattern.MatchString(v.Zone) || strings.TrimSuffix(v.Zone, v.Zone[strings.LastIndex(v.Zone, "-"):]) != v.Region || v.VPCRegion != v.Region || v.AccountID == "" || !recoveryFlavorPattern.MatchString(v.Flavor) || v.SatelliteManagedFrom != "" || v.SatelliteLocationID != "" || len(v.SatelliteZones) != 0 || len(v.SatelliteWorkerInstanceIDs) != 0 {
 			return fmt.Errorf("recovery metadata has invalid VPC values")
 		}
 	case "classic":
-		if !regexp.MustCompile(`^[a-z]+[0-9]+$`).MatchString(v.Datacenter) || !recoveryFlavorPattern.MatchString(v.MachineType) || !recoveryVLANPattern.MatchString(v.PublicVLANID) || !recoveryVLANPattern.MatchString(v.PrivateVLANID) || v.VPCID != "" || len(v.SubnetIDs) != 0 || len(v.PublicGatewayIDs) != 0 || len(v.SatelliteZones) != 0 || v.SatelliteManagedFrom != "" || v.SatelliteLocationID != "" || len(v.SatelliteWorkerInstanceIDs) != 0 {
+		if v.AuthPolicy != nil || v.AccountID != "" || v.VPCRegion != "" || !regexp.MustCompile(`^[a-z]+[0-9]+$`).MatchString(v.Datacenter) || !recoveryFlavorPattern.MatchString(v.MachineType) || !recoveryVLANPattern.MatchString(v.PublicVLANID) || !recoveryVLANPattern.MatchString(v.PrivateVLANID) || v.VPCID != "" || len(v.SubnetIDs) != 0 || len(v.PublicGatewayIDs) != 0 || len(v.SatelliteZones) != 0 || v.SatelliteManagedFrom != "" || v.SatelliteLocationID != "" || len(v.SatelliteWorkerInstanceIDs) != 0 {
 			return fmt.Errorf("recovery metadata has invalid Classic values")
 		}
 	case "satellite":
-		if v.Platform != "openshift" || len(v.SatelliteZones) != 3 || !sameRecoveryRegion(v.SatelliteZones, v.Region) || (v.WorkerCount != 1 && v.WorkerCount != 3) || v.Zone != "" || v.Flavor != "" || v.Datacenter != "" || v.MachineType != "" || v.PublicVLANID != "" || v.PrivateVLANID != "" {
+		if v.AuthPolicy != nil || v.AccountID != "" || v.VPCRegion != "" || v.Platform != "openshift" || len(v.SatelliteZones) != 3 || !sameRecoveryRegion(v.SatelliteZones, v.Region) || (v.WorkerCount != 1 && v.WorkerCount != 3) || v.Zone != "" || v.Flavor != "" || v.Datacenter != "" || v.MachineType != "" || v.PublicVLANID != "" || v.PrivateVLANID != "" {
 			return fmt.Errorf("recovery metadata has invalid Satellite values")
 		}
 	default:
@@ -293,30 +342,33 @@ func containsCredentialMarker(value string) bool {
 // RecoveryValues are ICT's normalized non-secret Terraform inputs. They let a
 // later fresh operation reconstruct its ephemeral tfvars without resolution.
 type RecoveryValues struct {
-	ClusterName                    string   `json:"cluster_name"`
-	ResourceGroupName              string   `json:"resource_group_name"`
-	Region                         string   `json:"region"`
-	ClusterMode                    string   `json:"cluster_mode"`
-	Platform                       string   `json:"platform"`
-	KubeVersion                    string   `json:"kube_version"`
-	WorkerCount                    int      `json:"worker_count"`
-	Zone                           string   `json:"zone,omitempty"`
-	Flavor                         string   `json:"flavor,omitempty"`
-	VPCID                          string   `json:"vpc_id,omitempty"`
-	SubnetIDs                      []string `json:"subnet_ids,omitempty"`
-	PublicGatewayIDs               []string `json:"public_gateway_ids,omitempty"`
-	Datacenter                     string   `json:"datacenter,omitempty"`
-	MachineType                    string   `json:"machine_type,omitempty"`
-	PublicVLANID                   string   `json:"public_vlan_id,omitempty"`
-	PrivateVLANID                  string   `json:"private_vlan_id,omitempty"`
-	SatelliteZones                 []string `json:"satellite_zones,omitempty"`
-	SatelliteManagedFrom           string   `json:"satellite_managed_from,omitempty"`
-	SatelliteLocationID            string   `json:"satellite_location_id,omitempty"`
-	SatelliteHostImage             string   `json:"satellite_host_image,omitempty"`
-	SatelliteHostProfile           string   `json:"satellite_host_profile,omitempty"`
-	SatelliteSSHKeyID              string   `json:"satellite_ssh_key_id,omitempty"`
-	SatelliteWorkerInstanceIDs     []string `json:"satellite_worker_instance_ids,omitempty"`
-	SatelliteWorkerOperatingSystem string   `json:"satellite_worker_operating_system,omitempty"`
+	ClusterName                    string            `json:"cluster_name"`
+	ResourceGroupName              string            `json:"resource_group_name"`
+	Region                         string            `json:"region"`
+	ClusterMode                    string            `json:"cluster_mode"`
+	Platform                       string            `json:"platform"`
+	KubeVersion                    string            `json:"kube_version"`
+	WorkerCount                    int               `json:"worker_count"`
+	Zone                           string            `json:"zone,omitempty"`
+	Flavor                         string            `json:"flavor,omitempty"`
+	AccountID                      string            `json:"account_id,omitempty"`
+	VPCRegion                      string            `json:"vpc_region,omitempty"`
+	VPCID                          string            `json:"vpc_id,omitempty"`
+	SubnetIDs                      []string          `json:"subnet_ids,omitempty"`
+	PublicGatewayIDs               []string          `json:"public_gateway_ids,omitempty"`
+	Datacenter                     string            `json:"datacenter,omitempty"`
+	MachineType                    string            `json:"machine_type,omitempty"`
+	PublicVLANID                   string            `json:"public_vlan_id,omitempty"`
+	PrivateVLANID                  string            `json:"private_vlan_id,omitempty"`
+	SatelliteZones                 []string          `json:"satellite_zones,omitempty"`
+	SatelliteManagedFrom           string            `json:"satellite_managed_from,omitempty"`
+	SatelliteLocationID            string            `json:"satellite_location_id,omitempty"`
+	SatelliteHostImage             string            `json:"satellite_host_image,omitempty"`
+	SatelliteHostProfile           string            `json:"satellite_host_profile,omitempty"`
+	SatelliteSSHKeyID              string            `json:"satellite_ssh_key_id,omitempty"`
+	SatelliteWorkerInstanceIDs     []string          `json:"satellite_worker_instance_ids,omitempty"`
+	SatelliteWorkerOperatingSystem string            `json:"satellite_worker_operating_system,omitempty"`
+	AuthPolicy                     *FrozenAuthPolicy `json:"auth_policy,omitempty"`
 }
 
 // OperationReference is persisted before a PipelineRun can be created.
@@ -428,10 +480,12 @@ type ServitorClusterStatus struct {
 	ReviewDeadline    *metav1.Time        `json:"reviewDeadline,omitempty"`
 	// ReviewGeneration and ReviewApproval record the spec state that entered AwaitingApproval.
 	// An approval must be written in a later generation.
-	ReviewGeneration int64                 `json:"reviewGeneration,omitempty"`
-	ReviewApproval   string                `json:"reviewApproval,omitempty"`
-	Ready            *ReadySummary         `json:"ready,omitempty"`
-	PublicAuth       *PublicAuthStatus     `json:"publicAuth,omitempty"`
+	ReviewGeneration int64         `json:"reviewGeneration,omitempty"`
+	ReviewApproval   string        `json:"reviewApproval,omitempty"`
+	Ready            *ReadySummary `json:"ready,omitempty"`
+	Auth             *AuthStatus   `json:"auth,omitempty"`
+	// PublicAuth is retained only to read pre-task-05 status. New reports write Auth.
+	PublicAuth       *AuthStatus           `json:"publicAuth,omitempty"`
 	LeaseExpiresAt   *metav1.Time          `json:"leaseExpiresAt,omitempty"`
 	LeaseExtension   *LeaseExtensionStatus `json:"leaseExtension,omitempty"`
 	AuthDelivery     *AuthDeliveryStatus   `json:"authDelivery,omitempty"`
@@ -547,6 +601,10 @@ func (in *ServitorClusterStatus) DeepCopy() *ServitorClusterStatus {
 		v := *in.ResolvedOptions
 		v.SatelliteZones = append([]string(nil), v.SatelliteZones...)
 		v.SatelliteWorkerInstanceIDs = append([]string(nil), v.SatelliteWorkerInstanceIDs...)
+		if v.Network.AuthPolicy != nil {
+			policy := *v.Network.AuthPolicy
+			v.Network.AuthPolicy = &policy
+		}
 		out.ResolvedOptions = &v
 	}
 	if in.LifecycleSnapshot != nil {
@@ -580,6 +638,10 @@ func (in *ServitorClusterStatus) DeepCopy() *ServitorClusterStatus {
 		v.Values.PublicGatewayIDs = append([]string(nil), v.Values.PublicGatewayIDs...)
 		v.Values.SatelliteZones = append([]string(nil), v.Values.SatelliteZones...)
 		v.Values.SatelliteWorkerInstanceIDs = append([]string(nil), v.Values.SatelliteWorkerInstanceIDs...)
+		if v.Values.AuthPolicy != nil {
+			policy := *v.Values.AuthPolicy
+			v.Values.AuthPolicy = &policy
+		}
 		out.Recovery = &v
 	}
 	if in.Ready != nil {
@@ -589,6 +651,10 @@ func (in *ServitorClusterStatus) DeepCopy() *ServitorClusterStatus {
 			v.Resources[index].Actions = append([]string(nil), v.Resources[index].Actions...)
 		}
 		out.Ready = &v
+	}
+	if in.Auth != nil {
+		v := *in.Auth
+		out.Auth = &v
 	}
 	if in.PublicAuth != nil {
 		v := *in.PublicAuth

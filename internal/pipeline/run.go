@@ -68,7 +68,7 @@ func newOperationRun(cluster *servitorv1alpha1.ServitorCluster, kind string, tas
 		return nil, fmt.Errorf("encode backend identity: %w", err)
 	}
 	operation := cluster.Status.Operation
-	publicAuthEligible := kind == "apply" && cluster.Status.LifecycleSnapshot != nil && cluster.Status.LifecycleSnapshot.PublicAuthEligible
+	authEligible := kind == "apply" && cluster.Status.LifecycleSnapshot != nil && (cluster.Status.LifecycleSnapshot.AuthEligible || cluster.Status.LifecycleSnapshot.PublicAuthEligible)
 	params := tektonv1.Params{
 		{Name: "operation-id", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: operation.ID}},
 		{Name: "operation-kind", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: kind}},
@@ -80,8 +80,8 @@ func newOperationRun(cluster *servitorv1alpha1.ServitorCluster, kind string, tas
 		{Name: "ict-config-key", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: taskConfig.ICTConfigKey}},
 		{Name: "cos-secret", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: taskConfig.COSSecret}},
 		{Name: "ibm-secret", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: taskConfig.IBMSecret}},
-		{Name: "public-auth-eligible", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: fmt.Sprintf("%t", publicAuthEligible)}},
-		{Name: "auth-secret", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: authSecretParameter(string(cluster.UID), publicAuthEligible)}},
+		{Name: "auth-eligible", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: fmt.Sprintf("%t", authEligible)}},
+		{Name: "auth-secret", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: authSecretParameter(string(cluster.UID), authEligible)}},
 	}
 	if kind == "apply" || kind == "destroy" {
 		if cluster.Status.Recovery == nil {
@@ -93,7 +93,7 @@ func newOperationRun(cluster *servitorv1alpha1.ServitorCluster, kind string, tas
 		}
 		params = append(params, tektonv1.Param{Name: "recovery", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: string(recovery)}})
 	}
-	taskRunTemplate := operationTaskRunTemplate(string(cluster.UID), publicAuthEligible)
+	taskRunTemplate := operationTaskRunTemplate(string(cluster.UID), authEligible)
 	pipelineTimeout, tasksTimeout := 100*time.Minute, 95*time.Minute
 	if kind == "apply" {
 		pipelineTimeout, tasksTimeout = 120*time.Minute, 115*time.Minute

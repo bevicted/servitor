@@ -42,7 +42,7 @@ func (r *Reconciler) reconcileAuthDelivery(ctx context.Context, cluster *servito
 		}
 		return ctrl.Result{}, false, nil
 	}
-	if cluster.Status.LifecycleSnapshot == nil || !cluster.Status.LifecycleSnapshot.PublicAuthEligible {
+	if !authEligible(cluster) {
 		return ctrl.Result{}, false, nil
 	}
 
@@ -71,7 +71,8 @@ func (r *Reconciler) reconcileAuthDelivery(ctx context.Context, cluster *servito
 	}
 	cluster = current
 
-	if cluster.Status.PublicAuth == nil || cluster.Status.PublicAuth.Availability != "available" {
+	status := authStatus(cluster)
+	if status == nil || status.Availability != "available" || (status.Mode != "" && status.Mode != "public") {
 		return ctrl.Result{}, true, r.setAuthDeliveryOutcome(ctx, cluster, authDeliveryUnavailable)
 	}
 	secret := &corev1.Secret{}
@@ -102,6 +103,13 @@ func (r *Reconciler) reconcileAuthDelivery(ctx context.Context, cluster *servito
 func (r *Reconciler) setAuthDeliveryOutcome(ctx context.Context, cluster *servitorv1alpha1.ServitorCluster, outcome string) error {
 	cluster.Status.AuthDelivery.Outcome = outcome
 	return r.Status().Update(ctx, cluster)
+}
+
+func authStatus(cluster *servitorv1alpha1.ServitorCluster) *servitorv1alpha1.AuthStatus {
+	if cluster.Status.Auth != nil {
+		return cluster.Status.Auth
+	}
+	return cluster.Status.PublicAuth
 }
 
 func clusterName(cluster *servitorv1alpha1.ServitorCluster) string {

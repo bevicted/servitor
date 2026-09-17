@@ -175,6 +175,34 @@ func TestReadyAuthDeliveryConsumesBeforeReadingAndDoesNotReplay(t *testing.T) {
 	}
 }
 
+func TestReadyVPNBundleNeverEntersPublicOneFileDelivery(t *testing.T) {
+	now := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
+	cluster := readyAuthCluster("1710000000.000100", now.Add(time.Hour))
+	cluster.Status.PublicAuth = nil
+	cluster.Status.Auth = &servitorv1alpha1.AuthStatus{Availability: "available", Mode: "vpn", Expiry: now.Add(30 * time.Minute).Format(time.RFC3339)}
+	kube, _ := newAuthDeliveryClient(t, cluster, []byte("synthetic-kubeconfig"))
+	reader := &authSecretReadRecorder{Reader: kube}
+	recorder := &authDeliveryRecorder{}
+	reconciler := &Reconciler{Client: kube, DirectReader: reader, AuthDelivery: recorder, Now: func() time.Time { return now }}
+	stored := &servitorv1alpha1.ServitorCluster{}
+	key := types.NamespacedName{Namespace: "ns", Name: "cluster"}
+	if err := kube.Get(context.Background(), key, stored); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconciler.reconcileReady(context.Background(), stored); err != nil {
+		t.Fatal(err)
+	}
+	if recorder.calls != 0 || reader.reads != 0 {
+		t.Fatalf("VPN bundle reached public delivery adapter: calls=%d reads=%d", recorder.calls, reader.reads)
+	}
+	if err := kube.Get(context.Background(), key, stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status.AuthDelivery == nil || stored.Status.AuthDelivery.Outcome != authDeliveryUnavailable {
+		t.Fatalf("VPN delivery outcome = %#v", stored.Status.AuthDelivery)
+	}
+}
+
 func TestReadyAuthDeliveryRefetchesConsumedStatusWithoutCacheLag(t *testing.T) {
 	now := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
 	cluster := readyAuthCluster("1710000000.000100", now.Add(time.Hour))

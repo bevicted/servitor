@@ -25,7 +25,7 @@ func authResourceName(cluster *servitorv1alpha1.ServitorCluster) string {
 }
 
 func (r *Reconciler) ensureAuthPublicationResources(ctx context.Context, cluster *servitorv1alpha1.ServitorCluster, operation string) error {
-	if cluster.Status.LifecycleSnapshot == nil || !cluster.Status.LifecycleSnapshot.PublicAuthEligible {
+	if !authEligible(cluster) {
 		return nil
 	}
 	name := authResourceName(cluster)
@@ -113,7 +113,7 @@ func (r *Reconciler) ensurePublisherRoleBinding(ctx context.Context, cluster *se
 // revokeAuthPublication removes authority before deleting data, so a late task
 // cannot recreate a Secret after cleanup begins.
 func (r *Reconciler) revokeAuthPublication(ctx context.Context, cluster *servitorv1alpha1.ServitorCluster) error {
-	if cluster.Status.LifecycleSnapshot == nil || !cluster.Status.LifecycleSnapshot.PublicAuthEligible {
+	if !authEligible(cluster) {
 		return nil
 	}
 	name := authResourceName(cluster)
@@ -138,7 +138,7 @@ func (r *Reconciler) revokeAuthPublication(ctx context.Context, cluster *servito
 }
 
 func (r *Reconciler) removeAuthPublisher(ctx context.Context, cluster *servitorv1alpha1.ServitorCluster) error {
-	if cluster.Status.LifecycleSnapshot == nil || !cluster.Status.LifecycleSnapshot.PublicAuthEligible {
+	if !authEligible(cluster) {
 		return nil
 	}
 	name := authResourceName(cluster)
@@ -149,6 +149,13 @@ func (r *Reconciler) removeAuthPublisher(ctx context.Context, cluster *servitorv
 		return err
 	}
 	return nil
+}
+
+func authEligible(cluster *servitorv1alpha1.ServitorCluster) bool {
+	if cluster.Status.LifecycleSnapshot == nil {
+		return false
+	}
+	return cluster.Status.LifecycleSnapshot.AuthEligible || cluster.Status.LifecycleSnapshot.PublicAuthEligible
 }
 
 func sameStrings(actual, expected []string) bool {

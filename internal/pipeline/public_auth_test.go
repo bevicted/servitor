@@ -35,7 +35,7 @@ func TestNewEligiblePublicApplyUsesScopedPublisherAndApplyBudget(t *testing.T) {
 	for _, param := range run.Spec.Params {
 		params[param.Name] = param.Value.StringVal
 	}
-	if params["public-auth-eligible"] != "true" || params["auth-secret"] != AuthResourceName(string(cluster.UID)) {
+	if params["auth-eligible"] != "true" || params["auth-secret"] != AuthResourceName(string(cluster.UID)) {
 		t.Fatalf("public auth params = %#v", params)
 	}
 }

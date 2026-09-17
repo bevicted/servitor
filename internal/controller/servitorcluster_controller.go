@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"reflect"
 	"strings"
 	"time"
 
@@ -601,15 +602,24 @@ func (r *Reconciler) adoptReport(ctx context.Context, cluster *servitorv1alpha1.
 		cluster.Status.ReviewApproval = cluster.Spec.Lifecycle.Approval
 		setCondition(cluster, "PlanningSucceeded", metav1.ConditionTrue, "ReportAdopted", "validated planning report adopted")
 	} else {
-		if cluster.Status.ResolvedOptions == nil || !sameFrozenNetwork(cluster.Status.ResolvedOptions.Network, report.ResolvedOptions.Network) || !networkMatchesRecovery(cluster.Status.ResolvedOptions, report.Recovery.Values) {
-			return r.unresolved(ctx, cluster, "InvalidReport", errors.New("apply report does not match the frozen network binding"))
+		if cluster.Status.ResolvedOptions == nil {
+			return r.unresolved(ctx, cluster, "InvalidReport", errors.New("apply report has no frozen network binding"))
 		}
-		eligible := cluster.Status.LifecycleSnapshot != nil && cluster.Status.LifecycleSnapshot.PublicAuthEligible
-		if eligible != (report.PublicAuth != nil) {
-			return r.unresolved(ctx, cluster, "InvalidReport", errors.New("public auth report does not match the frozen eligibility policy"))
+		if !sameFrozenNetwork(cluster.Status.ResolvedOptions.Network, report.ResolvedOptions.Network) {
+			return r.unresolved(ctx, cluster, "InvalidReport", errors.New("apply report network does not match the frozen binding"))
+		}
+		if !networkMatchesRecovery(cluster.Status.ResolvedOptions, report.Recovery.Values) {
+			return r.unresolved(ctx, cluster, "InvalidReport", errors.New("apply report recovery does not match the frozen binding"))
+		}
+		eligible := authEligible(cluster)
+		if eligible != (report.Auth != nil) {
+			return r.unresolved(ctx, cluster, "InvalidReport", errors.New("auth report does not match the frozen eligibility policy"))
+		}
+		if report.Auth != nil && !validAdoptedAuth(*report.Auth, cluster.Status.ResolvedOptions.Network.AuthPolicy, r.now()) {
+			return r.unresolved(ctx, cluster, "InvalidReport", errors.New("auth report does not match frozen policy"))
 		}
 		cluster.Status.Ready = &report.Ready
-		cluster.Status.PublicAuth = report.PublicAuth
+		cluster.Status.Auth = report.Auth
 		cluster.Status.Phase = servitorv1alpha1.PhaseReady
 		// This is the sole Ready transition. Never recompute this persisted
 		// deadline during report adoption or later duplicate reconciles.
@@ -639,7 +649,24 @@ func (r *Reconciler) snapshot(cluster *servitorv1alpha1.ServitorCluster) error {
 	resolved.Platform = platform
 	if resolved.Provider == "vpc-gen2" {
 		network, found := r.Config.NetworkBindings[resolved.Target]
-		if !found || !validFrozenNetwork(network) {
+		if !found {
+			return errors.New("no configured existing network binding for target")
+		}
+		if network.VPCRegion == "" {
+			separator := strings.LastIndex(network.Zone, "-")
+			if separator > 0 {
+				network.VPCRegion = network.Zone[:separator]
+			}
+		}
+		if network.AuthPolicy != nil {
+			policy := *network.AuthPolicy
+			policy.AllocationUID = string(cluster.UID)
+			if err := policy.Validate(); err != nil {
+				return fmt.Errorf("invalid frozen auth policy: %w", err)
+			}
+			network.AuthPolicy = &policy
+		}
+		if !validFrozenNetwork(network) {
 			return errors.New("no configured existing network binding for target")
 		}
 		if resolved.Zone != "" && resolved.Zone != network.Zone {
@@ -662,7 +689,8 @@ func (r *Reconciler) snapshot(cluster *servitorv1alpha1.ServitorCluster) error {
 	cluster.Status.LifecycleSnapshot = &servitorv1alpha1.LifecycleSnapshot{
 		InitialLeaseSeconds: cluster.Spec.Lifecycle.InitialLeaseSeconds,
 		RetrySeconds:        append([]int64(nil), cluster.Spec.Lifecycle.RetrySeconds...),
-		PublicAuthEligible:  resolved.Provider != "satellite" && contains(r.Config.PublicAuthTargets, resolved.Target),
+		AuthEligible:        resolved.Provider != "satellite" && (contains(r.Config.PublicAuthTargets, resolved.Target) || resolved.Network.AuthPolicy != nil),
+		PublicAuthEligible:  resolved.Provider != "satellite" && (contains(r.Config.PublicAuthTargets, resolved.Target) || resolved.Network.AuthPolicy != nil),
 	}
 	backend := r.Config.Backend
 	if backend.Key == "" {
@@ -675,7 +703,20 @@ func (r *Reconciler) snapshot(cluster *servitorv1alpha1.ServitorCluster) error {
 }
 
 func sameFrozenNetwork(left, right servitorv1alpha1.FrozenNetwork) bool {
-	return left == right
+	if left.VPCRegion == "" {
+		left.VPCRegion = regionFromZone(left.Zone)
+	}
+	if right.VPCRegion == "" {
+		right.VPCRegion = regionFromZone(right.Zone)
+	}
+	return reflect.DeepEqual(left, right)
+}
+
+func regionFromZone(zone string) string {
+	if separator := strings.LastIndex(zone, "-"); separator > 0 {
+		return zone[:separator]
+	}
+	return ""
 }
 
 func networkMatchesRecovery(options *servitorv1alpha1.ResolvedOptions, values servitorv1alpha1.RecoveryValues) bool {
@@ -683,11 +724,40 @@ func networkMatchesRecovery(options *servitorv1alpha1.ResolvedOptions, values se
 		return options.Network == (servitorv1alpha1.FrozenNetwork{})
 	}
 	network := options.Network
-	return validFrozenNetwork(network) && values.Zone == network.Zone && values.VPCID == network.VPCID && len(values.SubnetIDs) == 1 && values.SubnetIDs[0] == network.SubnetID && len(values.PublicGatewayIDs) == 1 && values.PublicGatewayIDs[0] == network.PublicGatewayID
+	if network.VPCRegion == "" {
+		network.VPCRegion = regionFromZone(network.Zone)
+	}
+	return validFrozenNetwork(network) && values.AccountID == network.AccountID && values.VPCRegion == network.VPCRegion && values.Zone == network.Zone && values.VPCID == network.VPCID && len(values.SubnetIDs) == 1 && values.SubnetIDs[0] == network.SubnetID && len(values.PublicGatewayIDs) == 1 && values.PublicGatewayIDs[0] == network.PublicGatewayID && reflect.DeepEqual(values.AuthPolicy, network.AuthPolicy)
+}
+
+func validAdoptedAuth(status servitorv1alpha1.AuthStatus, policy *servitorv1alpha1.FrozenAuthPolicy, now time.Time) bool {
+	switch status.Availability {
+	case "unavailable", "unsupported":
+		return status.Mode == "" && status.Expiry == ""
+	case "available":
+		switch status.Mode {
+		case "public":
+			return status.Expiry == ""
+		case "vpn":
+			if policy == nil {
+				return false
+			}
+			expiry, err := time.Parse(time.RFC3339, status.Expiry)
+			if err != nil {
+				return false
+			}
+			ttl, err := time.ParseDuration(policy.TTL)
+			return err == nil && expiry.After(now) && !expiry.After(now.Add(ttl))
+		}
+	}
+	return false
 }
 
 func validFrozenNetwork(network servitorv1alpha1.FrozenNetwork) bool {
-	return network.BindingID != "" && network.AccountID != "" && network.VPCID != "" && network.SubnetID != "" && network.PublicGatewayID != "" && network.Zone != ""
+	if network.BindingID == "" || network.AccountID == "" || network.VPCID == "" || network.VPCRegion == "" || network.SubnetID == "" || network.PublicGatewayID == "" || network.Zone == "" || !strings.HasPrefix(network.Zone, network.VPCRegion+"-") {
+		return false
+	}
+	return network.AuthPolicy == nil || network.AuthPolicy.Validate() == nil
 }
 
 func matchesLifecycleSnapshot(policy servitorv1alpha1.LifecyclePolicy, snapshot servitorv1alpha1.LifecycleSnapshot) bool {

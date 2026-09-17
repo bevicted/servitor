@@ -91,7 +91,7 @@ const maxTerraformShowBytes = 4 * 1024 * 1024
 func main() {
 	var uid, operation, kind, optionsFile, backendFile, recoveryFile, resultFile, reportFile, emitReport, ictPath, terraformPath, optionsJSON, backendJSON, recoveryJSON string
 	var authManifestFile, authOutputDir, publishAuthSecret, publisherToken, publisherCA, publisherNamespace string
-	var publicAuthEligible, publishAuth bool
+	var authEligible, publishAuth bool
 	var inventoryConfig, inventoryTarget, inventoryRunID, inventoryRevision, inventoryReport, emitInventoryReport, apiKeyEnv string
 	var planningInventoryConfig string
 	flag.StringVar(&uid, "cluster-uid", "", "ServitorCluster UID")
@@ -108,7 +108,7 @@ func main() {
 	flag.StringVar(&emitReport, "emit-report", "", "emit one validated task-local report JSON document")
 	flag.StringVar(&authManifestFile, "auth-manifest", "", "private optional public-auth manifest path")
 	flag.StringVar(&authOutputDir, "auth-output-dir", "", "private optional public-auth output directory")
-	flag.BoolVar(&publicAuthEligible, "public-auth-eligible", false, "frozen public auth eligibility")
+	flag.BoolVar(&authEligible, "auth-eligible", false, "frozen auth acquisition eligibility")
 	flag.BoolVar(&publishAuth, "publish-auth", false, "publish optional public auth without failing the operation")
 	flag.StringVar(&publishAuthSecret, "publish-auth-secret", "", "allocation-bound Secret to update")
 	flag.StringVar(&publisherToken, "publisher-token", "", "projected publisher token path")
@@ -157,7 +157,7 @@ func main() {
 		err = materializeParameterFile(recoveryFile, recoveryJSON)
 	}
 	if err == nil {
-		err = run(context.Background(), uid, operation, kind, optionsFile, backendFile, recoveryFile, resultFile, reportFile, ictPath, terraformPath, planningInventoryConfig, os.Getenv(apiKeyEnv), publicAuthEligible, authManifestFile, authOutputDir)
+		err = run(context.Background(), uid, operation, kind, optionsFile, backendFile, recoveryFile, resultFile, reportFile, ictPath, terraformPath, planningInventoryConfig, os.Getenv(apiKeyEnv), authEligible, authManifestFile, authOutputDir)
 	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "servitor-task:", err)
@@ -550,7 +550,7 @@ func runApply(ctx context.Context, uid, operation string, options servitorv1alph
 	}
 	report := pipeline.Report{Version: 1, ClusterUID: uid, OperationID: operation, ResolvedOptions: options, Recovery: recovery, Ready: summaryFromState(state)}
 	if publicAuthEligible {
-		report.PublicAuth = &servitorv1alpha1.PublicAuthStatus{Availability: "unavailable"}
+		report.Auth = &servitorv1alpha1.AuthStatus{Availability: "unavailable"}
 	}
 	return writeReport(reportFile, report)
 }
@@ -658,7 +658,7 @@ func validateFrozenNetwork(options servitorv1alpha1.ResolvedOptions) error {
 		return nil
 	}
 	network := options.Network
-	if network.BindingID == "" || network.AccountID == "" || network.VPCID == "" || network.SubnetID == "" || network.PublicGatewayID == "" || network.Zone == "" || options.Zone != network.Zone {
+	if network.BindingID == "" || network.AccountID == "" || network.VPCRegion == "" || network.VPCID == "" || network.SubnetID == "" || network.PublicGatewayID == "" || network.Zone == "" || options.Zone != network.Zone || options.Region != "" && options.Region != network.VPCRegion {
 		return errors.New("VPC options require one frozen existing network binding")
 	}
 	return nil
@@ -669,10 +669,24 @@ func validateRecoveredNetwork(options servitorv1alpha1.ResolvedOptions, values s
 		return nil
 	}
 	network := options.Network
-	if values.VPCID != network.VPCID || values.Zone != network.Zone || len(values.SubnetIDs) != 1 || values.SubnetIDs[0] != network.SubnetID || len(values.PublicGatewayIDs) != 1 || values.PublicGatewayIDs[0] != network.PublicGatewayID {
+	if values.AccountID != network.AccountID || values.VPCRegion != network.VPCRegion || values.VPCID != network.VPCID || values.Zone != network.Zone || len(values.SubnetIDs) != 1 || values.SubnetIDs[0] != network.SubnetID || len(values.PublicGatewayIDs) != 1 || values.PublicGatewayIDs[0] != network.PublicGatewayID || !sameFrozenAuthPolicy(values.AuthPolicy, network.AuthPolicy) {
 		return errors.New("ICT network values do not match the frozen existing network binding")
 	}
 	return nil
+}
+
+func sameFrozenAuthPolicy(left, right *servitorv1alpha1.FrozenAuthPolicy) bool {
+	if left == nil || right == nil {
+		return left == right
+	}
+	return left.AllocationUID == right.AllocationUID &&
+		left.VPNServerID == right.VPNServerID &&
+		left.SecretsManagerID == right.SecretsManagerID &&
+		left.SecretsManagerRegion == right.SecretsManagerRegion &&
+		left.SecretGroupID == right.SecretGroupID &&
+		left.CertificateTemplate == right.CertificateTemplate &&
+		left.Issuer == right.Issuer &&
+		left.TTL == right.TTL
 }
 
 func rejectManagedNetworkPlan(plan terraformview.Plan) error {
@@ -754,9 +768,21 @@ func optionArgs(options servitorv1alpha1.ResolvedOptions) []string {
 	add("--satellite-ssh-key-id", o.SatelliteSSHKeyID)
 	add("--satellite-worker-operating-system", o.SatelliteWorkerOperatingSystem)
 	if options.Provider == "vpc-gen2" {
+		add("--account-id", options.Network.AccountID)
+		add("--vpc-region", options.Network.VPCRegion)
 		add("--vpc-id", options.Network.VPCID)
 		add("--subnet-id", options.Network.SubnetID)
 		add("--public-gateway-id", options.Network.PublicGatewayID)
+		if policy := options.Network.AuthPolicy; policy != nil {
+			add("--auth-allocation-uid", policy.AllocationUID)
+			add("--auth-vpn-server-id", policy.VPNServerID)
+			add("--auth-secrets-manager-id", policy.SecretsManagerID)
+			add("--auth-secrets-manager-region", policy.SecretsManagerRegion)
+			add("--auth-secret-group-id", policy.SecretGroupID)
+			add("--auth-certificate-template", policy.CertificateTemplate)
+			add("--auth-issuer", policy.Issuer)
+			add("--auth-ttl", policy.TTL)
+		}
 	}
 	for _, value := range o.SatelliteZones {
 		add("--satellite-zone", value)

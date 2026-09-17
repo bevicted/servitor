@@ -248,7 +248,7 @@ func validConfig() Config {
 		Namespace: "servitor",
 		Slack:     SlackConfig{ChannelID: "C123"},
 		Defaults:  DefaultsConfig{Version: "4.22", Target: "production", Provider: "vpc-gen2", ResourceGroup: "Default", OpenShiftFlavor: "bx2.4x16", KubernetesFlavor: "bx2.2x8"},
-		Network:   NetworkConfig{Bindings: map[string]NetworkBinding{"existing": {AccountID: "account", VPCID: "vpc", SubnetID: "subnet", PublicGatewayID: "gateway", Zone: "us-south-1"}}, TargetBindings: map[string]string{"production": "existing"}},
+		Network:   NetworkConfig{Bindings: map[string]NetworkBinding{"existing": {AccountID: "account", VPCID: "vpc", VPCRegion: "us-south", SubnetID: "subnet", PublicGatewayID: "gateway", Zone: "us-south-1"}}, TargetBindings: map[string]string{"production": "existing"}},
 		Lifecycle: LifecycleConfig{ConfirmationTimeout: 5 * time.Minute, Lease: 4 * time.Hour, RetryIntervals: []time.Duration{time.Minute, 5 * time.Minute, 15 * time.Minute}},
 		ICT:       ICTConfig{TargetConfigMap: "servitor-ict-config", TargetConfigKey: "config.yaml"},
 		COS:       COSConfig{Endpoint: "https://s3.us-south.example.invalid", Bucket: "ict-state-bucket", Region: "us-south", KeyPrefix: "servitor", SkipCredentialsValidation: true, SkipMetadataAPICheck: true, SkipRegionValidation: true, SkipRequestingAccountID: true, ForcePathStyle: true},
@@ -262,7 +262,7 @@ func validYAML() string {
 slack: {channel_id: C123, maintainer_ids: [U012AB3CD, W012AB3CD]}
 defaults: {version: "4.22", target: production, provider: vpc-gen2, resource_group: Default, openshift_flavor: bx2.4x16, kubernetes_flavor: bx2.2x8}
 network:
-  bindings: {existing: {account_id: account, vpc_id: vpc, subnet_id: subnet, public_gateway_id: gateway, zone: us-south-1}}
+  bindings: {existing: {account_id: account, vpc_id: vpc, vpc_region: us-south, subnet_id: subnet, public_gateway_id: gateway, zone: us-south-1}}
   target_bindings: {production: existing}
 lifecycle: {confirmation_timeout: 5m, lease: 4h, retry_intervals: [1m, 5m, 15m]}
 ict: {target_config_map: servitor-ict-config, target_config_key: config.yaml}

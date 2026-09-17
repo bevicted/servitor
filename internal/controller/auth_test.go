@@ -129,6 +129,37 @@ func TestGeneratedPublisherRolePermissionsAreHeldByController(t *testing.T) {
 	}
 }
 
+func TestReplacementAllocationUIDCannotReusePublishedSecret(t *testing.T) {
+	scheme := runtime.NewScheme()
+	for _, add := range []func(*runtime.Scheme) error{corev1.AddToScheme, rbacv1.AddToScheme} {
+		if err := add(scheme); err != nil {
+			t.Fatal(err)
+		}
+	}
+	client := fake.NewClientBuilder().WithScheme(scheme).Build()
+	reconciler := &Reconciler{Client: client}
+	old := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "cluster", UID: "old-uid"}, Status: servitorv1alpha1.ServitorClusterStatus{LifecycleSnapshot: &servitorv1alpha1.LifecycleSnapshot{AuthEligible: true}}}
+	replacement := old.DeepCopy()
+	replacement.UID = "new-uid"
+	for _, cluster := range []*servitorv1alpha1.ServitorCluster{old, replacement} {
+		if err := reconciler.ensureAuthPublicationResources(context.Background(), cluster, applyID(string(cluster.UID))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if authResourceName(old) == authResourceName(replacement) {
+		t.Fatal("replacement allocation reused the prior publisher resource name")
+	}
+	for _, cluster := range []*servitorv1alpha1.ServitorCluster{old, replacement} {
+		secret := &corev1.Secret{}
+		if err := client.Get(context.Background(), types.NamespacedName{Namespace: "ns", Name: authResourceName(cluster)}, secret); err != nil {
+			t.Fatal(err)
+		}
+		if err := validateAuthSecret(secret, cluster, applyID(string(cluster.UID))); err != nil {
+			t.Fatalf("replacement Secret ownership: %v", err)
+		}
+	}
+}
+
 func publisherRuleAllows(rule rbacv1.PolicyRule, secretName, verb string) bool {
 	return containsString(rule.APIGroups, "") && containsString(rule.Resources, "secrets") && containsString(rule.ResourceNames, secretName) && containsString(rule.Verbs, verb)
 }

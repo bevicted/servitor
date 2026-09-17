@@ -40,12 +40,12 @@ func validRecoveryMetadata() servitorv1alpha1.RecoveryMetadata {
 		Endpoints: map[string]string{
 			"IAM": "https://iam.example.invalid", "ContainerService": "https://containers.example.invalid", "GlobalTagging": "https://tagging.example.invalid", "ResourceManagement": "https://management.example.invalid", "ResourceController": "https://controller.example.invalid", "VPC": "https://vpc.example.invalid",
 		},
-		Values: servitorv1alpha1.RecoveryValues{ClusterName: "cluster", ResourceGroupName: "Default", Region: "us-south", ClusterMode: "vpc", Platform: "openshift", KubeVersion: "4.22_openshift", WorkerCount: 2, Zone: "us-south-1", Flavor: "bx2.4x16", VPCID: "vpc", SubnetIDs: []string{"subnet"}, PublicGatewayIDs: []string{"gateway"}},
+		Values: servitorv1alpha1.RecoveryValues{ClusterName: "cluster", ResourceGroupName: "Default", Region: "us-south", ClusterMode: "vpc", Platform: "openshift", KubeVersion: "4.22_openshift", WorkerCount: 2, Zone: "us-south-1", Flavor: "bx2.4x16", AccountID: "account", VPCRegion: "us-south", VPCID: "vpc", SubnetIDs: []string{"subnet"}, PublicGatewayIDs: []string{"gateway"}},
 	}
 }
 
 func frozenNetwork() servitorv1alpha1.FrozenNetwork {
-	return servitorv1alpha1.FrozenNetwork{BindingID: "binding", AccountID: "account", VPCID: "vpc", SubnetID: "subnet", PublicGatewayID: "gateway", Zone: "us-south-1"}
+	return servitorv1alpha1.FrozenNetwork{BindingID: "binding", AccountID: "account", VPCRegion: "us-south", VPCID: "vpc", SubnetID: "subnet", PublicGatewayID: "gateway", Zone: "us-south-1"}
 }
 
 func validRecoveryPointer() *servitorv1alpha1.RecoveryMetadata {
@@ -127,6 +127,29 @@ func TestReconcilePersistsOneOperationAndAdoptsMatchingReport(t *testing.T) {
 	}
 	if stored.Status.Phase != servitorv1alpha1.PhaseAwaitingApproval || !stored.Status.Operation.Adopted || stored.Status.ReviewDeadline == nil || !stored.Status.ReviewDeadline.Time.Equal(now.Add(5*time.Minute)) || stored.Status.ReviewGeneration != stored.Generation || stored.Status.ReviewApproval != "approved" {
 		t.Fatalf("report was not adopted with its approval state: %+v", stored.Status)
+	}
+}
+
+func TestAuthReportAdoptionRequiresCompleteFrozenPolicyMetadata(t *testing.T) {
+	now := time.Date(2026, 9, 16, 0, 0, 0, 0, time.UTC)
+	policy := &servitorv1alpha1.FrozenAuthPolicy{AllocationUID: "uid", VPNServerID: "vpn", SecretsManagerID: "secrets", SecretsManagerRegion: "eu-gb", SecretGroupID: "group", CertificateTemplate: "template", Issuer: "issuer", TTL: "2h"}
+	for _, test := range []struct {
+		name   string
+		status servitorv1alpha1.AuthStatus
+		policy *servitorv1alpha1.FrozenAuthPolicy
+		valid  bool
+	}{
+		{"public", servitorv1alpha1.AuthStatus{Availability: "available", Mode: "public"}, nil, true},
+		{"VPN within frozen TTL", servitorv1alpha1.AuthStatus{Availability: "available", Mode: "vpn", Expiry: now.Add(time.Hour).Format(time.RFC3339)}, policy, true},
+		{"VPN without policy", servitorv1alpha1.AuthStatus{Availability: "available", Mode: "vpn", Expiry: now.Add(time.Hour).Format(time.RFC3339)}, nil, false},
+		{"VPN beyond frozen TTL", servitorv1alpha1.AuthStatus{Availability: "available", Mode: "vpn", Expiry: now.Add(3 * time.Hour).Format(time.RFC3339)}, policy, false},
+		{"partial unavailable", servitorv1alpha1.AuthStatus{Availability: "unavailable", Mode: "public"}, nil, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := validAdoptedAuth(test.status, test.policy, now); got != test.valid {
+				t.Fatalf("validAdoptedAuth(%+v) = %t, want %t", test.status, got, test.valid)
+			}
+		})
 	}
 }
 

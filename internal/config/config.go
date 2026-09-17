@@ -86,11 +86,63 @@ type NetworkConfig struct {
 
 // NetworkBinding contains only existing shared-network identity and references.
 type NetworkBinding struct {
-	AccountID       string `yaml:"account_id"`
-	VPCID           string `yaml:"vpc_id"`
-	SubnetID        string `yaml:"subnet_id"`
-	PublicGatewayID string `yaml:"public_gateway_id"`
-	Zone            string `yaml:"zone"`
+	AccountID            string `yaml:"account_id"`
+	VPCID                string `yaml:"vpc_id"`
+	VPCRegion            string `yaml:"vpc_region"`
+	SubnetID             string `yaml:"subnet_id"`
+	PublicGatewayID      string `yaml:"public_gateway_id"`
+	Zone                 string `yaml:"zone"`
+	VPNServerID          string `yaml:"vpn_server_id"`
+	SecretsManagerID     string `yaml:"secrets_manager_id"`
+	SecretsManagerRegion string `yaml:"secrets_manager_region"`
+	SecretGroupID        string `yaml:"secret_group_id"`
+	CertificateTemplate  string `yaml:"certificate_template"`
+	Issuer               string `yaml:"issuer"`
+	TTL                  string `yaml:"ttl"`
+}
+
+// AuthPolicy returns a complete frozen policy or nil when this binding only
+// permits public endpoint authentication.
+func (b NetworkBinding) AuthPolicy() (*AuthPolicy, error) {
+	policy := AuthPolicy{VPNServerID: b.VPNServerID, SecretsManagerID: b.SecretsManagerID, SecretsManagerRegion: b.SecretsManagerRegion, SecretGroupID: b.SecretGroupID, CertificateTemplate: b.CertificateTemplate, Issuer: b.Issuer, TTL: b.TTL}
+	if !policy.Enabled() {
+		return nil, nil
+	}
+	if err := policy.Validate(); err != nil {
+		return nil, err
+	}
+	return &policy, nil
+}
+
+// AuthPolicy is the operator-authored portion of a frozen allocation policy.
+type AuthPolicy struct {
+	VPNServerID          string
+	SecretsManagerID     string
+	SecretsManagerRegion string
+	SecretGroupID        string
+	CertificateTemplate  string
+	Issuer               string
+	TTL                  string
+}
+
+func (p AuthPolicy) Enabled() bool {
+	return p.VPNServerID != "" || p.SecretsManagerID != "" || p.SecretsManagerRegion != "" || p.SecretGroupID != "" || p.CertificateTemplate != "" || p.Issuer != "" || p.TTL != ""
+}
+
+func (p AuthPolicy) Validate() error {
+	for _, field := range []struct {
+		name, value string
+		limit       int
+	}{{"vpn_server_id", p.VPNServerID, 256}, {"secrets_manager_id", p.SecretsManagerID, 256}, {"secrets_manager_region", p.SecretsManagerRegion, 64}, {"secret_group_id", p.SecretGroupID, 256}, {"certificate_template", p.CertificateTemplate, 256}, {"issuer", p.Issuer, 256}, {"ttl", p.TTL, 32}} {
+		if field.value == "" || len(field.value) > field.limit || strings.TrimSpace(field.value) != field.value {
+			return fmt.Errorf("config: network auth policy %s is required", field.name)
+		}
+	}
+	ttl, err := time.ParseDuration(p.TTL)
+	if err != nil || ttl <= 0 || ttl > 30*24*time.Hour {
+		return errors.New("config: network auth policy ttl is invalid")
+	}
+	return nil
 }
 
 // BindingForTarget returns exactly one configured binding for a target.
@@ -354,7 +406,7 @@ func (c NetworkConfig) validate() error {
 			return err
 		}
 		for _, field := range []struct{ name, value string }{
-			{"account_id", binding.AccountID}, {"vpc_id", binding.VPCID}, {"subnet_id", binding.SubnetID}, {"public_gateway_id", binding.PublicGatewayID}, {"zone", binding.Zone},
+			{"account_id", binding.AccountID}, {"vpc_id", binding.VPCID}, {"vpc_region", binding.VPCRegion}, {"subnet_id", binding.SubnetID}, {"public_gateway_id", binding.PublicGatewayID}, {"zone", binding.Zone},
 		} {
 			if strings.TrimSpace(field.value) == "" || len(field.value) > 128 || strings.TrimSpace(field.value) != field.value {
 				return fmt.Errorf("config: network binding %q %s is required", bindingID, field.name)
@@ -362,6 +414,12 @@ func (c NetworkConfig) validate() error {
 		}
 		if !regexp.MustCompile(`^[a-z]+(?:-[a-z]+)+-[0-9]+$`).MatchString(binding.Zone) {
 			return fmt.Errorf("config: network binding %q zone is invalid", bindingID)
+		}
+		if !regexp.MustCompile(`^[a-z]+(?:-[a-z]+)+$`).MatchString(binding.VPCRegion) || !strings.HasPrefix(binding.Zone, binding.VPCRegion+"-") {
+			return fmt.Errorf("config: network binding %q vpc_region must match its zone", bindingID)
+		}
+		if _, err := binding.AuthPolicy(); err != nil {
+			return fmt.Errorf("config: network binding %q: %w", bindingID, err)
 		}
 	}
 	for target, bindingID := range c.TargetBindings {

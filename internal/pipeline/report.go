@@ -10,6 +10,7 @@ import (
 	"io"
 	"reflect"
 	"strings"
+	"time"
 
 	servitorv1alpha1 "github.com/bevicted/servitor/api/v1alpha1"
 )
@@ -21,15 +22,15 @@ var errReadReportLog = errors.New("read report log")
 
 // Report is the only structured output emitted by a Tekton operation.
 type Report struct {
-	Version         int                                `json:"version"`
-	ClusterUID      string                             `json:"clusterUID"`
-	OperationID     string                             `json:"operationID"`
-	ResolvedOptions servitorv1alpha1.ResolvedOptions   `json:"resolvedOptions"`
-	Recovery        servitorv1alpha1.RecoveryMetadata  `json:"recovery"`
-	Review          servitorv1alpha1.ReviewSummary     `json:"review,omitempty"`
-	Ready           servitorv1alpha1.ReadySummary      `json:"ready,omitempty"`
-	PublicAuth      *servitorv1alpha1.PublicAuthStatus `json:"publicAuth,omitempty"`
-	PlanRejection   *servitorv1alpha1.PlanRejection    `json:"planRejection,omitempty"`
+	Version         int                               `json:"version"`
+	ClusterUID      string                            `json:"clusterUID"`
+	OperationID     string                            `json:"operationID"`
+	ResolvedOptions servitorv1alpha1.ResolvedOptions  `json:"resolvedOptions"`
+	Recovery        servitorv1alpha1.RecoveryMetadata `json:"recovery"`
+	Review          servitorv1alpha1.ReviewSummary    `json:"review,omitempty"`
+	Ready           servitorv1alpha1.ReadySummary     `json:"ready,omitempty"`
+	Auth            *servitorv1alpha1.AuthStatus      `json:"auth,omitempty"`
+	PlanRejection   *servitorv1alpha1.PlanRejection   `json:"planRejection,omitempty"`
 }
 
 func (r Report) Validate(expectedUID, expectedOperation string) error {
@@ -40,7 +41,7 @@ func (r Report) Validate(expectedUID, expectedOperation string) error {
 		if err := r.PlanRejection.Validate(); err != nil {
 			return err
 		}
-		if !reflect.DeepEqual(r.ResolvedOptions, servitorv1alpha1.ResolvedOptions{}) || !reflect.DeepEqual(r.Recovery, servitorv1alpha1.RecoveryMetadata{}) || len(r.Review.Resources) != 0 || len(r.Ready.Resources) != 0 || r.PublicAuth != nil {
+		if !reflect.DeepEqual(r.ResolvedOptions, servitorv1alpha1.ResolvedOptions{}) || !reflect.DeepEqual(r.Recovery, servitorv1alpha1.RecoveryMetadata{}) || len(r.Review.Resources) != 0 || len(r.Ready.Resources) != 0 || r.Auth != nil {
 			return errors.New("planning rejection must not contain a success payload")
 		}
 		return nil
@@ -51,8 +52,8 @@ func (r Report) Validate(expectedUID, expectedOperation string) error {
 	if err := validateSummary(r.Ready.Resources); err != nil {
 		return err
 	}
-	if r.PublicAuth != nil && r.PublicAuth.Availability != "available" && r.PublicAuth.Availability != "unavailable" {
-		return errors.New("report has invalid public auth availability")
+	if r.Auth != nil && !validReportAuth(*r.Auth, time.Now()) {
+		return errors.New("report has invalid auth metadata")
 	}
 	if err := r.Recovery.Validate(); err != nil {
 		return fmt.Errorf("report has invalid recovery metadata: %w", err)
@@ -61,6 +62,22 @@ func (r Report) Validate(expectedUID, expectedOperation string) error {
 		return errors.New("report has incomplete resolved options")
 	}
 	return nil
+}
+
+func validReportAuth(status servitorv1alpha1.AuthStatus, now time.Time) bool {
+	switch status.Availability {
+	case "unavailable", "unsupported":
+		return status.Mode == "" && status.Expiry == ""
+	case "available":
+		switch status.Mode {
+		case "public":
+			return status.Expiry == ""
+		case "vpn":
+			expiry, err := time.Parse(time.RFC3339, status.Expiry)
+			return err == nil && expiry.After(now)
+		}
+	}
+	return false
 }
 
 func validateSummary(resources []servitorv1alpha1.SummaryResource) error {

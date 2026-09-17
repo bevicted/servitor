@@ -15,7 +15,7 @@ spec:
     - { name: ict-config-key, type: string }
     - { name: cos-secret, type: string }
     - { name: ibm-secret, type: string }
-    - { name: public-auth-eligible, type: string }
+    - { name: auth-eligible, type: string }
     - { name: auth-secret, type: string }
   stepTemplate:
     env:
@@ -79,7 +79,7 @@ spec:
         - /operation/ict-result.json
         - -report
         - /operation/report.json
-        - -public-auth-eligible=$(params.public-auth-eligible)
+        - -auth-eligible=$(params.auth-eligible)
         - -auth-manifest
         - /auth/manifest.json
         - -auth-output-dir
@@ -149,7 +149,7 @@ spec:
     - { name: ict-config-key, type: string }
     - { name: cos-secret, type: string }
     - { name: ibm-secret, type: string }
-    - { name: public-auth-eligible, type: string }
+    - { name: auth-eligible, type: string }
     - { name: auth-secret, type: string }
   tasks:
     - name: operation
@@ -167,5 +167,5 @@ spec:
         - { name: ict-config-key, value: $(params.ict-config-key) }
         - { name: cos-secret, value: $(params.cos-secret) }
         - { name: ibm-secret, value: $(params.ibm-secret) }
-        - { name: public-auth-eligible, value: $(params.public-auth-eligible) }
+        - { name: auth-eligible, value: $(params.auth-eligible) }
         - { name: auth-secret, value: $(params.auth-secret) }

@@ -30,16 +30,76 @@ import (
 
 func frozenVPCOptions(options servitorv1alpha1.ResolvedOptions) servitorv1alpha1.ResolvedOptions {
 	options.Zone = "us-south-1"
-	options.Network = servitorv1alpha1.FrozenNetwork{BindingID: "existing", AccountID: "account", VPCID: "vpc", SubnetID: "subnet", PublicGatewayID: "gateway", Zone: "us-south-1"}
+	options.Network = servitorv1alpha1.FrozenNetwork{BindingID: "existing", AccountID: "account", VPCRegion: "us-south", VPCID: "vpc", SubnetID: "subnet", PublicGatewayID: "gateway", Zone: "us-south-1"}
 	return options
 }
 
 func frozenVPCValues(values servitorv1alpha1.RecoveryValues) servitorv1alpha1.RecoveryValues {
 	values.Zone = "us-south-1"
+	values.AccountID = "account"
+	values.VPCRegion = "us-south"
 	values.VPCID = "vpc"
 	values.SubnetIDs = []string{"subnet"}
 	values.PublicGatewayIDs = []string{"gateway"}
 	return values
+}
+
+func TestValidateRecoveredNetworkRejectsFrozenFieldOmissionsAndSubstitutions(t *testing.T) {
+	options := frozenVPCOptions(servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Provider: "vpc-gen2"}})
+	options.Network.AuthPolicy = &servitorv1alpha1.FrozenAuthPolicy{
+		AllocationUID: "allocation", VPNServerID: "vpn", SecretsManagerID: "secrets", SecretsManagerRegion: "eu-gb", SecretGroupID: "group", CertificateTemplate: "template", Issuer: "issuer", TTL: "2h",
+	}
+	values := frozenVPCValues(servitorv1alpha1.RecoveryValues{})
+	policy := *options.Network.AuthPolicy
+	values.AuthPolicy = &policy
+	if err := validateRecoveredNetwork(options, values); err != nil {
+		t.Fatalf("valid frozen values rejected: %v", err)
+	}
+
+	cloneValues := func() servitorv1alpha1.RecoveryValues {
+		clone := values
+		clone.SubnetIDs = append([]string(nil), values.SubnetIDs...)
+		clone.PublicGatewayIDs = append([]string(nil), values.PublicGatewayIDs...)
+		policy := *values.AuthPolicy
+		clone.AuthPolicy = &policy
+		return clone
+	}
+	tests := []struct {
+		name       string
+		substitute func(*servitorv1alpha1.RecoveryValues)
+		omit       func(*servitorv1alpha1.RecoveryValues)
+	}{
+		{"account ID", func(v *servitorv1alpha1.RecoveryValues) { v.AccountID = "other-account" }, func(v *servitorv1alpha1.RecoveryValues) { v.AccountID = "" }},
+		{"VPC region", func(v *servitorv1alpha1.RecoveryValues) { v.VPCRegion = "us-east" }, func(v *servitorv1alpha1.RecoveryValues) { v.VPCRegion = "" }},
+		{"VPC ID", func(v *servitorv1alpha1.RecoveryValues) { v.VPCID = "other-vpc" }, func(v *servitorv1alpha1.RecoveryValues) { v.VPCID = "" }},
+		{"zone", func(v *servitorv1alpha1.RecoveryValues) { v.Zone = "us-south-2" }, func(v *servitorv1alpha1.RecoveryValues) { v.Zone = "" }},
+		{"subnet", func(v *servitorv1alpha1.RecoveryValues) { v.SubnetIDs[0] = "other-subnet" }, func(v *servitorv1alpha1.RecoveryValues) { v.SubnetIDs = nil }},
+		{"public gateway", func(v *servitorv1alpha1.RecoveryValues) { v.PublicGatewayIDs[0] = "other-gateway" }, func(v *servitorv1alpha1.RecoveryValues) { v.PublicGatewayIDs = nil }},
+		{"allocation UID", func(v *servitorv1alpha1.RecoveryValues) { v.AuthPolicy.AllocationUID = "other-allocation" }, func(v *servitorv1alpha1.RecoveryValues) { v.AuthPolicy.AllocationUID = "" }},
+		{"VPN server", func(v *servitorv1alpha1.RecoveryValues) { v.AuthPolicy.VPNServerID = "other-vpn" }, func(v *servitorv1alpha1.RecoveryValues) { v.AuthPolicy.VPNServerID = "" }},
+		{"Secrets Manager ID", func(v *servitorv1alpha1.RecoveryValues) { v.AuthPolicy.SecretsManagerID = "other-secrets" }, func(v *servitorv1alpha1.RecoveryValues) { v.AuthPolicy.SecretsManagerID = "" }},
+		{"Secrets Manager region", func(v *servitorv1alpha1.RecoveryValues) { v.AuthPolicy.SecretsManagerRegion = "us-south" }, func(v *servitorv1alpha1.RecoveryValues) { v.AuthPolicy.SecretsManagerRegion = "" }},
+		{"secret group", func(v *servitorv1alpha1.RecoveryValues) { v.AuthPolicy.SecretGroupID = "other-group" }, func(v *servitorv1alpha1.RecoveryValues) { v.AuthPolicy.SecretGroupID = "" }},
+		{"certificate template", func(v *servitorv1alpha1.RecoveryValues) { v.AuthPolicy.CertificateTemplate = "other-template" }, func(v *servitorv1alpha1.RecoveryValues) { v.AuthPolicy.CertificateTemplate = "" }},
+		{"issuer", func(v *servitorv1alpha1.RecoveryValues) { v.AuthPolicy.Issuer = "other-issuer" }, func(v *servitorv1alpha1.RecoveryValues) { v.AuthPolicy.Issuer = "" }},
+		{"TTL", func(v *servitorv1alpha1.RecoveryValues) { v.AuthPolicy.TTL = "1h" }, func(v *servitorv1alpha1.RecoveryValues) { v.AuthPolicy.TTL = "" }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			for _, mutation := range []struct {
+				name  string
+				apply func(*servitorv1alpha1.RecoveryValues)
+			}{{"substitution", test.substitute}, {"omission", test.omit}} {
+				t.Run(mutation.name, func(t *testing.T) {
+					candidate := cloneValues()
+					mutation.apply(&candidate)
+					if err := validateRecoveredNetwork(options, candidate); err == nil {
+						t.Fatal("accepted changed frozen value")
+					}
+				})
+			}
+		})
+	}
 }
 
 func planningValidationFixture(t *testing.T, directory string) (string, string) {
