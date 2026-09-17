@@ -5,6 +5,9 @@ config.yaml
 .env
 .env.*
 
+# Local credential-bearing VPN fixtures.
+/servitor-vpn/
+
 # Servitor private state and diagnostics.
 /state/
 logs/
