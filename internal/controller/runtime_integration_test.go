@@ -99,7 +99,7 @@ type runtimeContractDelivery struct {
 	data  []byte
 }
 
-func (d *runtimeContractDelivery) DeliverKubeconfig(_ context.Context, owner, _ string, data []byte) error {
+func (d *runtimeContractDelivery) DeliverAuthBundle(_ context.Context, owner, _, _, _ string, data, _ []byte) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.calls++

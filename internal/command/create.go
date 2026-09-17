@@ -76,7 +76,7 @@ func (o ExplicitCreateOptions) BareValues() []string {
 	return append([]string(nil), o.bare...)
 }
 
-// AuthRequested reports whether create requested public auth delivery.
+// AuthRequested reports whether create requested auth-bundle delivery.
 func (o ExplicitCreateOptions) AuthRequested() bool { return o.authRequested }
 
 // ApproveRequested reports whether create requested automatic approval after review delivery.

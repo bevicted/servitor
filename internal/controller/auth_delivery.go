@@ -13,7 +13,8 @@ import (
 
 const (
 	authDeliveryTimeout     = time.Minute
-	maxAuthKubeconfigBytes  = 1 << 20
+	maxAuthBundleBytes      = 2 << 20
+	maxAuthFileBytes        = 1 << 20
 	authDeliveryDelivered   = "Delivered"
 	authDeliveryFailed      = "Failed"
 	authDeliveryUnavailable = "Unavailable"
@@ -21,10 +22,10 @@ const (
 	authDeliveryCancelled   = "Cancelled"
 )
 
-// AuthFileDelivery sends a stored kubeconfig only to the persisted allocation owner.
-// Implementations must not log or retain kubeconfig bytes.
+// AuthFileDelivery sends one complete stored bundle only to the persisted allocation owner.
+// Implementations must not log or retain credential-bearing bytes.
 type AuthFileDelivery interface {
-	DeliverKubeconfig(context.Context, string, string, []byte) error
+	DeliverAuthBundle(context.Context, string, string, string, string, []byte, []byte) error
 }
 
 // reconcileAuthDelivery consumes an explicit request before any Secret or Slack
@@ -42,7 +43,7 @@ func (r *Reconciler) reconcileAuthDelivery(ctx context.Context, cluster *servito
 		}
 		return ctrl.Result{}, false, nil
 	}
-	if !authEligible(cluster) {
+	if !authDeliveryEligible(cluster) {
 		return ctrl.Result{}, false, nil
 	}
 
@@ -71,8 +72,8 @@ func (r *Reconciler) reconcileAuthDelivery(ctx context.Context, cluster *servito
 	}
 	cluster = current
 
-	status := authStatus(cluster)
-	if status == nil || status.Availability != "available" || (status.Mode != "" && status.Mode != "public") {
+	status := deliveryStatus(cluster)
+	if status == nil || !validDeliveryStatus(*status, r.now()) {
 		return ctrl.Result{}, true, r.setAuthDeliveryOutcome(ctx, cluster, authDeliveryUnavailable)
 	}
 	secret := &corev1.Secret{}
@@ -86,13 +87,12 @@ func (r *Reconciler) reconcileAuthDelivery(ctx context.Context, cluster *servito
 	if err := validateAuthSecret(secret, cluster, applyID(string(cluster.UID))); err != nil {
 		return ctrl.Result{}, true, r.setAuthDeliveryOutcome(ctx, cluster, authDeliveryUnavailable)
 	}
-	kubeconfig := secret.Data[authSecretDataName]
-	if len(kubeconfig) == 0 || len(kubeconfig) > maxAuthKubeconfigBytes || r.AuthDelivery == nil {
+	kubeconfig, vpn, valid := deliveryBundle(secret.Data, *status)
+	if !valid || r.AuthDelivery == nil {
 		return ctrl.Result{}, true, r.setAuthDeliveryOutcome(ctx, cluster, authDeliveryUnavailable)
 	}
-	copyBytes := append([]byte(nil), kubeconfig...)
 	deliveryCtx, cancel := context.WithTimeout(ctx, authDeliveryTimeout)
-	err := r.AuthDelivery.DeliverKubeconfig(deliveryCtx, cluster.Spec.Slack.OwnerID, clusterName(cluster), copyBytes)
+	err := r.AuthDelivery.DeliverAuthBundle(deliveryCtx, cluster.Spec.Slack.OwnerID, clusterName(cluster), status.Mode, status.Expiry, kubeconfig, vpn)
 	cancel()
 	if err != nil {
 		return ctrl.Result{}, true, r.setAuthDeliveryOutcome(ctx, cluster, authDeliveryFailed)
@@ -105,11 +105,71 @@ func (r *Reconciler) setAuthDeliveryOutcome(ctx context.Context, cluster *servit
 	return r.Status().Update(ctx, cluster)
 }
 
+func authDeliveryEligible(cluster *servitorv1alpha1.ServitorCluster) bool {
+	if cluster.Spec.UserOptions.Provider == "satellite" {
+		return false
+	}
+	if resolved := cluster.Status.ResolvedOptions; resolved != nil && resolved.Provider == "satellite" {
+		return false
+	}
+	return authEligible(cluster)
+}
+
 func authStatus(cluster *servitorv1alpha1.ServitorCluster) *servitorv1alpha1.AuthStatus {
 	if cluster.Status.Auth != nil {
 		return cluster.Status.Auth
 	}
 	return cluster.Status.PublicAuth
+}
+
+func deliveryStatus(cluster *servitorv1alpha1.ServitorCluster) *servitorv1alpha1.AuthStatus {
+	status := authStatus(cluster)
+	if status == nil {
+		return nil
+	}
+	if status.Mode == "" && cluster.Status.Auth == nil && cluster.Status.PublicAuth != nil {
+		legacy := *status
+		legacy.Mode = "public"
+		return &legacy
+	}
+	return status
+}
+
+func validDeliveryStatus(status servitorv1alpha1.AuthStatus, now time.Time) bool {
+	if status.Availability != "available" {
+		return false
+	}
+	switch status.Mode {
+	case "public":
+		return status.Expiry == ""
+	case "vpn":
+		expiry, err := time.Parse(time.RFC3339, status.Expiry)
+		return err == nil && now.Before(expiry)
+	default:
+		return false
+	}
+}
+
+func deliveryBundle(data map[string][]byte, status servitorv1alpha1.AuthStatus) ([]byte, []byte, bool) {
+	expected := 1
+	if status.Mode == "vpn" {
+		expected++
+	}
+	if len(data) != expected {
+		return nil, nil, false
+	}
+	kubeconfig := data[authSecretDataName]
+	vpn := data[authSecretVPNDataName]
+	if len(kubeconfig) == 0 || len(kubeconfig) > maxAuthFileBytes || len(vpn) > maxAuthFileBytes || len(kubeconfig)+len(vpn) > maxAuthBundleBytes {
+		return nil, nil, false
+	}
+	if status.Mode == "public" && len(vpn) != 0 {
+		return nil, nil, false
+	}
+	if status.Mode == "vpn" && len(vpn) == 0 {
+		return nil, nil, false
+	}
+	return append([]byte(nil), kubeconfig...), append([]byte(nil), vpn...), true
 }
 
 func clusterName(cluster *servitorv1alpha1.ServitorCluster) string {

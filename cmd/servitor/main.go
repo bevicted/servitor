@@ -158,10 +158,21 @@ func commandDefaults(operator config.Config) command.CreateDefaults {
 func newSlackBot(operator config.Config, kube client.Client, reader client.Reader, responder slackbot.Responder, permalinks slackbot.PermalinkLookup) slackbot.Bot {
 	return slackbot.Bot{
 		ChannelID: operator.Slack.ChannelID, Namespace: operator.Namespace, Client: allocationClient{Client: kube, reader: reader},
-		MaxAllocationsPerUser: operator.MaxAllocationsPerUser(), Events: state.NewEventStore(kube, operator.Namespace), Defaults: commandDefaults(operator), PublicAuthTargets: append([]string(nil), operator.Auth.PublicTargets...),
+		MaxAllocationsPerUser: operator.MaxAllocationsPerUser(), Events: state.NewEventStore(kube, operator.Namespace), Defaults: commandDefaults(operator), PublicAuthTargets: append([]string(nil), operator.Auth.PublicTargets...), AuthEligibleTargets: authEligibleTargets(operator),
 		InventoryConfigMap: operator.ICT.TargetConfigMap, InventoryConfigKey: operator.ICT.TargetConfigKey, InventoryMaximumAge: operator.InventoryMaximumAge(), MaintainerIDs: operator.Slack.MaintainerIDs,
 		Lease: operator.Lifecycle.Lease, RetryIntervals: operator.Lifecycle.RetryIntervals, Responder: responder, Permalinks: permalinks,
 	}
+}
+
+func authEligibleTargets(operator config.Config) []string {
+	targets := make([]string, 0, len(operator.Network.TargetBindings))
+	for target, bindingID := range operator.Network.TargetBindings {
+		policy, err := operator.Network.Bindings[bindingID].AuthPolicy()
+		if err == nil && policy != nil {
+			targets = append(targets, target)
+		}
+	}
+	return targets
 }
 
 func fail(err error) { _, _ = os.Stderr.WriteString("servitor: " + err.Error() + "\n"); os.Exit(1) }

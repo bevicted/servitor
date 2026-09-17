@@ -227,21 +227,23 @@ func TestCountedAllocationsExcludesOnlyCleanupComplete(t *testing.T) {
 func TestCreateAuthOptInQueuesOnlyEligiblePublicRequests(t *testing.T) {
 	for _, test := range []struct {
 		name, text, target, provider string
-		public                       bool
+		public, auth                 bool
 		wantIntent                   bool
-		unsupported                  bool
 	}{
 		{name: "public bare", text: "auth", target: "public", provider: "vpc-gen2", public: true, wantIntent: true},
 		{name: "public assignment", text: "auth=true", target: "public", provider: "vpc-gen2", public: true, wantIntent: true},
 		{name: "public disabled", text: "auth=false", target: "public", provider: "vpc-gen2", public: true},
 		{name: "public ordinary", text: "version=4.22", target: "public", provider: "vpc-gen2", public: true},
-		{name: "private", text: "auth", target: "private", provider: "vpc-gen2", unsupported: true},
+		{name: "private", text: "auth", target: "private", provider: "vpc-gen2", auth: true, wantIntent: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			bot, responses := botForTest(t)
 			bot.Defaults = command.CreateDefaults{Target: test.target, Provider: test.provider}
 			if test.public {
 				bot.PublicAuthTargets = []string{"public"}
+			}
+			if test.auth {
+				bot.AuthEligibleTargets = []string{"private"}
 			}
 			event := Envelope{ID: "create-" + test.name, Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "<@BOT> create " + test.text, Timestamp: "1710000000.000100"}}
 			if err := bot.Handle(context.Background(), event); err != nil {
@@ -262,11 +264,7 @@ func TestCreateAuthOptInQueuesOnlyEligiblePublicRequests(t *testing.T) {
 			if len(responses.responses) == 0 || responses.responses[0].Text != "Planning..." {
 				t.Fatalf("create response = %+v", responses.responses)
 			}
-			if test.unsupported {
-				if len(responses.responses) != 2 || responses.responses[1].Text != "VPN-backed authentication is not implemented yet" {
-					t.Fatalf("private auth response = %+v", responses.responses)
-				}
-			} else if len(responses.responses) != 1 {
+			if len(responses.responses) != 1 {
 				t.Fatalf("unexpected auth create response = %+v", responses.responses)
 			}
 			if err := bot.Handle(context.Background(), event); err != nil {
@@ -1152,7 +1150,7 @@ func TestCreateRejectsPlatformAndHelpDoesNotAdvertiseIt(t *testing.T) {
 
 func TestCreateHelpDistinguishesDefaultsAliasesStreamsAndProvider(t *testing.T) {
 	help := strings.Join(createHelp(command.CreateDefaults{}, 3), "\n")
-	for _, wanted := range []string{"Configured defaults", "provider=", "key=value", "target=synthetic-target", "resource-group=\"Platform Team\"", "auth=true", "auth=false", "Public `auth`", "Satellite provisioning is not supported", "roks", "iks", "k8s", "default_openshift", "default_kubernetes", "4.17", "prestage", "pretest", "test`/`stage", "dev target"} {
+	for _, wanted := range []string{"Configured defaults", "provider=", "key=value", "target=synthetic-target", "resource-group=\"Platform Team\"", "auth=true", "auth=false", "eligible `auth`", "Satellite provisioning is not supported", "roks", "iks", "k8s", "default_openshift", "default_kubernetes", "4.17", "prestage", "pretest", "test`/`stage", "dev target"} {
 		if !containsText(help, wanted) {
 			t.Fatalf("create help missing %q: %s", wanted, help)
 		}

@@ -65,6 +65,7 @@ type Bot struct {
 	MaintainerIDs         []string
 	InventoryMaximumAge   time.Duration
 	PublicAuthTargets     []string
+	AuthEligibleTargets   []string
 	Lease                 time.Duration
 	RetryIntervals        []time.Duration
 	Responder             Responder
@@ -304,8 +305,8 @@ func (b Bot) create(ctx context.Context, message Message, text string, respond f
 		UserOptions: userOptions,
 		Lifecycle:   servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: int64(b.lease() / time.Second), RetrySeconds: seconds(b.RetryIntervals), AutoApprove: autoApprove},
 	}}
-	publicAuthEligible := b.publicAuthEligible(cluster)
-	if authRequested && publicAuthEligible {
+	authEligible := b.authDeliveryEligible(cluster)
+	if authRequested && authEligible {
 		if _, _, valid := splitSlackTimestamp(message.Timestamp); !valid {
 			respond(rejectedText("Unable to record the authentication request."))
 			return true
@@ -333,8 +334,8 @@ func (b Bot) create(ctx context.Context, message Message, text string, respond f
 		respond(rejectedText("Unable to record the create request. No operation was started."))
 		return false
 	}
-	if authRequested && !publicAuthEligible {
-		respond("VPN-backed authentication is not implemented yet")
+	if authRequested && !authEligible {
+		respond("Authentication delivery is unavailable for this allocation.")
 	}
 	return true
 }
@@ -561,8 +562,8 @@ func (b Bot) auth(ctx context.Context, message Message, thread string, respond f
 		respond(text)
 		return
 	}
-	if !b.publicAuthEligible(cluster) {
-		respond("VPN-backed authentication is not implemented yet")
+	if !b.authDeliveryEligible(cluster) {
+		respond("Authentication delivery is unavailable for this allocation.")
 		return
 	}
 	if _, _, valid := splitSlackTimestamp(message.Timestamp); !valid {
@@ -578,8 +579,8 @@ func (b Bot) auth(ctx context.Context, message Message, thread string, respond f
 			stateText = text
 			return false, nil
 		}
-		if !b.publicAuthEligible(current) {
-			stateText = "VPN-backed authentication is not implemented yet"
+		if !b.authDeliveryEligible(current) {
+			stateText = "Authentication delivery is unavailable for this allocation."
 			return false, nil
 		}
 		if staleAuthEvent(current.Spec.Lifecycle.AuthRequestTimestamp, message.Timestamp) {
@@ -616,9 +617,21 @@ func authUnavailableText(cluster *servitorv1alpha1.ServitorCluster) string {
 	}
 }
 
-func (b Bot) publicAuthEligible(cluster *servitorv1alpha1.ServitorCluster) bool {
+// authDeliveryEligible uses frozen policy before Ready and the adopted stored
+// bundle mode once Ready. The controller separately validates the exact Secret.
+func (b Bot) authDeliveryEligible(cluster *servitorv1alpha1.ServitorCluster) bool {
+	if satelliteAllocation(cluster) {
+		return false
+	}
 	if cluster.Status.LifecycleSnapshot != nil {
-		return cluster.Status.LifecycleSnapshot.PublicAuthEligible
+		if cluster.Status.Phase != servitorv1alpha1.PhaseReady {
+			return cluster.Status.LifecycleSnapshot.AuthEligible || cluster.Status.LifecycleSnapshot.PublicAuthEligible
+		}
+		status := cluster.Status.Auth
+		if status == nil {
+			status = cluster.Status.PublicAuth
+		}
+		return status != nil && status.Availability == "available" && (status.Mode == "public" || status.Mode == "vpn" || (status.Mode == "" && cluster.Status.Auth == nil && cluster.Status.PublicAuth != nil))
 	}
 	provider := cluster.Spec.UserOptions.Provider
 	if provider == "" {
@@ -631,7 +644,11 @@ func (b Bot) publicAuthEligible(cluster *servitorv1alpha1.ServitorCluster) bool 
 	if target == "" {
 		target = b.Defaults.Target
 	}
-	return slices.Contains(b.PublicAuthTargets, target)
+	return slices.Contains(b.PublicAuthTargets, target) || slices.Contains(b.AuthEligibleTargets, target)
+}
+
+func satelliteAllocation(cluster *servitorv1alpha1.ServitorCluster) bool {
+	return cluster.Spec.UserOptions.Provider == "satellite" || (cluster.Status.ResolvedOptions != nil && cluster.Status.ResolvedOptions.Provider == "satellite")
 }
 
 func (b Bot) extend(ctx context.Context, message Message, thread string, respond func(string)) {
@@ -1046,7 +1063,7 @@ func (b Bot) respondHelp(text string, respond func(string), maintainer bool) {
 	case "extend":
 		messages = []string{"`extend [N[h]]` extends your ready lease by the configured duration or by 1 through 24 whole hours. Use it only in your lifecycle thread. It is available only while the lease is ready, not during planning, cleanup, or after expiry."}
 	case "auth":
-		messages = []string{"`auth` sends the stored public kubeconfig to the allocation owner's DM. Use exact `auth` only in the initiating lifecycle thread. Requests made before Ready are queued; a failed or interrupted delivery is not retried automatically, so send a newer `auth` request to resend the stored file. Private-only and Satellite authentication is not implemented yet."}
+		messages = []string{"`auth` sends the complete stored authentication bundle to the allocation owner's DM. Use exact `auth` only in the initiating lifecycle thread. Requests made before Ready are queued; a failed or interrupted delivery is not retried automatically, so send a newer `auth` request to resend the stored files. A VPN bundle includes its actual certificate expiry; extending the lease does not renew it. Satellite authentication is unavailable."}
 	case "list":
 		messages = []string{"`list` shows only your allocations in a table with cluster, state, location, and expires columns. Cleanup in progress and cleanup complete are shown separately. Use it in a DM or as `@servitor list` in the configured channel."}
 	case "refresh":
@@ -1132,7 +1149,7 @@ func (b Bot) unknownText() string {
 }
 func rejectedText(reason string) string { return "Command rejected.\n\n" + reason }
 func helpOverview(maintainer bool, maxAllocationsPerUser int) []string {
-	text := fmt.Sprintf("Servitor provisions up to %d temporary IBM Cloud clusters per Slack user, one per initiating lifecycle thread.\n\nCommands\n```\nDM\n  help [command]          print help\n  list                    list clusters\n\nConfigured channel\n  @servitor help [command]  print help\n  @servitor create [safe options]  provision a new cluster\n  @servitor done            request cleanup for all your allocations in this channel\n  @servitor list            list clusters\n\nLifecycle thread\n  yes                       approve the cluster plan\n  no                        reject the cluster plan\n  done                      release this allocation\n  extend [N[h]]             extend your lease\n  auth                      send stored public access to your DM\n", maxAllocationsPerUser)
+	text := fmt.Sprintf("Servitor provisions up to %d temporary IBM Cloud clusters per Slack user, one per initiating lifecycle thread.\n\nCommands\n```\nDM\n  help [command]          print help\n  list                    list clusters\n\nConfigured channel\n  @servitor help [command]  print help\n  @servitor create [safe options]  provision a new cluster\n  @servitor done            request cleanup for all your allocations in this channel\n  @servitor list            list clusters\n\nLifecycle thread\n  yes                       approve the cluster plan\n  no                        reject the cluster plan\n  done                      release this allocation\n  extend [N[h]]             extend your lease\n  auth                      send stored authentication bundle to your DM\n", maxAllocationsPerUser)
 	if maintainer {
 		text += "\nMaintainer DM\n  refresh inventory         refresh private inventory\n"
 	}
@@ -1140,7 +1157,7 @@ func helpOverview(maintainer bool, maxAllocationsPerUser int) []string {
 }
 func createHelp(defaults command.CreateDefaults, maxAllocationsPerUser int) []string {
 	intro := fmt.Sprintf("`create` starts planning from the configured channel root, up to %d active allocations per user. Repeating create in the same thread preserves that allocation. Configured defaults: version %s, target %s, provider %s.", maxAllocationsPerUser, safeHelpCell(defaults.Version), safeHelpCell(defaults.Target), safeHelpCell(defaults.Provider))
-	return []string{intro + " `provider=value` chooses VPC Gen 2 or Classic infrastructure; Satellite provisioning is not supported for new allocations. Version chooses Kubernetes or OpenShift. Cluster names are generated internally.\n\nSpecify provisioning options as `key=value`. A current common-option inventory also recognizes unique bare values, for example `create target=synthetic-target vpc-gen2 us-south-1 bx2.4x16 resource-group=\"Platform Team\"`. The environment target synonyms `prestage`/`pretest` and `test`/`stage` are interchangeable; `dev` selects the configured dev target. `auth`, `auth=true`, and `auth=false` control only public kubeconfig delivery; the default is no delivery. `approve`, `approve=true`, and `approve=false` control create-time automatic approval; the default remains manual. Automatic approval follows successful plan-summary delivery before the persisted deadline. `yes` cannot bypass that delivery; `no` and `done` retain their existing behavior. Public `auth` queues one owner-DM delivery after Ready. Private-only auth opt-ins continue creating the cluster but report that VPN-backed authentication is not implemented yet. Unknown or colliding shorthand must use a key such as `flavor=value`; worker counts stay keyed. Use `roks` (also `openshift` or `default_openshift`) for the cloud default OpenShift stream, or `iks` (also `kubernetes`, `k8s`, or `default_kubernetes`) for Kubernetes. A compatible numeric stream can refine an alias: `create roks 4.17`. These reserved aliases require a key when used as resource names.\n\nReview the resolved stream and configuration in its thread. The review prompt shows the persisted approval deadline; reply with exact `yes` or `no` before that deadline.", "Safe create options\n```\nCommon\n  target= provider= version= resource-group= worker-count=\n  auth | auth=true | auth=false (public delivery only)\n  approve | approve=true | approve=false (automatic after plan-summary delivery)\n\nVPC Gen 2\n  zone= flavor=\n\nClassic\n  datacenter= machine-type= public-vlan-id= private-vlan-id=\n```"}
+	return []string{intro + " `provider=value` chooses VPC Gen 2 or Classic infrastructure; Satellite provisioning is not supported for new allocations. Version chooses Kubernetes or OpenShift. Cluster names are generated internally.\n\nSpecify provisioning options as `key=value`. A current common-option inventory also recognizes unique bare values, for example `create target=synthetic-target vpc-gen2 us-south-1 bx2.4x16 resource-group=\"Platform Team\"`. The environment target synonyms `prestage`/`pretest` and `test`/`stage` are interchangeable; `dev` selects the configured dev target. `auth`, `auth=true`, and `auth=false` control eligible authentication-bundle delivery; the default is no delivery. `approve`, `approve=true`, and `approve=false` control create-time automatic approval; the default remains manual. Automatic approval follows successful plan-summary delivery before the persisted deadline. `yes` cannot bypass that delivery; `no` and `done` retain their existing behavior. An eligible `auth` opt-in queues one owner-DM delivery after Ready. A VPN bundle includes both stored files and reports its certificate expiry; extending the lease does not renew it. Unknown or colliding shorthand must use a key such as `flavor=value`; worker counts stay keyed. Use `roks` (also `openshift` or `default_openshift`) for the cloud default OpenShift stream, or `iks` (also `kubernetes`, `k8s`, or `default_kubernetes`) for Kubernetes. A compatible numeric stream can refine an alias: `create roks 4.17`. These reserved aliases require a key when used as resource names.\n\nReview the resolved stream and configuration in its thread. The review prompt shows the persisted approval deadline; reply with exact `yes` or `no` before that deadline.", "Safe create options\n```\nCommon\n  target= provider= version= resource-group= worker-count=\n  auth | auth=true | auth=false (eligible bundle delivery)\n  approve | approve=true | approve=false (automatic after plan-summary delivery)\n\nVPC Gen 2\n  zone= flavor=\n\nClassic\n  datacenter= machine-type= public-vlan-id= private-vlan-id=\n```"}
 }
 func safeHelpCell(value string) string {
 	value = strings.Map(func(character rune) rune {

@@ -402,11 +402,11 @@ func authDeliveryNoticeID(uid string, delivery *servitorv1alpha1.AuthDeliverySta
 func authDeliveryOutcomeText(delivery *servitorv1alpha1.AuthDeliveryStatus) string {
 	switch delivery.Outcome {
 	case "Delivered":
-		return "Your requested kubeconfig was sent to your DM."
+		return "Your requested authentication bundle was sent to your DM."
 	case "Failed":
-		return "Unable to deliver the requested kubeconfig to your DM. Send a new `auth` request to retry."
+		return "Unable to deliver the requested authentication bundle to your DM. Send a new `auth` request to retry."
 	case "Unavailable":
-		return "The requested kubeconfig is unavailable. No new credentials were created."
+		return "The requested authentication bundle is unavailable. No new credentials were created."
 	default:
 		return ""
 	}

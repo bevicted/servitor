@@ -16,21 +16,23 @@ import (
 )
 
 type authDeliveryRecorder struct {
-	calls   int
-	owner   string
-	cluster string
-	bytes   []byte
-	err     error
-	before  func()
+	calls        int
+	owner        string
+	cluster      string
+	mode, expiry string
+	bytes, vpn   []byte
+	err          error
+	before       func()
 }
 
-func (d *authDeliveryRecorder) DeliverKubeconfig(_ context.Context, owner, cluster string, kubeconfig []byte) error {
+func (d *authDeliveryRecorder) DeliverAuthBundle(_ context.Context, owner, cluster, mode, expiry string, kubeconfig, vpn []byte) error {
 	if d.before != nil {
 		d.before()
 	}
 	d.calls++
-	d.owner, d.cluster = owner, cluster
+	d.owner, d.cluster, d.mode, d.expiry = owner, cluster, mode, expiry
 	d.bytes = append([]byte(nil), kubeconfig...)
+	d.vpn = append([]byte(nil), vpn...)
 	if len(kubeconfig) > 0 {
 		kubeconfig[0] = 'x'
 	}
@@ -175,12 +177,17 @@ func TestReadyAuthDeliveryConsumesBeforeReadingAndDoesNotReplay(t *testing.T) {
 	}
 }
 
-func TestReadyVPNBundleNeverEntersPublicOneFileDelivery(t *testing.T) {
+func TestReadyVPNBundleDeliversBothStoredFiles(t *testing.T) {
 	now := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
 	cluster := readyAuthCluster("1710000000.000100", now.Add(time.Hour))
 	cluster.Status.PublicAuth = nil
-	cluster.Status.Auth = &servitorv1alpha1.AuthStatus{Availability: "available", Mode: "vpn", Expiry: now.Add(30 * time.Minute).Format(time.RFC3339)}
-	kube, _ := newAuthDeliveryClient(t, cluster, []byte("synthetic-kubeconfig"))
+	expiry := now.Add(30 * time.Minute).Format(time.RFC3339)
+	cluster.Status.Auth = &servitorv1alpha1.AuthStatus{Availability: "available", Mode: "vpn", Expiry: expiry}
+	kube, secret := newAuthDeliveryClient(t, cluster, []byte("synthetic-kubeconfig"))
+	secret.Data[authSecretVPNDataName] = []byte("synthetic-vpn")
+	if err := kube.Update(context.Background(), secret); err != nil {
+		t.Fatal(err)
+	}
 	reader := &authSecretReadRecorder{Reader: kube}
 	recorder := &authDeliveryRecorder{}
 	reconciler := &Reconciler{Client: kube, DirectReader: reader, AuthDelivery: recorder, Now: func() time.Time { return now }}
@@ -192,13 +199,13 @@ func TestReadyVPNBundleNeverEntersPublicOneFileDelivery(t *testing.T) {
 	if _, err := reconciler.reconcileReady(context.Background(), stored); err != nil {
 		t.Fatal(err)
 	}
-	if recorder.calls != 0 || reader.reads != 0 {
-		t.Fatalf("VPN bundle reached public delivery adapter: calls=%d reads=%d", recorder.calls, reader.reads)
+	if recorder.calls != 1 || recorder.mode != "vpn" || recorder.expiry != expiry || string(recorder.bytes) != "synthetic-kubeconfig" || string(recorder.vpn) != "synthetic-vpn" {
+		t.Fatalf("VPN delivery = calls:%d mode:%q expiry:%q", recorder.calls, recorder.mode, recorder.expiry)
 	}
 	if err := kube.Get(context.Background(), key, stored); err != nil {
 		t.Fatal(err)
 	}
-	if stored.Status.AuthDelivery == nil || stored.Status.AuthDelivery.Outcome != authDeliveryUnavailable {
+	if stored.Status.AuthDelivery == nil || stored.Status.AuthDelivery.Outcome != authDeliveryDelivered {
 		t.Fatalf("VPN delivery outcome = %#v", stored.Status.AuthDelivery)
 	}
 }
@@ -382,5 +389,88 @@ func TestExpiredAuthRequestCancelsWithoutDelivery(t *testing.T) {
 	}
 	if recorder.calls != 0 || stored.Status.AuthDelivery == nil || stored.Status.AuthDelivery.Outcome != "Cancelled" || stored.Status.Cleanup == nil {
 		t.Fatalf("expired auth delivery = calls:%d status:%#v", recorder.calls, stored.Status)
+	}
+}
+
+func TestFrozenSatelliteAuthDoesNotConsumeOrReadSecret(t *testing.T) {
+	now := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
+	for _, test := range []struct {
+		name  string
+		setup func(*servitorv1alpha1.ServitorCluster)
+	}{
+		{name: "explicit provider", setup: func(cluster *servitorv1alpha1.ServitorCluster) { cluster.Spec.UserOptions.Provider = "satellite" }},
+		{name: "frozen resolved provider", setup: func(cluster *servitorv1alpha1.ServitorCluster) {
+			cluster.Status.ResolvedOptions.UserOptions.Provider = "satellite"
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cluster := readyAuthCluster("1710000000.000100", now.Add(time.Hour))
+			cluster.Status.LifecycleSnapshot.AuthEligible = true
+			test.setup(cluster)
+			kube, _ := newAuthDeliveryClient(t, cluster, []byte("synthetic-kubeconfig"))
+			reader := &authSecretReadRecorder{Reader: kube}
+			recorder := &authDeliveryRecorder{}
+			key := types.NamespacedName{Namespace: cluster.Namespace, Name: cluster.Name}
+
+			for range 2 {
+				reconciler := &Reconciler{Client: kube, DirectReader: reader, AuthDelivery: recorder, Now: func() time.Time { return now }}
+				stored := &servitorv1alpha1.ServitorCluster{}
+				if err := kube.Get(context.Background(), key, stored); err != nil {
+					t.Fatal(err)
+				}
+				if _, handled, err := reconciler.reconcileAuthDelivery(context.Background(), stored); err != nil || handled {
+					t.Fatalf("Satellite delivery reconciliation = handled:%t err:%v", handled, err)
+				}
+			}
+			stored := &servitorv1alpha1.ServitorCluster{}
+			if err := kube.Get(context.Background(), key, stored); err != nil {
+				t.Fatal(err)
+			}
+			if reader.reads != 0 || recorder.calls != 0 || stored.Status.AuthDelivery != nil || stored.Spec.Lifecycle.AuthRequestTimestamp != "1710000000.000100" {
+				t.Fatalf("Satellite auth caused delivery side effects: reads=%d calls=%d delivery=%#v request=%q", reader.reads, recorder.calls, stored.Status.AuthDelivery, stored.Spec.Lifecycle.AuthRequestTimestamp)
+			}
+		})
+	}
+}
+
+func TestIncompleteOrExpiredVPNBundleIsUnavailableWithoutPartialDelivery(t *testing.T) {
+	now := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
+	for _, test := range []struct {
+		name   string
+		expiry time.Time
+		vpn    []byte
+		reads  int
+	}{
+		{name: "incomplete", expiry: now.Add(time.Hour), reads: 1},
+		{name: "expired", expiry: now, vpn: []byte("synthetic-vpn"), reads: 0},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cluster := readyAuthCluster("1710000000.000100", now.Add(2*time.Hour))
+			cluster.Status.PublicAuth = nil
+			cluster.Status.Auth = &servitorv1alpha1.AuthStatus{Availability: "available", Mode: "vpn", Expiry: test.expiry.Format(time.RFC3339)}
+			kube, secret := newAuthDeliveryClient(t, cluster, []byte("synthetic-kubeconfig"))
+			if len(test.vpn) != 0 {
+				secret.Data[authSecretVPNDataName] = test.vpn
+				if err := kube.Update(context.Background(), secret); err != nil {
+					t.Fatal(err)
+				}
+			}
+			reader := &authSecretReadRecorder{Reader: kube}
+			recorder := &authDeliveryRecorder{}
+			reconciler := &Reconciler{Client: kube, DirectReader: reader, AuthDelivery: recorder, Now: func() time.Time { return now }}
+			stored := &servitorv1alpha1.ServitorCluster{}
+			if err := kube.Get(context.Background(), types.NamespacedName{Namespace: "ns", Name: "cluster"}, stored); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := reconciler.reconcileReady(context.Background(), stored); err != nil {
+				t.Fatal(err)
+			}
+			if err := kube.Get(context.Background(), types.NamespacedName{Namespace: "ns", Name: "cluster"}, stored); err != nil {
+				t.Fatal(err)
+			}
+			if recorder.calls != 0 || reader.reads != test.reads || stored.Status.AuthDelivery == nil || stored.Status.AuthDelivery.Outcome != authDeliveryUnavailable {
+				t.Fatalf("unsafe VPN delivery calls=%d reads=%d status=%#v", recorder.calls, reader.reads, stored.Status.AuthDelivery)
+			}
+		})
 	}
 }

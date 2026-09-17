@@ -35,7 +35,7 @@ func (r *replies) Reply(_ context.Context, response slackbot.Response) error {
 
 type deliveryCounter struct{ calls int }
 
-func (d *deliveryCounter) DeliverKubeconfig(_ context.Context, _, _ string, _ []byte) error {
+func (d *deliveryCounter) DeliverAuthBundle(_ context.Context, _, _, _, _ string, _, _ []byte) error {
 	d.calls++
 	return nil
 }
@@ -210,5 +210,77 @@ func TestOwnerThreadAuthDrivesControllerAndExternalDMUpload(t *testing.T) {
 	}
 	if string(secret.Data["kubeconfig.yaml"]) != "synthetic-kubeconfig" {
 		t.Fatal("delivery modified stored kubeconfig")
+	}
+}
+
+func TestOwnerThreadAuthDeliversCompleteVPNBundleToOwnerDM(t *testing.T) {
+	now := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
+	expiry := now.Add(time.Hour).Format(time.RFC3339)
+	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "slack-28205610339efb8b5404f514", Namespace: "ns", UID: "allocation-uid"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 3600, RetrySeconds: []int64{60}}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseReady, LifecycleSnapshot: &servitorv1alpha1.LifecycleSnapshot{InitialLeaseSeconds: 3600, RetrySeconds: []int64{60}, AuthEligible: true}, Auth: &servitorv1alpha1.AuthStatus{Availability: "available", Mode: "vpn", Expiry: expiry}, ResolvedOptions: &servitorv1alpha1.ResolvedOptions{ClusterName: "private-cluster"}, LeaseExpiresAt: &metav1.Time{Time: now.Add(2 * time.Hour)}}}
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: pipeline.AuthResourceName(string(cluster.UID)), Namespace: "ns", Labels: map[string]string{"servitor.bevicted.github.io/auth-uid": string(cluster.UID)}, Annotations: map[string]string{"servitor.bevicted.github.io/auth-operation": "apply-bb82212777bdc1b9"}}, Data: map[string][]byte{"kubeconfig.yaml": []byte("synthetic-kubeconfig"), "client.ovpn": []byte("synthetic-vpn")}}
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := servitorv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	kube := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&servitorv1alpha1.ServitorCluster{}).WithRuntimeObjects(cluster, secret).Build()
+
+	var uploadNames []string
+	var uploaded [][]byte
+	var completeCalls int
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/conversations.open":
+			if err := request.ParseForm(); err != nil || request.Form.Get("users") != "U1" {
+				t.Fatalf("owner DM request = %v, %v", request.Form, err)
+			}
+			_, _ = writer.Write([]byte(`{"ok":true,"channel":{"id":"D1"}}`))
+		case "/files.getUploadURLExternal":
+			if err := request.ParseForm(); err != nil {
+				t.Fatal(err)
+			}
+			name := request.Form.Get("filename")
+			uploadNames = append(uploadNames, name)
+			_, _ = writer.Write([]byte(`{"ok":true,"upload_url":"` + server.URL + `/upload","file_id":"F` + string(rune('1'+len(uploadNames)-1)) + `"}`))
+		case "/upload":
+			body, err := io.ReadAll(request.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			uploaded = append(uploaded, body)
+			writer.WriteHeader(http.StatusOK)
+		case "/files.completeUploadExternal":
+			completeCalls++
+			if err := request.ParseForm(); err != nil || request.Form.Get("channel_id") != "D1" || !bytes.Contains([]byte(request.Form.Get("initial_comment")), []byte(expiry)) {
+				t.Fatalf("VPN completion = %v, %v", request.Form, err)
+			}
+			_, _ = writer.Write([]byte(`{"ok":true,"files":[{"id":"F1"},{"id":"F2"}]}`))
+		default:
+			writer.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	responses := &replies{}
+	bot := slackbot.Bot{ChannelID: "C1", SelfUserID: "BOT", Namespace: "ns", Client: kube, Events: state.NewEventStore(kube, "ns"), Responder: responses}
+	if err := bot.Handle(context.Background(), slackbot.Envelope{ID: "private-auth", Message: slackbot.Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "auth", Timestamp: "1710000000.000100", ThreadTimestamp: "root"}}); err != nil {
+		t.Fatal(err)
+	}
+	reconciler := &controller.Reconciler{Client: kube, DirectReader: kube, AuthDelivery: slackbot.NewAuthDelivery(slack.New("synthetic-token", slack.OptionAPIURL(server.URL+"/"))), Config: controller.Config{Namespace: "ns"}, Now: func() time.Time { return now }}
+	if _, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "ns", Name: "slack-28205610339efb8b5404f514"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "ns", Name: "slack-28205610339efb8b5404f514"}}); err != nil {
+		t.Fatal(err)
+	}
+	stored := &servitorv1alpha1.ServitorCluster{}
+	if err := kube.Get(context.Background(), types.NamespacedName{Namespace: "ns", Name: "slack-28205610339efb8b5404f514"}, stored); err != nil {
+		t.Fatal(err)
+	}
+	if len(uploadNames) != 2 || uploadNames[0] != "kubeconfig.yaml" || uploadNames[1] != "client.ovpn" || len(uploaded) != 2 || !bytes.Contains(uploaded[0], secret.Data["kubeconfig.yaml"]) || !bytes.Contains(uploaded[1], secret.Data["client.ovpn"]) || completeCalls != 1 {
+		t.Fatalf("VPN bundle routing/upload counts names=%v uploads=%d completes=%d request=%q delivery=%#v", uploadNames, len(uploaded), completeCalls, stored.Spec.Lifecycle.AuthRequestTimestamp, stored.Status.AuthDelivery)
 	}
 }

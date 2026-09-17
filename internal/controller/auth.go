@@ -15,9 +15,10 @@ import (
 )
 
 const (
-	authUIDLabel       = "servitor.bevicted.github.io/auth-uid"
-	authOperationKey   = "servitor.bevicted.github.io/auth-operation"
-	authSecretDataName = "kubeconfig.yaml"
+	authUIDLabel          = "servitor.bevicted.github.io/auth-uid"
+	authOperationKey      = "servitor.bevicted.github.io/auth-operation"
+	authSecretDataName    = "kubeconfig.yaml"
+	authSecretVPNDataName = "client.ovpn"
 )
 
 func authResourceName(cluster *servitorv1alpha1.ServitorCluster) string {

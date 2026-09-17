@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	servitorv1alpha1 "github.com/bevicted/servitor/api/v1alpha1"
+	"github.com/bevicted/servitor/internal/state"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 )
@@ -83,12 +84,59 @@ func TestAuthRejectsCleanupStatesWithoutIntent(t *testing.T) {
 	}
 }
 
-func TestPrivateOrSatelliteThreadAuthIsUnsupportedWithoutIntent(t *testing.T) {
+func TestFrozenSatelliteAuthDoesNotQueueAcrossRestart(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		setup func(*servitorv1alpha1.ServitorCluster)
+	}{
+		{name: "explicit provider", setup: func(cluster *servitorv1alpha1.ServitorCluster) { cluster.Spec.UserOptions.Provider = "satellite" }},
+		{name: "frozen resolved provider", setup: func(cluster *servitorv1alpha1.ServitorCluster) {
+			cluster.Status.ResolvedOptions = &servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Provider: "satellite"}}
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cluster := authCommandCluster(true)
+			cluster.Status.LifecycleSnapshot.AuthEligible = true
+			cluster.Status.Phase = servitorv1alpha1.PhasePending
+			cluster.Spec.Lifecycle.AuthRequestTimestamp = "1710000000.000099"
+			test.setup(cluster)
+			bot, responses := botForTest(t, cluster)
+			request := func(bot Bot, id, timestamp string) {
+				t.Helper()
+				if err := bot.Handle(context.Background(), Envelope{ID: id, Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "auth", Timestamp: timestamp, ThreadTimestamp: "root"}}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			request(bot, "satellite-auth", "1710000000.000100")
+			restarted := bot
+			restarted.Events = state.NewEventStore(bot.Client, "servitor")
+			request(restarted, "satellite-auth-after-restart", "1710000001.000100")
+
+			stored := &servitorv1alpha1.ServitorCluster{}
+			if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: cluster.Name}, stored); err != nil {
+				t.Fatal(err)
+			}
+			if stored.Spec.Lifecycle.AuthRequestTimestamp != "1710000000.000099" || len(responses.responses) != 2 {
+				t.Fatalf("Satellite auth changed queued request: lifecycle=%#v responses=%+v", stored.Spec.Lifecycle, responses.responses)
+			}
+			for _, response := range responses.responses {
+				if response.Text != "Authentication delivery is unavailable for this allocation." {
+					t.Fatalf("Satellite auth response=%+v", responses.responses)
+				}
+			}
+		})
+	}
+}
+
+func TestPrivateFrozenPolicyQueuesAndSatelliteDoesNot(t *testing.T) {
+	private := authCommandCluster(false)
+	private.Status.LifecycleSnapshot = &servitorv1alpha1.LifecycleSnapshot{AuthEligible: true}
 	for _, test := range []struct {
 		name    string
 		cluster *servitorv1alpha1.ServitorCluster
+		want    string
 	}{
-		{name: "frozen private", cluster: authCommandCluster(false)},
+		{name: "frozen private", cluster: private, want: "1710000000.000100"},
 		{name: "unfrozen satellite", cluster: &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: allocationClusterName("C1", "root"), Namespace: "servitor"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}, UserOptions: servitorv1alpha1.UserOptions{Provider: "satellite"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 3600, RetrySeconds: []int64{60}}}}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -100,8 +148,11 @@ func TestPrivateOrSatelliteThreadAuthIsUnsupportedWithoutIntent(t *testing.T) {
 			if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: test.cluster.Name}, stored); err != nil {
 				t.Fatal(err)
 			}
-			if stored.Spec.Lifecycle.AuthRequestTimestamp != "" || len(responses.responses) != 1 || responses.responses[0].Text != "VPN-backed authentication is not implemented yet" {
-				t.Fatalf("private auth recorded state=%#v responses=%+v", stored.Spec.Lifecycle, responses.responses)
+			if stored.Spec.Lifecycle.AuthRequestTimestamp != test.want || len(responses.responses) != 1 {
+				t.Fatalf("auth recorded state=%#v responses=%+v", stored.Spec.Lifecycle, responses.responses)
+			}
+			if test.want == "" && responses.responses[0].Text != "Authentication delivery is unavailable for this allocation." {
+				t.Fatalf("unsupported auth response=%+v", responses.responses)
 			}
 		})
 	}
