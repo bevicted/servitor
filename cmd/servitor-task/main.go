@@ -47,6 +47,8 @@ type ictOperationResult struct {
 type authManifest struct {
 	Version      int    `json:"version"`
 	Availability string `json:"availability"`
+	Mode         string `json:"mode,omitempty"`
+	Expiry       string `json:"expiry,omitempty"`
 	Artifacts    []struct {
 		Name string `json:"name"`
 	} `json:"artifacts,omitempty"`

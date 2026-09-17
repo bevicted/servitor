@@ -93,7 +93,7 @@ func publisherConfig(tokenPath, caPath string) (*rest.Config, error) {
 
 func publicationKubeconfig(manifestPath, outputDir string) ([]byte, error) {
 	manifest, err := readJSON[authManifest](manifestPath)
-	if err != nil || manifest.Version != 1 || manifest.Availability != "available" || len(manifest.Artifacts) != 1 || manifest.Artifacts[0].Name != publishedKubeconfigKey {
+	if err != nil || manifest.Version != 1 || manifest.Availability != "available" || manifest.Mode != "public" || manifest.Expiry != "" || len(manifest.Artifacts) != 1 || manifest.Artifacts[0].Name != publishedKubeconfigKey {
 		return nil, errors.New("invalid public auth manifest")
 	}
 	entries, err := os.ReadDir(outputDir)

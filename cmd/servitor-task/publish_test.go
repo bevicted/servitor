@@ -25,7 +25,7 @@ func TestPublicationKubeconfigAcceptsOnlyCompleteKubeconfigArtifact(t *testing.T
 	if err := os.Mkdir(outputDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	manifest := authManifest{Version: 1, Availability: "available"}
+	manifest := authManifest{Version: 1, Availability: "available", Mode: "public"}
 	manifest.Artifacts = append(manifest.Artifacts, struct {
 		Name string `json:"name"`
 	}{Name: "kubeconfig.yaml"})
