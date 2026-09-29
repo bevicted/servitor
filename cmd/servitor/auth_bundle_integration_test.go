@@ -242,7 +242,7 @@ func runConnectedAuthBundleFlow(t *testing.T, task string, endpoints connectedEn
 	}
 	report, reportErr := pipeline.DecodeReport(reportData, string(stored.UID), stored.Status.Operation.ID)
 	if publicationFailure {
-		if publishErr == nil || len(storedSecret.Data) != 0 || storedSecret.Annotations["servitor.bevicted.github.io/auth-pending-certificate"] != "" || reportErr != nil || report.Auth == nil || report.Auth.Availability != "unavailable" || report.Auth.Reason != "publisher-unavailable" || report.Auth.CleanupOutcome != "cleaned" || report.Auth.Certificate != nil || report.Auth.AttemptID != stored.Status.Operation.AuthAttemptID {
+		if publishErr != nil || len(storedSecret.Data) != 0 || storedSecret.Annotations["servitor.bevicted.github.io/auth-pending-certificate"] != "" || reportErr != nil || report.Auth == nil || report.Auth.Availability != "unavailable" || report.Auth.Reason != "publisher-unavailable" || report.Auth.CleanupOutcome != "cleaned" || report.Auth.Certificate != nil || report.Auth.AttemptID != stored.Status.Operation.AuthAttemptID {
 			t.Fatalf("failed publication did not retain a revoked, recoverable auth result: publish=%v secret=%#v annotations=%#v report=%#v decode=%v", publishErr, storedSecret.Data, storedSecret.Annotations, report.Auth, reportErr)
 		}
 		run.Status.Status.Conditions = duckv1.Conditions{{Type: apis.ConditionSucceeded, Status: corev1.ConditionTrue}}
