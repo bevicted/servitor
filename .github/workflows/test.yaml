@@ -18,3 +18,11 @@ jobs:
           go-version-file: go.mod
           cache: true
       - run: make test
+
+  publish:
+    needs: test
+    if: success() && github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'bevicted/servitor'
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/publish.yaml

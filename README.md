@@ -18,13 +18,23 @@ Controller restart recovery is supported: persisted operations, status snapshots
 
 ## Deploy
 
-Build immutable operator and task images, then replace the digest placeholders in the deployment overlay:
+Build immutable operator and task images with tags, then use their registry digests to replace the digest placeholders in the deployment overlay. `docker build --tag` accepts a tag, not a digest reference.
 
 ```sh
-make operator-image OPERATOR_IMAGE=registry.example/servitor-operator@sha256:...
-make task-image TASK_IMAGE=registry.example/servitor-task@sha256:...
+make operator-image OPERATOR_IMAGE=registry.example/servitor-operator:dev
+make task-image TASK_IMAGE=registry.example/servitor-task:dev
 kubectl kustomize config/default
 ```
+
+Deploy `registry.example/servitor-operator@sha256:...` and `registry.example/servitor-task@sha256:...` after the registry reports their digests.
+
+### GitHub Container Registry publication
+
+A successful push to `main` in `bevicted/servitor` runs the test gate and then publishes `linux/amd64` images to `ghcr.io/bevicted/servitor-operator` and `ghcr.io/bevicted/servitor-task`. Each image receives `latest` and `sha-<full-servitor-commit>` tags. `latest` is a development build. SHA tags provide source traceability but are mutable because rebuilding can use changed base-image tags or dependency downloads. Deploy digest-qualified references reported by the successful workflow instead.
+
+Publication constructs a clean build context from committed Servitor and pinned ICT source, not a developer checkout. The task image's exact ICT revision is in `build/ict-revision`. Update that file only to a compatible, exact 40-character commit SHA which is available from `github.com/bevicted/ict`; an unavailable pin stops publication rather than falling back to a branch. The workflow builds, smoke-tests, and inspects both final images before authenticating or pushing.
+
+The repository's GitHub Actions token needs package write access for both GHCR packages. Before initial public access, review the actual published image contents and then configure each package's visibility and repository access in GitHub package settings. Cross-package pushes are not atomic: a registry failure can leave one image published, so only a successful workflow run confirms an image pair.
 
 Copy `config.example.yaml` to the ConfigMap input used by `config/default`. It contains only non-secret deployment settings: namespace, Slack channel ID and per-user allocation cap, safe defaults, lifecycle and private inventory refresh policy, ICT target ConfigMap, COS S3 identity, task image digest, and Secret names. `slack.max_allocations_per_user` defaults to 3 when omitted or zero and is read only at operator startup; restart the operator after changing it. Lowering the cap leaves existing allocations usable and blocks only new creates until the owner's active count is below the cap. `config/default/operator-references.env` supplies resource names. Do not put Slack, IBM Cloud, or COS HMAC values in configuration, CRs, status, CLI arguments, reports, or source control.
 

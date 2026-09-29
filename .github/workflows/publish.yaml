@@ -1,0 +1,169 @@
+name: publish images
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: publish-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      PLATFORM: linux/amd64
+      OPERATOR_LOCAL_IMAGE: servitor-operator:ci
+      TASK_LOCAL_IMAGE: servitor-task:ci
+      OPERATOR_IMAGE: ghcr.io/bevicted/servitor-operator
+      TASK_IMAGE: ghcr.io/bevicted/servitor-task
+    steps:
+      - name: Check out Servitor source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: servitor-oss
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Validate ICT revision
+        id: ict
+        working-directory: servitor-oss
+        shell: bash
+        run: |
+          set -euo pipefail
+          revision=$(tr -d '\r\n' < build/ict-revision)
+          if [[ ! $revision =~ ^[0-9a-f]{40}$ ]]; then
+            echo "build/ict-revision must contain one 40-character lowercase SHA" >&2
+            exit 1
+          fi
+          probe=$(mktemp -d)
+          if ! git -C "$probe" init --quiet || ! git -C "$probe" fetch --depth=1 https://github.com/bevicted/ict.git "$revision"; then
+            rm -rf "$probe"
+            echo "pinned ICT revision is unavailable from github.com/bevicted/ict" >&2
+            exit 1
+          fi
+          rm -rf "$probe"
+          echo "revision=$revision" >> "$GITHUB_OUTPUT"
+
+      - name: Check out pinned ICT source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: bevicted/ict
+          ref: ${{ steps.ict.outputs.revision }}
+          path: ict
+          persist-credentials: false
+
+      - name: Create clean build context
+        shell: bash
+        run: |
+          set -euo pipefail
+          context=$(mktemp -d)
+          echo "context=$context" >> "$GITHUB_ENV"
+
+          copy_tracked() {
+            local source=$1 destination=$2
+            shift 2
+            git -C "$source" ls-files -z -- "$@" | while IFS= read -r -d '' file; do
+              mkdir -p "$destination/$(dirname "$file")"
+              cp "$source/$file" "$destination/$file"
+            done
+          }
+
+          mkdir -p "$context/servitor-oss" "$context/ict"
+          copy_tracked servitor-oss "$context/servitor-oss" go.mod go.sum build/operator.Dockerfile build/task.Dockerfile api cmd internal
+          copy_tracked ict "$context/ict" go.mod go.sum ':(top,glob)*.go' ':(top,glob)!*_test.go' internal
+
+          test -f "$context/ict/internal/terraform/assets/.terraform.lock.hcl"
+          test -f "$context/ict/internal/terraform/auth-assets/.terraform.lock.hcl"
+          test ! -e "$context/servitor-oss/.git"
+          test ! -e "$context/ict/.git"
+          test ! -e "$context/servitor-oss/config.example.yaml"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+
+      - name: Build final runtime images
+        shell: bash
+        env:
+          SOURCE_LABEL: https://github.com/${{ github.repository }}
+          SERVITOR_REVISION: ${{ github.sha }}
+          ICT_REVISION: ${{ steps.ict.outputs.revision }}
+        run: |
+          set -euo pipefail
+          labels=(
+            --label "org.opencontainers.image.source=$SOURCE_LABEL"
+            --label "org.opencontainers.image.revision=$SERVITOR_REVISION"
+          )
+          docker buildx build --platform "$PLATFORM" --load --file "$context/servitor-oss/build/operator.Dockerfile" --tag "$OPERATOR_LOCAL_IMAGE" "${labels[@]}" "$context/servitor-oss"
+          docker buildx build --platform "$PLATFORM" --load --file "$context/servitor-oss/build/task.Dockerfile" --tag "$TASK_LOCAL_IMAGE" "${labels[@]}" --label "org.opencontainers.image.ict-revision=$ICT_REVISION" "$context"
+
+      - name: Smoke and inspect final images
+        shell: bash
+        env:
+          SOURCE_LABEL: https://github.com/${{ github.repository }}
+          SERVITOR_REVISION: ${{ github.sha }}
+          ICT_REVISION: ${{ steps.ict.outputs.revision }}
+        run: |
+          set -euo pipefail
+          docker run --rm --entrypoint /usr/local/bin/servitor "$OPERATOR_LOCAL_IMAGE" -h
+          docker run --rm --entrypoint /usr/local/bin/servitor-task "$TASK_LOCAL_IMAGE" -h
+          docker run --rm --entrypoint /usr/local/bin/ict "$TASK_LOCAL_IMAGE" --help
+          docker run --rm --entrypoint /usr/local/bin/terraform "$TASK_LOCAL_IMAGE" version
+
+          for image in "$OPERATOR_LOCAL_IMAGE" "$TASK_LOCAL_IMAGE"; do
+            docker image inspect "$image" --format '{{.Architecture}} {{.Config.User}} {{index .Config.Labels "org.opencontainers.image.source"}} {{index .Config.Labels "org.opencontainers.image.revision"}}' | grep -Fx "amd64 65532:0 $SOURCE_LABEL $SERVITOR_REVISION"
+            archive=$(mktemp)
+            docker save "$image" -o "$archive"
+            tar -tf "$archive" | grep -E '^(manifest.json|[^/]+/json|[^/]+/layer.tar)$'
+            rm -f "$archive"
+          done
+          docker image inspect "$OPERATOR_LOCAL_IMAGE" --format '{{json .Config.Entrypoint}}' | grep -Fx '["/usr/local/bin/servitor"]'
+          docker image inspect "$TASK_LOCAL_IMAGE" --format '{{json .Config.Entrypoint}}' | grep -Fx '["/usr/local/bin/servitor-task"]'
+          docker image inspect "$TASK_LOCAL_IMAGE" --format '{{index .Config.Labels "org.opencontainers.image.ict-revision"}}' | grep -Fx "$ICT_REVISION"
+
+          inspect_rootfs() {
+            local image=$1 binary=$2 rootfs container
+            rootfs=$(mktemp)
+            container=$(docker create "$image")
+            docker export "$container" -o "$rootfs"
+            docker rm "$container" >/dev/null
+            tar -tf "$rootfs" | grep -Fx "usr/local/bin/$binary" >&2
+            ! tar -tf "$rootfs" | grep -E '(^|/)(\.git|config\.yaml|\.env|[^/]+\.token)$' >&2
+            printf '%s\n' "$rootfs"
+          }
+          operator_rootfs=$(inspect_rootfs "$OPERATOR_LOCAL_IMAGE" servitor)
+          task_rootfs=$(inspect_rootfs "$TASK_LOCAL_IMAGE" servitor-task)
+          trap 'rm -f "$operator_rootfs" "$task_rootfs"' EXIT
+          tar -tf "$task_rootfs" | grep -Fx 'usr/local/bin/ict'
+          tar -tf "$task_rootfs" | grep -Fx 'usr/local/bin/terraform'
+          tar -tf "$task_rootfs" | grep -Fx 'usr/share/ict/.terraform.lock.hcl'
+          tar -xOf "$task_rootfs" usr/share/ict/.terraform.lock.hcl | grep -F 'registry.terraform.io/ibm-cloud/ibm'
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push inspected images and write digests
+        shell: bash
+        run: |
+          set -euo pipefail
+          revision=$GITHUB_SHA
+          for pair in "$OPERATOR_LOCAL_IMAGE $OPERATOR_IMAGE" "$TASK_LOCAL_IMAGE $TASK_IMAGE"; do
+            read -r local remote <<< "$pair"
+            docker tag "$local" "$remote:sha-$revision"
+            docker tag "$local" "$remote:latest"
+            docker push "$remote:sha-$revision"
+            docker push "$remote:latest"
+            digest=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$remote:sha-$revision")
+            if [[ ! $digest =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "registry did not return a usable digest for $remote" >&2
+              exit 1
+            fi
+            echo "- \`$remote@$digest\`" >> "$GITHUB_STEP_SUMMARY"
+          done
