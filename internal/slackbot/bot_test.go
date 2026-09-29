@@ -9,6 +9,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	servitorv1alpha1 "github.com/bevicted/servitor/api/v1alpha1"
 	"github.com/bevicted/servitor/internal/command"
@@ -1158,6 +1159,43 @@ func TestCreateHelpDistinguishesDefaultsAliasesStreamsAndProvider(t *testing.T) 
 	for _, forbidden := range []string{"--key=value", "--key value", "--provider", "config=", "resource-group=", "satellite-zone=", "Satellite\n  "} {
 		if containsText(help, forbidden) {
 			t.Fatalf("create help advertises unsupported form %q: %s", forbidden, help)
+		}
+	}
+}
+
+func TestCreateOptionsHelpRoutesAndMatchesApprovedReference(t *testing.T) {
+	const want = "```\nKeyed form                    Bare form\n  target=<target>               <target>\n  provider=<provider>           <provider>\n  version=<version>             <version>\n  worker-count=<1-100>           -\n  auth=true | auth=false        auth\n  approve=true | approve=false  approve\n  private-only=true             private-only\n  private-only=false            -\n  zone=<zone>                   <zone>\n  flavor=<flavor>               <flavor>\n  datacenter=<datacenter>       <datacenter>\n  machine-type=<type>           <type>\n  public-vlan-id=<id>           -\n  private-vlan-id=<id>          -\n\nTargets\n  <configured-target>\n  prestage | pretest\n  stage | test\n\nProviders\n  vpc-gen2 | classic\n\nVersions\n  roks | openshift | default_openshift\n  iks | kubernetes | k8s | default_kubernetes\n  <numeric-version>\n  <numeric-version>_openshift\n\nVersion refinement\n  <alias> <compatible-numeric-version>\n```"
+
+	bot, responses := botForTest(t)
+	for index, test := range []struct {
+		envelope Envelope
+		channel  string
+		thread   string
+		text     string
+	}{
+		{Envelope{ID: "create-options-dm", Message: Message{Channel: "D1", ChannelType: "im", User: "U1", Text: "help create-options", Timestamp: "dm-ts"}}, "D1", "", want},
+		{Envelope{ID: "create-options-channel", Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "<@BOT> help create-options", Timestamp: "channel-ts"}}, "C1", "channel-ts", want},
+		{Envelope{ID: "create-options-unknown", Message: Message{Channel: "D1", ChannelType: "im", User: "U1", Text: "help unknown", Timestamp: "unknown-ts"}}, "D1", "", bot.unknownText()},
+		{Envelope{ID: "create-options-extra", Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "<@BOT> help create-options extra", Timestamp: "extra-ts"}}, "C1", "extra-ts", bot.unknownText()},
+	} {
+		if err := bot.Handle(context.Background(), test.envelope); err != nil {
+			t.Fatal(err)
+		}
+		if len(responses.responses) != index+1 {
+			t.Fatalf("response count = %d, want %d", len(responses.responses), index+1)
+		}
+		response := responses.responses[index]
+		if response.Channel != test.channel || response.ThreadTimestamp != test.thread || response.Text != test.text {
+			t.Fatalf("response = %+v, want channel=%q thread=%q text=%q", response, test.channel, test.thread, test.text)
+		}
+		if index < 2 && (len(response.Text) >= maxSlackMessage || !utf8.ValidString(response.Text) || strings.Count(response.Text, "```")%2 != 0) {
+			t.Fatalf("invalid create-options help: bytes=%d utf8=%t fences=%d", len(response.Text), utf8.ValidString(response.Text), strings.Count(response.Text, "```"))
+		}
+	}
+
+	for _, forbidden := range []string{"Satellite", "platform=", "resource-group=", "config=", "--", "worker-count=<1-100>           <"} {
+		if strings.Contains(want, forbidden) {
+			t.Fatalf("create-options help advertises unsupported form %q: %s", forbidden, want)
 		}
 	}
 }
