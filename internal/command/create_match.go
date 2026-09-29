@@ -56,7 +56,7 @@ func ResolveBareSelectors(options ExplicitCreateOptions, defaults CreateDefaults
 	if !contains(targetConfig.Providers, provider) {
 		return ExplicitCreateOptions{}, inventory.TargetConfig{}, fmt.Errorf("provider is not configured for the selected target; use provider=value")
 	}
-	return ExplicitCreateOptions{values: values, bare: bare, authRequested: options.authRequested, approveRequested: options.approveRequested}, targetConfig, nil
+	return ExplicitCreateOptions{values: values, bare: bare, authRequested: options.authRequested, approveRequested: options.approveRequested, privateOnly: options.privateOnly}, targetConfig, nil
 }
 
 // MatchBareCreateOptions promotes uniquely recognized common catalog values.
@@ -98,10 +98,10 @@ func MatchBareCreateOptions(options ExplicitCreateOptions, defaults CreateDefaul
 	for _, value := range options.bare {
 		roles := matchingRoles(catalog, provider, zone, datacenter, satelliteRegion, value)
 		if len(roles) == 0 {
-			return ExplicitCreateOptions{}, fmt.Errorf("unknown shorthand value %q; use an explicit key such as resource-group=value", value)
+			return ExplicitCreateOptions{}, fmt.Errorf("unknown shorthand value %q; use an explicit key such as flavor=value", value)
 		}
 		if len(roles) != 1 {
-			return ExplicitCreateOptions{}, fmt.Errorf("ambiguous shorthand value; use an explicit key such as resource-group=value")
+			return ExplicitCreateOptions{}, fmt.Errorf("ambiguous shorthand value; use an explicit key such as flavor=value")
 		}
 		flag := roles[0]
 		if one(values, flag) != "" {
@@ -109,16 +109,11 @@ func MatchBareCreateOptions(options ExplicitCreateOptions, defaults CreateDefaul
 		}
 		values[flag] = []string{value}
 	}
-	return ExplicitCreateOptions{values: values, authRequested: options.authRequested, approveRequested: options.approveRequested}, nil
+	return ExplicitCreateOptions{values: values, authRequested: options.authRequested, approveRequested: options.approveRequested, privateOnly: options.privateOnly}, nil
 }
 
 func matchingRoles(catalog inventory.Catalog, provider, zone, datacenter, satelliteRegion, value string) []string {
-	roles := make([]string, 0, 3)
-	for _, group := range catalog.ResourceGroups {
-		if group == value {
-			roles = append(roles, "--resource-group")
-		}
-	}
+	roles := make([]string, 0, 2)
 	switch provider {
 	case "vpc-gen2":
 		for _, location := range catalog.VPCLocations {

@@ -10,18 +10,19 @@ import (
 
 // CreateDefaults are operator-controlled values supplied to every create.
 type CreateDefaults struct {
-	Version, Target, Provider, ResourceGroup string
-	OpenShiftFlavor, KubernetesFlavor        string
+	Version, Target, Provider         string
+	OpenShiftFlavor, KubernetesFlavor string
 }
 
 // CreateRequest is the validated, shell-free provisioning option vector.
 type CreateRequest struct {
-	Target, Platform, Version, Provider, ResourceGroup string
-	WorkerShape, WorkerCount                           string
-	Location, Zone, Datacenter                         string
-	SatelliteZones                                     []string
-	PublicVLANID, PrivateVLANID, SatelliteLocationID   string
-	Args                                               []string
+	Target, Platform, Version, Provider              string
+	PrivateOnly                                      bool
+	WorkerShape, WorkerCount                         string
+	Location, Zone, Datacenter                       string
+	SatelliteZones                                   []string
+	PublicVLANID, PrivateVLANID, SatelliteLocationID string
+	Args                                             []string
 }
 
 func normalizedLocation(provider, zone, datacenter string, satelliteZones []string) string {
@@ -42,7 +43,7 @@ func normalizedLocation(provider, zone, datacenter string, satelliteZones []stri
 
 var createFlags = map[string]bool{
 	"--target": true, "--provider": true, "--version": true,
-	"--resource-group": true, "--zone": true, "--flavor": true, "--datacenter": true,
+	"--zone": true, "--flavor": true, "--datacenter": true,
 	"--machine-type": true, "--public-vlan-id": true, "--private-vlan-id": true,
 	"--satellite-zone": true, "--satellite-managed-from": true, "--satellite-location-id": true,
 	"--satellite-host-image": true, "--satellite-host-profile": true,
@@ -60,6 +61,7 @@ type ExplicitCreateOptions struct {
 	bare             []string
 	authRequested    bool
 	approveRequested bool
+	privateOnly      bool
 }
 
 // Values returns a copy of the explicitly supplied safe flag values.
@@ -81,6 +83,9 @@ func (o ExplicitCreateOptions) AuthRequested() bool { return o.authRequested }
 
 // ApproveRequested reports whether create requested automatic approval after review delivery.
 func (o ExplicitCreateOptions) ApproveRequested() bool { return o.approveRequested }
+
+// PrivateOnly reports whether create requested a private endpoint only.
+func (o ExplicitCreateOptions) PrivateOnly() bool { return o.privateOnly }
 
 // WorkerCount returns the explicit worker count, or zero when it was omitted.
 func (o ExplicitCreateOptions) WorkerCount() (int, error) {
@@ -108,18 +113,22 @@ func ParseCreateOptions(text string) (ExplicitCreateOptions, error) {
 	var bare []string
 	authRequested := false
 	approveRequested := false
+	privateOnly := false
 	for _, word := range words[1:] {
 		key, value, assigned := strings.Cut(word, "=")
 		if !assigned {
-			if word == "auth" || word == "approve" {
+			if word == "auth" || word == "approve" || word == "private-only" {
 				if seen[word] {
 					return ExplicitCreateOptions{}, fmt.Errorf("%s may only be supplied once", word)
 				}
 				seen[word] = true
-				if word == "auth" {
+				switch word {
+				case "auth":
 					authRequested = true
-				} else {
+				case "approve":
 					approveRequested = true
+				case "private-only":
+					privateOnly = true
 				}
 				continue
 			}
@@ -138,7 +147,7 @@ func ParseCreateOptions(text string) (ExplicitCreateOptions, error) {
 		if strings.HasPrefix(key, "-") {
 			return ExplicitCreateOptions{}, fmt.Errorf("create options must use key=value without leading dashes")
 		}
-		if key == "auth" || key == "approve" {
+		if key == "auth" || key == "approve" || key == "private-only" {
 			if seen[key] {
 				return ExplicitCreateOptions{}, fmt.Errorf("%s may only be supplied once", key)
 			}
@@ -146,10 +155,13 @@ func ParseCreateOptions(text string) (ExplicitCreateOptions, error) {
 				return ExplicitCreateOptions{}, fmt.Errorf("%s must be true or false", key)
 			}
 			seen[key] = true
-			if key == "auth" {
+			switch key {
+			case "auth":
 				authRequested = value == "true"
-			} else {
+			case "approve":
 				approveRequested = value == "true"
+			case "private-only":
+				privateOnly = value == "true"
 			}
 			continue
 		}
@@ -179,7 +191,7 @@ func ParseCreateOptions(text string) (ExplicitCreateOptions, error) {
 		seen[flag] = true
 		values[flag] = append(values[flag], value)
 	}
-	options := ExplicitCreateOptions{values: values, bare: bare, authRequested: authRequested, approveRequested: approveRequested}
+	options := ExplicitCreateOptions{values: values, bare: bare, authRequested: authRequested, approveRequested: approveRequested, privateOnly: privateOnly}
 	if _, err := options.WorkerCount(); err != nil {
 		return ExplicitCreateOptions{}, err
 	}
@@ -198,7 +210,7 @@ func ParseCreate(text string, defaults CreateDefaults) (CreateRequest, error) {
 // ResolveCreateOptions overlays startup defaults once onto explicit options.
 func ResolveCreateOptions(options ExplicitCreateOptions, defaults CreateDefaults) (CreateRequest, error) {
 	if len(options.bare) != 0 {
-		return CreateRequest{}, fmt.Errorf("unknown shorthand value %q; use an explicit key such as resource-group=value", options.bare[0])
+		return CreateRequest{}, fmt.Errorf("unknown shorthand value %q; use an explicit key such as flavor=value", options.bare[0])
 	}
 	values := make(map[string][]string, len(options.values))
 	for flag, supplied := range options.values {
@@ -225,7 +237,6 @@ func ResolveCreateOptions(options ExplicitCreateOptions, defaults CreateDefaults
 	}
 	setDefault("--target", defaults.Target)
 	setDefault("--provider", defaults.Provider)
-	setDefault("--resource-group", defaults.ResourceGroup)
 	if one(values, "--provider") == "vpc-gen2" {
 		if platform == "openshift" {
 			setDefault("--flavor", defaults.OpenShiftFlavor)
@@ -233,7 +244,7 @@ func ResolveCreateOptions(options ExplicitCreateOptions, defaults CreateDefaults
 			setDefault("--flavor", defaults.KubernetesFlavor)
 		}
 	}
-	ordered := []string{"--target", "--provider", "--platform", "--version", "--resource-group", "--zone", "--flavor", "--datacenter", "--machine-type", "--public-vlan-id", "--private-vlan-id", "--satellite-zone", "--satellite-managed-from", "--satellite-location-id", "--satellite-host-image", "--satellite-host-profile", "--satellite-ssh-key-id", "--satellite-worker-instance-id", "--satellite-worker-operating-system", "--worker-count"}
+	ordered := []string{"--target", "--provider", "--platform", "--version", "--zone", "--flavor", "--datacenter", "--machine-type", "--public-vlan-id", "--private-vlan-id", "--satellite-zone", "--satellite-managed-from", "--satellite-location-id", "--satellite-host-image", "--satellite-host-profile", "--satellite-ssh-key-id", "--satellite-worker-instance-id", "--satellite-worker-operating-system", "--worker-count"}
 	args := make([]string, 0, len(values)*2+12)
 	for _, flag := range ordered {
 		for _, value := range values[flag] {
@@ -245,7 +256,7 @@ func ResolveCreateOptions(options ExplicitCreateOptions, defaults CreateDefaults
 		Platform:            platform,
 		Version:             version,
 		Provider:            one(values, "--provider"),
-		ResourceGroup:       one(values, "--resource-group"),
+		PrivateOnly:         options.privateOnly,
 		WorkerShape:         first(one(values, "--flavor"), one(values, "--machine-type"), one(values, "--satellite-host-profile")),
 		WorkerCount:         one(values, "--worker-count"),
 		Zone:                one(values, "--zone"),

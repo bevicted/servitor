@@ -20,7 +20,7 @@ func TestRunnerUsesArgumentVectorAndBoundsOutput(t *testing.T) {
 	}
 	t.Setenv("SERVITOR_COMMAND_HELPER", "1")
 	var stdout, stderr bytes.Buffer
-	runner := Runner{MaxOutput: 8, Stdout: &stdout, Stderr: &stderr}
+	runner := Runner{MaxOutput: 8, Stdout: &stdout, Stderr: &stderr, Env: os.Environ()}
 	result, err := runner.Run(context.Background(), os.Args[0], "-test.run=TestRunnerUsesArgumentVectorAndBoundsOutput", "--", "literal;not-a-shell-command")
 	if err != nil {
 		t.Fatal(err)
@@ -44,7 +44,7 @@ func TestRunnerFailureLogRedactsSensitiveInputs(t *testing.T) {
 	t.Setenv("SERVITOR_COMMAND_ENV", environmentSecret)
 	var logs bytes.Buffer
 
-	result, err := (Runner{Log: &logs}).Run(context.Background(), os.Args[0], "-test.run=TestRunnerFailureLogRedactsSensitiveInputs", "--", argumentSecret)
+	result, err := (Runner{Log: &logs, Env: os.Environ()}).Run(context.Background(), os.Args[0], "-test.run=TestRunnerFailureLogRedactsSensitiveInputs", "--", argumentSecret)
 	if err == nil {
 		t.Fatal("Run returned nil error")
 	}
@@ -72,7 +72,7 @@ func TestRunnerResolvesBareNamesAndPreservesExplicitPaths(t *testing.T) {
 	}
 	t.Setenv("PATH", directory)
 
-	result, err := (Runner{}).Run(context.Background(), "bare-command")
+	result, err := (Runner{Env: os.Environ()}).Run(context.Background(), "bare-command")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,12 +80,36 @@ func TestRunnerResolvesBareNamesAndPreservesExplicitPaths(t *testing.T) {
 		t.Errorf("bare command output = %q, want %q", result.Stdout, "bare")
 	}
 
-	result, err = (Runner{}).Run(context.Background(), explicitPath)
+	result, err = (Runner{Env: os.Environ()}).Run(context.Background(), explicitPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if result.Stdout != "explicit" {
 		t.Errorf("explicit command output = %q, want %q", result.Stdout, "explicit")
+	}
+}
+
+func TestRunnerEnvironmentSelection(t *testing.T) {
+	if os.Args[len(os.Args)-1] == "runner-environment-helper" {
+		_, _ = os.Stdout.WriteString(os.Getenv("SERVITOR_COMMAND_SENTINEL") + "\n" + os.Getenv("SERVITOR_COMMAND_UNRELATED"))
+		return
+	}
+	const sentinel = "explicit-sentinel"
+	t.Setenv("SERVITOR_COMMAND_SENTINEL", sentinel)
+	t.Setenv("SERVITOR_COMMAND_UNRELATED", "parent-only")
+	args := []string{"-test.run=TestRunnerEnvironmentSelection", "--", "runner-environment-helper"}
+
+	result, err := (Runner{}).Run(context.Background(), os.Args[0], args...)
+	if err != nil || result.Stdout != sentinel+"\nparent-onlyPASS\n" {
+		t.Fatalf("inherited child environment = %q, %v", result.Stdout, err)
+	}
+	result, err = (Runner{Env: []string{}}).Run(context.Background(), os.Args[0], args...)
+	if err != nil || result.Stdout != "\nPASS\n" {
+		t.Fatalf("empty child environment = %q, %v; want empty", result.Stdout, err)
+	}
+	result, err = (Runner{Env: []string{"SERVITOR_COMMAND_SENTINEL=" + sentinel}}).Run(context.Background(), os.Args[0], args...)
+	if err != nil || result.Stdout != sentinel+"\nPASS\n" {
+		t.Fatalf("explicit child environment = %q, %v; want only sentinel", result.Stdout, err)
 	}
 }
 
@@ -110,7 +134,7 @@ esac
 		{name: "over", truncated: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			result, err := (Runner{}).Run(context.Background(), path, test.name)
+			result, err := (Runner{Env: os.Environ()}).Run(context.Background(), path, test.name)
 			if err != nil {
 				t.Fatal(err)
 			}

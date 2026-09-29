@@ -62,6 +62,8 @@ spec:
                   x-kubernetes-validations:
                     - rule: self == oldSelf
                       message: userOptions are immutable
+                    - rule: "!has(self.resourceGroup)"
+                      message: resourceGroup is configured by the operator and cannot be requested
                   properties:
                     target:
                       {
@@ -77,7 +79,13 @@ spec:
                         maxLength: 32,
                         pattern: '(^[0-9]+\.[0-9]+(\.[0-9]+)?(_openshift)?$)|(^default_(openshift|kubernetes)$)',
                       }
-                    resourceGroup: { type: string, maxLength: 128 }
+                    privateOnly: { type: boolean }
+                    resourceGroup:
+                      {
+                        type: string,
+                        maxLength: 0,
+                        description: "Deprecated: resource group is configured by the operator and cannot be requested.",
+                      }
                     zone:
                       {
                         type: string,
@@ -150,6 +158,12 @@ spec:
                         maxLength: 64,
                         pattern: '^[0-9]+(\.[0-9]+)?$',
                       }
+                    authRetryRequestTimestamp:
+                      {
+                        type: string,
+                        maxLength: 64,
+                        pattern: '^[0-9]+(\.[0-9]+)?$',
+                      }
                     cleanupRequested: { type: boolean }
             status:
               type: object
@@ -194,6 +208,7 @@ spec:
                         pattern: '(^[0-9]+\.[0-9]+(\.[0-9]+)?(_openshift)?$)|(^default_(openshift|kubernetes)$)',
                       }
                     resourceGroup: { type: string, maxLength: 128 }
+                    privateOnly: { type: boolean }
                     zone: { type: string, maxLength: 64 }
                     flavor: { type: string, maxLength: 64 }
                     network:
@@ -209,7 +224,6 @@ spec:
                         authPolicy:
                           type: object
                           properties:
-                            allocation_uid: { type: string, maxLength: 128 }
                             vpn_server_id: { type: string, maxLength: 256 }
                             secrets_manager_id: { type: string, maxLength: 256 }
                             secrets_manager_region:
@@ -298,6 +312,7 @@ spec:
                       {
                         id: { type: string, maxLength: 64 },
                         kind: { type: string },
+                        authAttemptID: { type: string, maxLength: 64 },
                         pipelineRunName: { type: string, maxLength: 63 },
                         startedAt: { type: string, format: date-time },
                         dispatched: { type: boolean },
@@ -344,6 +359,95 @@ spec:
                       }
                     mode: { type: string, enum: [public, vpn] }
                     expiry: { type: string, format: date-time }
+                    reason:
+                      {
+                        type: string,
+                        enum:
+                          [
+                            publisher-unavailable,
+                            invalid-artifacts,
+                            auth-manifest-invalid,
+                            auth-artifact-layout-invalid,
+                            auth-kubeconfig-invalid,
+                            auth-vpn-profile-invalid,
+                            auth-vpn-profile-trust-invalid,
+                            auth-vpn-certificate-invalid,
+                            auth-vpn-expiry-mismatch,
+                            auth-state-failure,
+                            certificate-cleanup-pending,
+                            auth-retry-cancelled,
+                            auth-retry-fenced,
+                            vpn-certificate-leaf-parse,
+                            vpn-certificate-leaf-usage,
+                            vpn-certificate-key-parse,
+                            vpn-certificate-key-mismatch,
+                            vpn-certificate-chain-parse,
+                            vpn-certificate-chain-authority,
+                            vpn-certificate-chain-no-root,
+                            vpn-certificate-chain-verify,
+                            vpn-certificate-leaf-verify,
+                            vpn-certificate-server-eku,
+                            vpn-certificate-expiry-mismatch,
+                            vpn-certificate-authority-mismatch,
+                          ],
+                      }
+                    attemptID: { type: string, maxLength: 64 }
+                    cleanupOutcome:
+                      { type: string, enum: [not-required, cleaned, pending] }
+                    cleanupReason:
+                      {
+                        type: string,
+                        enum:
+                          [
+                            ownership-mismatch,
+                            authentication,
+                            rate-limit,
+                            service,
+                            request,
+                            transport,
+                            list,
+                            delete,
+                            unknown,
+                          ],
+                      }
+                    cleanupStage:
+                      {
+                        type: string,
+                        enum:
+                          [
+                            client,
+                            authenticate,
+                            metadata-get,
+                            metadata-list,
+                            delete,
+                          ],
+                      }
+                    certificate:
+                      type: object
+                      properties:
+                        id: { type: string, maxLength: 256 }
+                        allocationUID: { type: string, maxLength: 128 }
+                        attemptID: { type: string, maxLength: 128 }
+                    clearedCertificateReferences:
+                      type: array
+                      maxItems: 8
+                      items:
+                        type: object
+                        required: [allocationUID, attemptID]
+                        properties:
+                          id: { type: string, maxLength: 256 }
+                          allocationUID: { type: string, maxLength: 128 }
+                          attemptID: { type: string, maxLength: 128 }
+                authCertificateReferences:
+                  type: array
+                  maxItems: 8
+                  items:
+                    type: object
+                    required: [allocationUID, attemptID]
+                    properties:
+                      id: { type: string, maxLength: 256 }
+                      allocationUID: { type: string, maxLength: 128 }
+                      attemptID: { type: string, maxLength: 128 }
                 publicAuth:
                   type: object
                   required: [availability]
@@ -377,6 +481,7 @@ spec:
                         kube_version: { type: string, maxLength: 32 }
                         worker_count:
                           { type: integer, minimum: 1, maximum: 100 }
+                        private_only: { type: boolean }
                         zone: { type: string, maxLength: 64 }
                         flavor: { type: string, maxLength: 64 }
                         account_id: { type: string, maxLength: 128 }
@@ -420,7 +525,6 @@ spec:
                         auth_policy:
                           type: object
                           properties:
-                            allocation_uid: { type: string, maxLength: 128 }
                             vpn_server_id: { type: string, maxLength: 256 }
                             secrets_manager_id: { type: string, maxLength: 256 }
                             secrets_manager_region:
@@ -488,6 +592,69 @@ spec:
                         enum:
                           [Pending, Delivered, Failed, Unavailable, Cancelled],
                       }
+                authRetry:
+                  type: object
+                  required: [requestTimestamp, attemptID, outcome]
+                  properties:
+                    requestTimestamp:
+                      {
+                        type: string,
+                        maxLength: 64,
+                        pattern: '^[0-9]+(\.[0-9]+)?$',
+                      }
+                    attemptID: { type: string, maxLength: 64 }
+                    executionImage:
+                      {
+                        type: string,
+                        maxLength: 512,
+                        pattern: "^.+@sha256:[a-f0-9]{64}$",
+                      }
+                    outcome:
+                      {
+                        type: string,
+                        enum: [Pending, Available, Unavailable, Cancelled],
+                      }
+                cleanupRecovery:
+                  type: object
+                  required:
+                    [
+                      attempt,
+                      executionImage,
+                      operationID,
+                      requestResourceVersion,
+                      startedAt,
+                      state,
+                    ]
+                  properties:
+                    attempt: { type: integer, minimum: 1, maximum: 2 }
+                    executionImage:
+                      {
+                        type: string,
+                        maxLength: 512,
+                        pattern: "^.+@sha256:[a-f0-9]{64}$",
+                      }
+                    operationID: { type: string, maxLength: 128 }
+                    requestResourceVersion: { type: string, maxLength: 128 }
+                    startedAt: { type: string, format: date-time }
+                    state: { type: string, enum: [Pending, Succeeded, Failed] }
+                    completedAt: { type: string, format: date-time }
+                    history:
+                      type: array
+                      maxItems: 1
+                      items:
+                        type: object
+                        required:
+                          [executionImage, operationID, outcome, timestamp]
+                        properties:
+                          executionImage:
+                            {
+                              type: string,
+                              maxLength: 512,
+                              pattern: "^.+@sha256:[a-f0-9]{64}$",
+                            }
+                          operationID: { type: string, maxLength: 128 }
+                          outcome: { type: string, enum: [Failed] }
+                          timestamp: { type: string, format: date-time }
                 applyDispatched: { type: boolean }
                 cleanupRequested: { type: boolean }
                 cleanup:
@@ -536,7 +703,7 @@ spec:
                             target,
                             provider,
                             version,
-                            resource-group,
+                            private-only,
                             zone,
                             flavor,
                             datacenter,

@@ -181,6 +181,7 @@ func TestReadyVPNBundleDeliversBothStoredFiles(t *testing.T) {
 	now := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
 	cluster := readyAuthCluster("1710000000.000100", now.Add(time.Hour))
 	cluster.Status.PublicAuth = nil
+	cluster.Status.ResolvedOptions.UserOptions = servitorv1alpha1.UserOptions{Provider: "vpc-gen2", PrivateOnly: true}
 	expiry := now.Add(30 * time.Minute).Format(time.RFC3339)
 	cluster.Status.Auth = &servitorv1alpha1.AuthStatus{Availability: "available", Mode: "vpn", Expiry: expiry}
 	kube, secret := newAuthDeliveryClient(t, cluster, []byte("synthetic-kubeconfig"))
@@ -447,6 +448,7 @@ func TestIncompleteOrExpiredVPNBundleIsUnavailableWithoutPartialDelivery(t *test
 		t.Run(test.name, func(t *testing.T) {
 			cluster := readyAuthCluster("1710000000.000100", now.Add(2*time.Hour))
 			cluster.Status.PublicAuth = nil
+			cluster.Status.ResolvedOptions.UserOptions = servitorv1alpha1.UserOptions{Provider: "vpc-gen2", PrivateOnly: true}
 			cluster.Status.Auth = &servitorv1alpha1.AuthStatus{Availability: "available", Mode: "vpn", Expiry: test.expiry.Format(time.RFC3339)}
 			kube, secret := newAuthDeliveryClient(t, cluster, []byte("synthetic-kubeconfig"))
 			if len(test.vpn) != 0 {

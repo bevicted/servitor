@@ -65,10 +65,18 @@ func (r Report) Validate(expectedUID, expectedOperation string) error {
 }
 
 func validReportAuth(status servitorv1alpha1.AuthStatus, now time.Time) bool {
+	if !validClearedCertificateReferences(status.ClearedCertificateReferences) {
+		return false
+	}
 	switch status.Availability {
-	case "unavailable", "unsupported":
-		return status.Mode == "" && status.Expiry == ""
+	case "unavailable":
+		return status.Mode == "" && status.Expiry == "" && servitorv1alpha1.ValidAuthFailureReason(status.Reason) && validAuthCleanup(status.CleanupOutcome, status.CleanupReason, status.CleanupStage) && validAuthCertificate(status)
+	case "unsupported":
+		return status.Mode == "" && status.Expiry == "" && status.Reason == "" && validAuthCleanup(status.CleanupOutcome, status.CleanupReason, status.CleanupStage)
 	case "available":
+		if status.Reason != "" || !validAuthCleanup(status.CleanupOutcome, status.CleanupReason, status.CleanupStage) || !validAuthCertificate(status) {
+			return false
+		}
 		switch status.Mode {
 		case "public":
 			return status.Expiry == ""
@@ -78,6 +86,50 @@ func validReportAuth(status servitorv1alpha1.AuthStatus, now time.Time) bool {
 		}
 	}
 	return false
+}
+
+func validAuthCleanup(outcome, reason, stage string) bool {
+	if outcome == "" {
+		return reason == "" && stage == "" // retained statuses before cleanup observability
+	}
+	if !servitorv1alpha1.ValidAuthCleanupOutcome(outcome) || stage != "" && !servitorv1alpha1.ValidAuthCleanupStage(stage) {
+		return false
+	}
+	if outcome == "pending" {
+		return servitorv1alpha1.ValidAuthCleanupReason(reason)
+	}
+	return reason == "" && stage == ""
+}
+
+func validAuthCertificate(status servitorv1alpha1.AuthStatus) bool {
+	certificate := status.Certificate
+	if certificate == nil {
+		return status.Reason != "certificate-cleanup-pending" && status.CleanupOutcome != "pending"
+	}
+	if status.AttemptID == "" || certificate.AllocationUID == "" || certificate.AttemptID == "" || len(certificate.ID) > 256 || len(certificate.AllocationUID) > 128 || len(certificate.AttemptID) > 128 {
+		return false
+	}
+	if certificate.AttemptID != status.AttemptID && (status.Availability != "unavailable" || status.CleanupOutcome != "pending") {
+		return false
+	}
+	return certificate.ID != "" || status.Reason == "certificate-cleanup-pending" || status.CleanupOutcome == "pending"
+}
+
+func validClearedCertificateReferences(references []servitorv1alpha1.AuthCertificateReference) bool {
+	if len(references) > servitorv1alpha1.MaxAuthCertificateReferences {
+		return false
+	}
+	seen := make(map[servitorv1alpha1.AuthCertificateReference]struct{}, len(references))
+	for _, reference := range references {
+		if reference.AllocationUID == "" || reference.AttemptID == "" || len(reference.ID) > 256 || len(reference.AllocationUID) > 128 || len(reference.AttemptID) > 128 {
+			return false
+		}
+		if _, duplicate := seen[reference]; duplicate {
+			return false
+		}
+		seen[reference] = struct{}{}
+	}
+	return true
 }
 
 func validateSummary(resources []servitorv1alpha1.SummaryResource) error {

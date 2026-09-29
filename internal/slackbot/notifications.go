@@ -320,6 +320,10 @@ func reviewConfigRows(options *servitorv1alpha1.ResolvedOptions) [][]string {
 	if options.WorkerCount > 0 && shape != "" {
 		worker = fmt.Sprintf("%d x %s", options.WorkerCount, shape)
 	}
+	endpointPolicy := "public and private"
+	if options.UserOptions.PrivateOnly {
+		endpointPolicy = "private only"
+	}
 	return [][]string{
 		{"Name:", options.ClusterName},
 		{"Target:", options.Target},
@@ -327,6 +331,7 @@ func reviewConfigRows(options *servitorv1alpha1.ResolvedOptions) [][]string {
 		{"Provider:", providerLabel(options.Provider)},
 		{"Location:", location},
 		{"Resource group:", options.ResourceGroup},
+		{"Endpoints:", endpointPolicy},
 		{"Worker:", worker},
 		{"Network:", networkDescription(options)},
 	}

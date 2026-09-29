@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	servitorv1alpha1 "github.com/bevicted/servitor/api/v1alpha1"
@@ -28,14 +29,32 @@ type TaskConfig struct {
 }
 
 // DeterministicRunName is stable across controller restarts and bounded for Kubernetes names.
+const (
+	pipelineRunNamePrefix  = "servitor-"
+	pipelineRunNameHashLen = 12
+	maxPipelineRunNameLen  = 63
+)
+
 func DeterministicRunName(uid, operation string) string {
 	digest := sha256.Sum256([]byte(uid + "\x00" + operation))
-	return fmt.Sprintf("servitor-%s-%s", operation, hex.EncodeToString(digest[:])[:12])
+	component := strings.ReplaceAll(operation, ".", "-")
+	maxComponentLen := maxPipelineRunNameLen - len(pipelineRunNamePrefix) - 1 - pipelineRunNameHashLen
+	if len(component) > maxComponentLen {
+		component = component[:maxComponentLen]
+	}
+	return fmt.Sprintf("%s%s-%s", pipelineRunNamePrefix, component, hex.EncodeToString(digest[:])[:pipelineRunNameHashLen])
 }
 
 // AuthResourceName is UID-derived so a later allocation cannot inherit old data.
 func AuthResourceName(uid string) string {
 	digest := sha256.Sum256([]byte(uid))
+	return "servitor-auth-" + hex.EncodeToString(digest[:])[:20]
+}
+
+// AuthAttemptResourceName is unique per immutable auth attempt. A token from
+// an earlier attempt therefore cannot gain a binding for a later publication.
+func AuthAttemptResourceName(uid, attemptID string) string {
+	digest := sha256.Sum256([]byte(uid + "\x00" + attemptID))
 	return "servitor-auth-" + hex.EncodeToString(digest[:])[:20]
 }
 
@@ -55,25 +74,59 @@ func NewDestroyRun(cluster *servitorv1alpha1.ServitorCluster, taskConfig TaskCon
 	return newOperationRun(cluster, "destroy", taskConfig)
 }
 
+// NewAuthRetryRun performs only ICT auth against frozen recovery metadata.
+func NewAuthRetryRun(cluster *servitorv1alpha1.ServitorCluster, taskConfig TaskConfig) (*tektonv1.PipelineRun, error) {
+	return newOperationRun(cluster, "auth-retry", taskConfig)
+}
+
 func newOperationRun(cluster *servitorv1alpha1.ServitorCluster, kind string, taskConfig TaskConfig) (*tektonv1.PipelineRun, error) {
-	if cluster.Status.Operation == nil || cluster.Status.Operation.Kind != kind || cluster.Status.ResolvedOptions == nil || cluster.Status.Backend == nil || cluster.Status.ExecutionImage == "" {
+	if cluster.Status.Operation == nil || cluster.Status.Operation.Kind != kind || cluster.Status.ResolvedOptions == nil || (kind != "auth-retry" && (cluster.Status.ExecutionImage == "" || cluster.Status.Backend == nil)) {
 		return nil, fmt.Errorf("%s operation was not persisted", kind)
+	}
+	executionImage := cluster.Status.ExecutionImage
+	if kind == "auth-retry" {
+		if cluster.Status.AuthRetry == nil || !servitorv1alpha1.ValidExecutionImage(cluster.Status.AuthRetry.ExecutionImage) {
+			return nil, fmt.Errorf("auth retry execution image was not persisted")
+		}
+		executionImage = cluster.Status.AuthRetry.ExecutionImage
+	}
+	if kind == "destroy" && cluster.Status.CleanupRecovery != nil {
+		recovery := cluster.Status.CleanupRecovery
+		if recovery.State != servitorv1alpha1.CleanupRecoveryPending || recovery.OperationID != cluster.Status.Operation.ID || !servitorv1alpha1.ValidExecutionImage(recovery.ExecutionImage) {
+			return nil, fmt.Errorf("cleanup recovery execution image was not persisted")
+		}
+		executionImage = recovery.ExecutionImage
 	}
 	options, err := json.Marshal(cluster.Status.ResolvedOptions)
 	if err != nil {
 		return nil, fmt.Errorf("encode resolved options: %w", err)
 	}
-	backend, err := encodeBackendConfig(*cluster.Status.Backend)
-	if err != nil {
-		return nil, fmt.Errorf("encode backend identity: %w", err)
+	backend := []byte{}
+	if kind != "auth-retry" {
+		backend, err = encodeBackendConfig(*cluster.Status.Backend)
+		if err != nil {
+			return nil, fmt.Errorf("encode backend identity: %w", err)
+		}
 	}
 	operation := cluster.Status.Operation
-	authEligible := kind == "apply" && cluster.Status.LifecycleSnapshot != nil && (cluster.Status.LifecycleSnapshot.AuthEligible || cluster.Status.LifecycleSnapshot.PublicAuthEligible)
+	authEligible := (kind == "apply" || kind == "auth-retry") && cluster.Status.LifecycleSnapshot != nil && (cluster.Status.LifecycleSnapshot.AuthEligible || cluster.Status.LifecycleSnapshot.PublicAuthEligible)
+	if authEligible && operation.AuthAttemptID == "" {
+		return nil, fmt.Errorf("%s auth attempt was not persisted", kind)
+	}
+	certificateRefs, err := json.Marshal(cluster.Status.AuthCertificateReferences)
+	if err != nil {
+		return nil, fmt.Errorf("encode auth certificate references: %w", err)
+	}
+	cleanupOutcome, cleanupReason, cleanupStage, err := authRetryCleanupContext(cluster, kind)
+	if err != nil {
+		return nil, err
+	}
 	params := tektonv1.Params{
 		{Name: "operation-id", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: operation.ID}},
 		{Name: "operation-kind", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: kind}},
 		{Name: "cluster-uid", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: string(cluster.UID)}},
-		{Name: "execution-image", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: cluster.Status.ExecutionImage}},
+		{Name: "cluster-name", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: cluster.Name}},
+		{Name: "execution-image", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: executionImage}},
 		{Name: "resolved-options", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: string(options)}},
 		{Name: "backend", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: string(backend)}},
 		{Name: "ict-config-map", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: taskConfig.ICTConfigMap}},
@@ -81,9 +134,16 @@ func newOperationRun(cluster *servitorv1alpha1.ServitorCluster, kind string, tas
 		{Name: "cos-secret", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: taskConfig.COSSecret}},
 		{Name: "ibm-secret", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: taskConfig.IBMSecret}},
 		{Name: "auth-eligible", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: fmt.Sprintf("%t", authEligible)}},
+		{Name: "auth-attempt-id", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: operation.AuthAttemptID}},
 		{Name: "auth-secret", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: authSecretParameter(string(cluster.UID), authEligible)}},
+		{Name: "auth-certificate-refs", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: string(certificateRefs)}},
+		{Name: "auth-primary-reason", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: authPrimaryReason(cluster, kind)}},
+		{Name: "auth-cleanup-outcome", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: cleanupOutcome}},
+		{Name: "auth-cleanup-reason", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: cleanupReason}},
+		{Name: "auth-cleanup-stage", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: cleanupStage}},
+		{Name: "auth-retry-request", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: authRetryRequest(cluster, kind)}},
 	}
-	if kind == "apply" || kind == "destroy" {
+	if kind == "apply" || kind == "destroy" || kind == "auth-retry" {
 		if cluster.Status.Recovery == nil {
 			return nil, fmt.Errorf("%s recovery metadata was not persisted", kind)
 		}
@@ -93,10 +153,13 @@ func newOperationRun(cluster *servitorv1alpha1.ServitorCluster, kind string, tas
 		}
 		params = append(params, tektonv1.Param{Name: "recovery", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: string(recovery)}})
 	}
-	taskRunTemplate := operationTaskRunTemplate(string(cluster.UID), authEligible)
+	taskRunTemplate := operationTaskRunTemplate(string(cluster.UID), operation.AuthAttemptID, authEligible)
 	pipelineTimeout, tasksTimeout := 100*time.Minute, 95*time.Minute
 	if kind == "apply" {
 		pipelineTimeout, tasksTimeout = 120*time.Minute, 115*time.Minute
+	}
+	if kind == "auth-retry" {
+		pipelineTimeout, tasksTimeout = 15*time.Minute, 12*time.Minute
 	}
 	return &tektonv1.PipelineRun{
 		TypeMeta: metav1.TypeMeta{APIVersion: "tekton.dev/v1", Kind: "PipelineRun"},
@@ -115,11 +178,36 @@ func newOperationRun(cluster *servitorv1alpha1.ServitorCluster, kind string, tas
 	}, nil
 }
 
-func operationTaskRunTemplate(uid string, publicAuthEligible bool) tektonv1.PipelineTaskRunTemplate {
+func authPrimaryReason(cluster *servitorv1alpha1.ServitorCluster, kind string) string {
+	if kind == "auth-retry" && cluster.Status.Auth != nil && servitorv1alpha1.ValidAuthFailureReason(cluster.Status.Auth.Reason) {
+		return cluster.Status.Auth.Reason
+	}
+	return "auth-state-failure"
+}
+
+func authRetryCleanupContext(cluster *servitorv1alpha1.ServitorCluster, kind string) (string, string, string, error) {
+	if kind != "auth-retry" || cluster.Status.Auth == nil || cluster.Status.Auth.CleanupOutcome == "" {
+		return "not-required", "", "", nil
+	}
+	outcome, reason, stage := cluster.Status.Auth.CleanupOutcome, cluster.Status.Auth.CleanupReason, cluster.Status.Auth.CleanupStage
+	if !servitorv1alpha1.ValidAuthCleanupOutcome(outcome) || stage != "" && !servitorv1alpha1.ValidAuthCleanupStage(stage) || outcome == "pending" && !servitorv1alpha1.ValidAuthCleanupReason(reason) || outcome != "pending" && (reason != "" || stage != "") {
+		return "", "", "", fmt.Errorf("auth retry cleanup state was not persisted")
+	}
+	return outcome, reason, stage, nil
+}
+
+func authRetryRequest(cluster *servitorv1alpha1.ServitorCluster, kind string) string {
+	if kind == "auth-retry" && cluster.Status.AuthRetry != nil {
+		return cluster.Status.AuthRetry.RequestTimestamp
+	}
+	return ""
+}
+
+func operationTaskRunTemplate(uid, attemptID string, publicAuthEligible bool) tektonv1.PipelineTaskRunTemplate {
 	automount := false
 	serviceAccount := "servitor-task"
 	if publicAuthEligible {
-		serviceAccount = AuthResourceName(uid)
+		serviceAccount = AuthAttemptResourceName(uid, attemptID)
 	}
 	return tektonv1.PipelineTaskRunTemplate{
 		ServiceAccountName: serviceAccount,

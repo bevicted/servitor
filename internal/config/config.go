@@ -2,7 +2,6 @@
 package config
 
 import (
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -12,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	servitorv1alpha1 "github.com/bevicted/servitor/api/v1alpha1"
 	"github.com/bevicted/servitor/internal/command"
 	"gopkg.in/yaml.v3"
 )
@@ -483,12 +483,7 @@ func validCOSEndpoint(value string) bool {
 }
 
 func validExecutionImage(value string) bool {
-	imageName, digest, found := strings.Cut(value, "@sha256:")
-	if !found || imageName == "" || strings.TrimSpace(imageName) != imageName || len(digest) != 64 {
-		return false
-	}
-	_, err := hex.DecodeString(digest)
-	return err == nil
+	return servitorv1alpha1.ValidExecutionImage(value)
 }
 
 func containsCredentialMarker(value string) bool {

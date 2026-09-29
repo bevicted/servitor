@@ -73,7 +73,7 @@ func (r *Reconciler) reconcileAuthDelivery(ctx context.Context, cluster *servito
 	cluster = current
 
 	status := deliveryStatus(cluster)
-	if status == nil || !validDeliveryStatus(*status, r.now()) {
+	if status == nil || current.Status.ResolvedOptions == nil || !validDeliveryStatus(*status, *current.Status.ResolvedOptions, r.now()) {
 		return ctrl.Result{}, true, r.setAuthDeliveryOutcome(ctx, cluster, authDeliveryUnavailable)
 	}
 	secret := &corev1.Secret{}
@@ -84,7 +84,7 @@ func (r *Reconciler) reconcileAuthDelivery(ctx context.Context, cluster *servito
 		}
 		return ctrl.Result{}, true, r.setAuthDeliveryOutcome(ctx, cluster, authDeliveryFailed)
 	}
-	if err := validateAuthSecret(secret, cluster, applyID(string(cluster.UID))); err != nil {
+	if err := validateAuthSecret(secret, cluster, authAttemptID(cluster, *status)); err != nil {
 		return ctrl.Result{}, true, r.setAuthDeliveryOutcome(ctx, cluster, authDeliveryUnavailable)
 	}
 	kubeconfig, vpn, valid := deliveryBundle(secret.Data, *status)
@@ -135,8 +135,15 @@ func deliveryStatus(cluster *servitorv1alpha1.ServitorCluster) *servitorv1alpha1
 	return status
 }
 
-func validDeliveryStatus(status servitorv1alpha1.AuthStatus, now time.Time) bool {
-	if status.Availability != "available" {
+func authAttemptID(cluster *servitorv1alpha1.ServitorCluster, status servitorv1alpha1.AuthStatus) string {
+	if status.AttemptID != "" {
+		return status.AttemptID
+	}
+	return applyID(string(cluster.UID))
+}
+
+func validDeliveryStatus(status servitorv1alpha1.AuthStatus, options servitorv1alpha1.ResolvedOptions, now time.Time) bool {
+	if status.Availability != "available" || !availableAuthModeMatches(options, status.Mode) {
 		return false
 	}
 	switch status.Mode {

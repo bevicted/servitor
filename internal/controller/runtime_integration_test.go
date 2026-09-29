@@ -143,6 +143,7 @@ func TestStrictNetworkUserOptionsAdmission(t *testing.T) {
 		t.Fatal(err)
 	}
 	verifyRemovedNetworkUserOptionsRejected(t, ctx, config, namespace)
+	verifyResourceGroupUserOptionRejected(t, ctx, config, namespace)
 }
 
 func TestRuntimeContract(t *testing.T) {
@@ -321,11 +322,46 @@ func TestRuntimeContract(t *testing.T) {
 		if cluster.Status.Phase != servitorv1alpha1.PhaseApplying {
 			return fmt.Errorf("phase is %q", cluster.Status.Phase)
 		}
-		name := pipeline.AuthResourceName(string(cluster.UID))
-		for _, object := range []client.Object{&corev1.Secret{}, &corev1.ServiceAccount{}, &rbacv1.Role{}, &rbacv1.RoleBinding{}} {
-			if err := admin.Get(ctx, types.NamespacedName{Namespace: runtimeContractNamespace, Name: name}, object); err != nil {
-				return fmt.Errorf("get %T: %w", object, err)
-			}
+		operation := cluster.Status.Operation
+		if operation == nil || operation.ID != applyID(string(cluster.UID)) || operation.AuthAttemptID == "" || operation.AuthAttemptID == operation.ID {
+			return fmt.Errorf("operation identity = %#v", operation)
+		}
+		var runs tektonv1.PipelineRunList
+		if err := admin.List(ctx, &runs, client.InNamespace(runtimeContractNamespace), client.MatchingLabels{pipeline.ClusterUIDLabel: string(cluster.UID), pipeline.OperationLabel: operation.ID}); err != nil {
+			return err
+		}
+		if len(runs.Items) != 1 || runs.Items[0].Name != operation.PipelineRunName {
+			return fmt.Errorf("operation PipelineRuns = %#v", runs.Items)
+		}
+		secretName := pipeline.AuthResourceName(string(cluster.UID))
+		attemptName := pipeline.AuthAttemptResourceName(string(cluster.UID), operation.AuthAttemptID)
+		secret := &corev1.Secret{}
+		if err := admin.Get(ctx, types.NamespacedName{Namespace: runtimeContractNamespace, Name: secretName}, secret); err != nil {
+			return fmt.Errorf("get Secret: %w", err)
+		}
+		if secret.Labels[authUIDLabel] != string(cluster.UID) || secret.Annotations[authOperationKey] != operation.AuthAttemptID {
+			return fmt.Errorf("Secret provenance = %#v", secret.ObjectMeta)
+		}
+		serviceAccount := &corev1.ServiceAccount{}
+		if err := admin.Get(ctx, types.NamespacedName{Namespace: runtimeContractNamespace, Name: attemptName}, serviceAccount); err != nil {
+			return fmt.Errorf("get ServiceAccount: %w", err)
+		}
+		if serviceAccount.Labels[authUIDLabel] != string(cluster.UID) || serviceAccount.AutomountServiceAccountToken == nil || *serviceAccount.AutomountServiceAccountToken {
+			return fmt.Errorf("ServiceAccount = %#v", serviceAccount)
+		}
+		role := &rbacv1.Role{}
+		if err := admin.Get(ctx, types.NamespacedName{Namespace: runtimeContractNamespace, Name: attemptName}, role); err != nil {
+			return fmt.Errorf("get Role: %w", err)
+		}
+		if role.Labels[authUIDLabel] != string(cluster.UID) || role.Annotations[authOperationKey] != operation.AuthAttemptID || !publisherRoleMatches(role, secretName, cluster.Name, false) {
+			return fmt.Errorf("Role = %#v", role)
+		}
+		binding := &rbacv1.RoleBinding{}
+		if err := admin.Get(ctx, types.NamespacedName{Namespace: runtimeContractNamespace, Name: attemptName}, binding); err != nil {
+			return fmt.Errorf("get RoleBinding: %w", err)
+		}
+		if binding.Labels[authUIDLabel] != string(cluster.UID) || len(binding.Subjects) != 1 || binding.Subjects[0].Kind != "ServiceAccount" || binding.Subjects[0].Name != attemptName || binding.RoleRef.APIGroup != rbacv1.GroupName || binding.RoleRef.Kind != "Role" || binding.RoleRef.Name != attemptName {
+			return fmt.Errorf("RoleBinding = %#v", binding)
 		}
 		return nil
 	})
@@ -347,10 +383,9 @@ func TestRuntimeContract(t *testing.T) {
 
 	eventually(t, managerDone, "terminal run and publisher cleanup", func() error {
 		cluster := &servitorv1alpha1.ServitorCluster{}
-		if err := admin.Get(ctx, cleanupKey, cluster); err != nil {
+		if err := admin.Get(ctx, cleanupKey, cluster); err != nil && !apierrors.IsNotFound(err) {
 			return err
-		}
-		if cluster.Status.Phase != servitorv1alpha1.PhaseCleanupComplete {
+		} else if err == nil && cluster.Status.Phase != servitorv1alpha1.PhaseCleanupComplete {
 			return fmt.Errorf("phase is %q", cluster.Status.Phase)
 		}
 		for _, object := range cleanupObjects {
@@ -552,7 +587,7 @@ func seedDeliveryContract(t *testing.T, ctx context.Context, kube client.Client)
 	if err := kube.Status().Update(ctx, cluster); err != nil {
 		t.Fatal(err)
 	}
-	secret := contractAuthSecret(cluster, []byte("synthetic-kubeconfig"))
+	secret := contractAuthSecret(cluster, applyID(string(cluster.UID)), []byte("synthetic-kubeconfig"))
 	if err := kube.Create(ctx, secret); err != nil {
 		t.Fatal(err)
 	}
@@ -569,10 +604,13 @@ func seedCleanupContract(t *testing.T, ctx context.Context, kube client.Client) 
 	if err := kube.Get(ctx, key, cluster); err != nil {
 		t.Fatal(err)
 	}
+	operationID := "cleanup-operation"
+	attemptID := "cleanup-attempt"
 	cluster.Status = servitorv1alpha1.ServitorClusterStatus{
 		Phase:             servitorv1alpha1.PhaseCleanupPending,
 		ResolvedOptions:   contractResolvedOptions("cleanup-cluster"),
 		LifecycleSnapshot: contractLifecycleSnapshot(true),
+		Operation:         &servitorv1alpha1.OperationReference{ID: operationID, Kind: "apply", AuthAttemptID: attemptID, PipelineRunName: "cleanup-pipeline", StartedAt: metav1.Now(), Dispatched: true},
 		CleanupRequested:  true,
 		Cleanup: &servitorv1alpha1.CleanupStatus{
 			Reason:      servitorv1alpha1.CleanupReasonExplicit,
@@ -583,19 +621,20 @@ func seedCleanupContract(t *testing.T, ctx context.Context, kube client.Client) 
 		t.Fatal(err)
 	}
 
-	name := pipeline.AuthResourceName(string(cluster.UID))
+	secretName := pipeline.AuthResourceName(string(cluster.UID))
+	attemptName := pipeline.AuthAttemptResourceName(string(cluster.UID), attemptID)
 	labels := map[string]string{authUIDLabel: string(cluster.UID)}
-	secret := contractAuthSecret(cluster, nil)
-	serviceAccount := &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: runtimeContractNamespace, Labels: labels}, AutomountServiceAccountToken: boolPointer(false)}
-	role := &rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: runtimeContractNamespace, Labels: labels}, Rules: []rbacv1.PolicyRule{{APIGroups: []string{""}, Resources: []string{"secrets"}, ResourceNames: []string{name}, Verbs: []string{"get", "update", "patch"}}}}
-	binding := &rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: runtimeContractNamespace, Labels: labels}, Subjects: []rbacv1.Subject{{Kind: "ServiceAccount", Name: name, Namespace: runtimeContractNamespace}}, RoleRef: rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "Role", Name: name}}
+	secret := contractAuthSecret(cluster, attemptID, nil)
+	serviceAccount := &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: attemptName, Namespace: runtimeContractNamespace, Labels: labels}, AutomountServiceAccountToken: boolPointer(false)}
+	role := &rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Name: attemptName, Namespace: runtimeContractNamespace, Labels: labels, Annotations: map[string]string{authOperationKey: attemptID}}, Rules: []rbacv1.PolicyRule{{APIGroups: []string{""}, Resources: []string{"secrets"}, ResourceNames: []string{secretName}, Verbs: []string{"get", "update", "patch"}}}}
+	binding := &rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: attemptName, Namespace: runtimeContractNamespace, Labels: labels}, Subjects: []rbacv1.Subject{{Kind: "ServiceAccount", Name: attemptName, Namespace: runtimeContractNamespace}}, RoleRef: rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "Role", Name: attemptName}}
 	for _, object := range []client.Object{secret, serviceAccount, role, binding} {
 		if err := kube.Create(ctx, object); err != nil {
 			t.Fatal(err)
 		}
 	}
 
-	runLabels := map[string]string{pipeline.ClusterUIDLabel: string(cluster.UID), pipeline.OperationLabel: "plan"}
+	runLabels := map[string]string{pipeline.ClusterUIDLabel: string(cluster.UID), pipeline.OperationLabel: operationID}
 	pipelineRun := &tektonv1.PipelineRun{ObjectMeta: metav1.ObjectMeta{Name: "cleanup-pipeline", Namespace: runtimeContractNamespace, Labels: runLabels}}
 	if err := kube.Create(ctx, pipelineRun); err != nil {
 		t.Fatal(err)
@@ -630,10 +669,11 @@ func contractCluster(name string) *servitorv1alpha1.ServitorCluster {
 
 func contractResolvedOptions(name string) *servitorv1alpha1.ResolvedOptions {
 	return &servitorv1alpha1.ResolvedOptions{
-		UserOptions: servitorv1alpha1.UserOptions{Target: "target", Provider: "vpc-gen2", Version: "4.22", ResourceGroup: "Default", Zone: "us-south-1", Flavor: "bx2.4x16"},
-		Platform:    "openshift",
-		ClusterName: name,
-		Region:      "us-south",
+		UserOptions:   servitorv1alpha1.UserOptions{Target: "target", Provider: "vpc-gen2", Version: "4.22", Zone: "us-south-1", Flavor: "bx2.4x16"},
+		ResourceGroup: "Default",
+		Platform:      "openshift",
+		ClusterName:   name,
+		Region:        "us-south",
 	}
 }
 
@@ -661,16 +701,16 @@ func contractRecovery(clusterName string) *servitorv1alpha1.RecoveryMetadata {
 		Endpoints: map[string]string{
 			"IAM": "https://iam.example.invalid", "ContainerService": "https://containers.example.invalid", "GlobalTagging": "https://tagging.example.invalid", "ResourceManagement": "https://management.example.invalid", "ResourceController": "https://controller.example.invalid", "VPC": "https://vpc.example.invalid",
 		},
-		Values:       servitorv1alpha1.RecoveryValues{ClusterName: clusterName, ResourceGroupName: "Default", Region: "us-south", ClusterMode: "vpc", Platform: "openshift", KubeVersion: "4.22_openshift", WorkerCount: 1, Zone: "us-south-1", Flavor: "bx2.4x16", VPCID: "vpc", SubnetIDs: []string{"subnet"}, PublicGatewayIDs: []string{"gateway"}},
+		Values:       servitorv1alpha1.RecoveryValues{ClusterName: clusterName, ResourceGroupName: "Default", Region: "us-south", ClusterMode: "vpc", Platform: "openshift", KubeVersion: "4.22_openshift", WorkerCount: 1, Zone: "us-south-1", Flavor: "bx2.4x16", AccountID: "runtime-contract-account", VPCRegion: "us-south", VPCID: "vpc", SubnetIDs: []string{"subnet"}, PublicGatewayIDs: []string{"gateway"}},
 		TFVarsSHA256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
 	}
 }
 
-func contractAuthSecret(cluster *servitorv1alpha1.ServitorCluster, data []byte) *corev1.Secret {
+func contractAuthSecret(cluster *servitorv1alpha1.ServitorCluster, attemptID string, data []byte) *corev1.Secret {
 	name := pipeline.AuthResourceName(string(cluster.UID))
 	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
 		Name: name, Namespace: runtimeContractNamespace,
-		Labels: map[string]string{authUIDLabel: string(cluster.UID)}, Annotations: map[string]string{authOperationKey: applyID(string(cluster.UID))},
+		Labels: map[string]string{authUIDLabel: string(cluster.UID)}, Annotations: map[string]string{authOperationKey: attemptID},
 	}}
 	if data != nil {
 		secret.Data = map[string][]byte{authSecretDataName: append([]byte(nil), data...)}
@@ -762,6 +802,44 @@ func verifyRemovedNetworkUserOptionsRejected(t *testing.T, ctx context.Context, 
 			}
 			if err := resources.Delete(ctx, cluster.GetName(), metav1.DeleteOptions{}); err != nil {
 				t.Fatalf("delete permissive direct CR with %s: %v", test.field, err)
+			}
+		})
+	}
+}
+
+func verifyResourceGroupUserOptionRejected(t *testing.T, ctx context.Context, config *rest.Config, namespace string) {
+	t.Helper()
+	clusters, err := dynamic.NewForConfig(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resources := clusters.Resource(schema.GroupVersionResource{
+		Group: "servitor.bevicted.github.io", Version: "v1alpha1", Resource: "servitorclusters",
+	}).Namespace(namespace)
+	for _, test := range []struct {
+		name  string
+		value string
+	}{
+		{name: "empty", value: ""},
+		{name: "nonempty", value: "caller-selected"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cluster := &unstructured.Unstructured{Object: map[string]any{
+				"apiVersion": "servitor.bevicted.github.io/v1alpha1",
+				"kind":       "ServitorCluster",
+				"metadata":   map[string]any{"name": "reject-resource-group-" + test.name},
+				"spec": map[string]any{
+					"slack":       map[string]any{"ownerID": "U1", "channelID": "C1", "threadTimestamp": "1.2"},
+					"userOptions": map[string]any{"version": "4.22", "resourceGroup": test.value},
+					"lifecycle":   map[string]any{"initialLeaseSeconds": int64(3600), "retrySeconds": []any{int64(60)}},
+				},
+			}}
+			_, err := resources.Create(ctx, cluster, metav1.CreateOptions{DryRun: []string{metav1.DryRunAll}})
+			if !apierrors.IsInvalid(err) {
+				t.Fatalf("dry-run CR with resourceGroup %q create error = %v, want invalid", test.value, err)
+			}
+			if _, err := resources.Get(ctx, cluster.GetName(), metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+				t.Fatalf("dry-run CR with resourceGroup %q was stored: %v", test.value, err)
 			}
 		})
 	}

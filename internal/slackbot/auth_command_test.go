@@ -3,6 +3,7 @@ package slackbot
 import (
 	"context"
 	"testing"
+	"time"
 
 	servitorv1alpha1 "github.com/bevicted/servitor/api/v1alpha1"
 	"github.com/bevicted/servitor/internal/state"
@@ -81,6 +82,72 @@ func TestAuthRejectsCleanupStatesWithoutIntent(t *testing.T) {
 				t.Fatalf("cleanup auth recorded state=%#v responses=%+v", stored.Spec.Lifecycle, responses.responses)
 			}
 		})
+	}
+}
+
+func TestAuthReportsAllowlistedUnavailableDiagnostic(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		status servitorv1alpha1.AuthStatus
+		want   string
+	}{
+		{name: "absent cleanup", status: servitorv1alpha1.AuthStatus{Availability: "unavailable", Reason: "vpn-certificate-chain-verify"}, want: "Authentication delivery is unavailable for this allocation. Diagnostic: `vpn-certificate-chain-verify`."},
+		{name: "present cleanup", status: servitorv1alpha1.AuthStatus{Availability: "unavailable", Reason: "vpn-certificate-chain-verify", CleanupOutcome: "pending", CleanupReason: "transport", CleanupStage: "authenticate"}, want: "Authentication delivery is unavailable for this allocation. Diagnostic: `vpn-certificate-chain-verify` (cleanup outcome: `pending`, reason: `transport`, stage: `authenticate`)."},
+		{name: "untrusted cleanup omitted", status: servitorv1alpha1.AuthStatus{Availability: "unavailable", Reason: "vpn-certificate-chain-verify", CleanupOutcome: "pending:private-value", CleanupReason: "transport:private-value", CleanupStage: "authenticate:private-value"}, want: "Authentication delivery is unavailable for this allocation. Diagnostic: `vpn-certificate-chain-verify`."},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cluster := authCommandCluster(true)
+			cluster.Status.Phase = servitorv1alpha1.PhaseReady
+			cluster.Status.Auth = &test.status
+			bot, responses := botForTest(t, cluster)
+			message := Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "auth", Timestamp: "1710000000.000100", ThreadTimestamp: "root"}
+			if err := bot.Handle(context.Background(), Envelope{ID: test.name, Message: message}); err != nil {
+				t.Fatal(err)
+			}
+			if len(responses.responses) != 1 || responses.responses[0].Text != test.want {
+				t.Fatalf("unavailable diagnostic responses=%+v", responses.responses)
+			}
+		})
+	}
+}
+
+func TestAuthReportsPublicationPredicatesWithoutValues(t *testing.T) {
+	for _, reason := range []string{"auth-manifest-invalid", "auth-artifact-layout-invalid", "auth-kubeconfig-invalid", "auth-vpn-profile-invalid", "auth-vpn-profile-trust-invalid", "auth-vpn-certificate-invalid", "auth-vpn-expiry-mismatch"} {
+		cluster := authCommandCluster(true)
+		cluster.Status.Auth = &servitorv1alpha1.AuthStatus{Availability: "unavailable", Reason: reason}
+		if got, want := authUnavailableDiagnostic(cluster), "Authentication delivery is unavailable for this allocation. Diagnostic: `"+reason+"`."; got != want {
+			t.Fatalf("Slack diagnostic for %q = %q, want %q", reason, got, want)
+		}
+	}
+}
+
+func TestOwnerThreadAuthRetryRecordsSeparateMonotonicIntent(t *testing.T) {
+	cluster := authCommandCluster(true)
+	cluster.Status.Phase = servitorv1alpha1.PhaseReady
+	cluster.Status.Ready = &servitorv1alpha1.ReadySummary{}
+	cluster.Status.LeaseExpiresAt = &metav1.Time{Time: time.Now().Add(time.Hour)}
+	cluster.Status.ResolvedOptions = &servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Provider: "vpc-gen2", PrivateOnly: true}, Network: servitorv1alpha1.FrozenNetwork{AuthPolicy: &servitorv1alpha1.FrozenAuthPolicy{}}}
+	cluster.Status.Auth = &servitorv1alpha1.AuthStatus{Availability: "unavailable", Reason: "auth-state-failure"}
+	bot, responses := botForTest(t, cluster)
+	request := func(id, user, text, timestamp string) {
+		t.Helper()
+		if err := bot.Handle(context.Background(), Envelope{ID: id, Message: Message{Channel: "C1", ChannelType: "channel", User: user, Text: text, Timestamp: timestamp, ThreadTimestamp: "root"}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	request("retry-1", "U1", "auth retry", "1710000000.000100")
+	request("retry-old", "U1", "auth retry", "1710000000.000099")
+	request("retry-other", "U2", "auth retry", "1710000001.000100")
+	request("delivery", "U1", "auth", "1710000002.000100")
+	stored := &servitorv1alpha1.ServitorCluster{}
+	if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: cluster.Name}, stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.Spec.Lifecycle.AuthRetryRequestTimestamp != "1710000000.000100" || stored.Spec.Lifecycle.AuthRequestTimestamp != "" {
+		t.Fatalf("auth retry and delivery intents were not independent: %#v", stored.Spec.Lifecycle)
+	}
+	if len(responses.responses) != 3 || responses.responses[0].Text != "Authentication retry has been queued." || responses.responses[1].Text != "This authentication retry was already recorded. Send a newer `auth retry` request." {
+		t.Fatalf("retry responses=%+v", responses.responses)
 	}
 }
 

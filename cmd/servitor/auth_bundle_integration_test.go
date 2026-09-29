@@ -11,6 +11,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/json"
 	"encoding/pem"
+	"fmt"
 	"io"
 	"math/big"
 	"net"
@@ -112,8 +113,9 @@ func runConnectedAuthBundleFlow(t *testing.T, task string, endpoints connectedEn
 	cluster := &servitorv1alpha1.ServitorCluster{
 		ObjectMeta: metav1.ObjectMeta{Name: "allocation", Namespace: "servitor", UID: "allocation-uid", Generation: 1, Finalizers: []string{servitorv1alpha1.CleanupFinalizer}},
 		Spec: servitorv1alpha1.ServitorClusterSpec{
-			Slack:     servitorv1alpha1.SlackIdentity{OwnerID: "U012AB3CD", ChannelID: "C123", ThreadTimestamp: "1.2"},
-			Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 3600, RetrySeconds: []int64{60}},
+			Slack:       servitorv1alpha1.SlackIdentity{OwnerID: "U012AB3CD", ChannelID: "C123", ThreadTimestamp: "1.2"},
+			UserOptions: servitorv1alpha1.UserOptions{PrivateOnly: endpoints.PublicURL == ""},
+			Lifecycle:   servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 3600, RetrySeconds: []int64{60}},
 		},
 	}
 	kube := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&servitorv1alpha1.ServitorCluster{}, &tektonv1.PipelineRun{}, &tektonv1.TaskRun{}).WithObjects(cluster).Build()
@@ -174,7 +176,7 @@ func runConnectedAuthBundleFlow(t *testing.T, task string, endpoints connectedEn
 	if err := json.Unmarshal([]byte(parameters["resolved-options"]), &taskOptions); err != nil || !reflect.DeepEqual(taskOptions, frozen) {
 		t.Fatal("frozen options did not survive the PipelineRun handoff")
 	}
-	if parameters["auth-eligible"] != "true" || parameters["auth-secret"] != pipeline.AuthResourceName(string(stored.UID)) {
+	if parameters["auth-eligible"] != "true" || parameters["auth-attempt-id"] != stored.Status.Operation.AuthAttemptID || parameters["auth-secret"] != pipeline.AuthResourceName(string(stored.UID)) {
 		t.Fatal("apply task did not receive publication permission")
 	}
 
@@ -182,21 +184,29 @@ func runConnectedAuthBundleFlow(t *testing.T, task string, endpoints connectedEn
 	if err := kube.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: parameters["auth-secret"]}, secret); err != nil {
 		t.Fatal(err)
 	}
+	if secret.Labels["servitor.bevicted.github.io/auth-uid"] != string(stored.UID) || secret.Annotations["servitor.bevicted.github.io/auth-operation"] != stored.Status.Operation.AuthAttemptID {
+		t.Fatalf("auth Secret binding = labels=%v annotations=%v", secret.Labels, secret.Annotations)
+	}
 	workdir := t.TempDir()
 	reportPath := filepath.Join(workdir, "report.json")
 	writeConnectedTaskInputs(t, workdir, frozen, *stored.Status.Recovery, stored.Status.Backend, stored.Status.Operation.ID)
-	ict, terraform, bundle, mode, expiry := writeConnectedICTFixture(t, workdir, endpoints, now)
+	ict, terraform, bundle, mode, expiry := writeConnectedICTFixture(t, workdir, endpoints, now, stored.Status.Operation.AuthAttemptID)
 	if mode != wantMode {
 		t.Fatalf("endpoint metadata selected mode %q, want %q", mode, wantMode)
 	}
+	authTmpfsDir := filepath.Join(workdir, "auth-tmpfs")
+	if err := os.Mkdir(authTmpfsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	taskArgs := []string{
-		"-cluster-uid", string(stored.UID), "-operation-id", stored.Status.Operation.ID, "-operation-kind", "apply",
+		"-cluster-uid", string(stored.UID), "-operation-id", stored.Status.Operation.ID, "-operation-kind", "apply", "-auth-attempt-id", stored.Status.Operation.AuthAttemptID,
 		"-resolved-options", filepath.Join(workdir, "options.json"), "-backend-config", filepath.Join(workdir, "backend.json"),
 		"-recovery", filepath.Join(workdir, "recovery.json"), "-ict-result", filepath.Join(workdir, "result.json"), "-report", reportPath,
-		"-ict", ict, "-terraform", terraform, "-auth-eligible=true", "-auth-manifest", filepath.Join(workdir, "auth", "manifest.json"), "-auth-output-dir", filepath.Join(workdir, "auth"),
+		"-ict", ict, "-terraform", terraform, "-auth-eligible=true", "-auth-manifest", filepath.Join(workdir, "auth", "manifest.json"), "-auth-output-dir", filepath.Join(workdir, "auth"), "-auth-tmpfs-dir", authTmpfsDir,
 	}
-	if err := exec.Command(task, taskArgs...).Run(); err != nil {
-		t.Fatalf("run task ICT fixture: %v", err)
+	output, err := exec.Command(task, taskArgs...).CombinedOutput()
+	if err != nil {
+		t.Fatalf("run task ICT fixture: %v: %s", err, output)
 	}
 	contextData, err := os.ReadFile(filepath.Join(workdir, "ict-context.json"))
 	if err != nil {
@@ -218,36 +228,50 @@ func runConnectedAuthBundleFlow(t *testing.T, task string, endpoints connectedEn
 		t.Fatal(err)
 	}
 	publish := exec.Command(task,
-		"-publish-auth", "-cluster-uid", string(stored.UID), "-operation-id", stored.Status.Operation.ID,
-		"-publish-auth-secret", secret.Name, "-auth-manifest", filepath.Join(workdir, "auth", "manifest.json"), "-auth-output-dir", filepath.Join(workdir, "auth"),
+		"-publish-auth", "-auth-eligible=true", "-cluster-uid", string(stored.UID), "-operation-id", stored.Status.Operation.ID, "-auth-attempt-id", stored.Status.Operation.AuthAttemptID,
+		"-resolved-options", filepath.Join(workdir, "options.json"), "-publish-auth-secret", secret.Name, "-auth-manifest", filepath.Join(workdir, "auth", "manifest.json"), "-auth-output-dir", filepath.Join(workdir, "auth"),
 		"-report", reportPath, "-publisher-namespace", "servitor", "-publisher-token", tokenPath, "-publisher-ca", caPath,
+		"-ict", ict, "-auth-cleanup-context", filepath.Join(workdir, "auth-context.json"),
 	)
 	publish.Env = append(os.Environ(), "KUBERNETES_SERVICE_HOST="+host, "KUBERNETES_SERVICE_PORT="+port)
-	if err := publish.Run(); err != nil {
-		t.Fatalf("publish task result: %v", err)
-	}
+	publishErr := publish.Run()
 	storedSecret := connectedPublishedSecret(t, publisher)
-	if publicationFailure {
-		if len(storedSecret.Data) != 0 {
-			t.Fatal("failed publication left Secret data")
-		}
-	} else if !sameConnectedBundle(storedSecret.Data, bundle) {
-		t.Fatal("published Secret did not receive the complete bundle")
-	}
 	reportData, err := os.ReadFile(reportPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	report, err := pipeline.DecodeReport(reportData, string(stored.UID), stored.Status.Operation.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	report, reportErr := pipeline.DecodeReport(reportData, string(stored.UID), stored.Status.Operation.ID)
 	if publicationFailure {
-		if report.Auth == nil || report.Auth.Availability != "unavailable" || report.Auth.Mode != "" || report.Auth.Expiry != "" {
-			t.Fatal("failed publication did not preserve the bounded unavailable result")
+		if publishErr == nil || len(storedSecret.Data) != 0 || storedSecret.Annotations["servitor.bevicted.github.io/auth-pending-certificate"] != "" || reportErr != nil || report.Auth == nil || report.Auth.Availability != "unavailable" || report.Auth.Reason != "publisher-unavailable" || report.Auth.CleanupOutcome != "cleaned" || report.Auth.Certificate != nil || report.Auth.AttemptID != stored.Status.Operation.AuthAttemptID {
+			t.Fatalf("failed publication did not retain a revoked, recoverable auth result: publish=%v secret=%#v annotations=%#v report=%#v decode=%v", publishErr, storedSecret.Data, storedSecret.Annotations, report.Auth, reportErr)
 		}
-	} else if report.Auth == nil || report.Auth.Availability != "available" || report.Auth.Mode != wantMode || (wantMode == "vpn" && report.Auth.Expiry != expiry) {
-		t.Fatal("published report did not contain the safe endpoint-selected result")
+		run.Status.Status.Conditions = duckv1.Conditions{{Type: apis.ConditionSucceeded, Status: corev1.ConditionTrue}}
+		run.Status.ChildReferences = []tektonv1.ChildStatusReference{{TypeMeta: runtime.TypeMeta{Kind: "TaskRun"}, Name: "apply-task", PipelineTaskName: "operation"}}
+		if err := kube.Status().Update(context.Background(), run); err != nil {
+			t.Fatal(err)
+		}
+		taskRun := &tektonv1.TaskRun{ObjectMeta: metav1.ObjectMeta{Name: "apply-task", Namespace: "servitor"}, Status: tektonv1.TaskRunStatus{TaskRunStatusFields: tektonv1.TaskRunStatusFields{PodName: "apply-pod", Steps: []tektonv1.StepState{{Name: pipeline.ReportContainerName, Container: "step-report"}}}}}
+		if err := kube.Create(context.Background(), taskRun); err != nil {
+			t.Fatal(err)
+		}
+		reconciler.Logs = integrationReportLogs{data: reportData}
+		if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
+			t.Fatal(err)
+		}
+		stored = connectedCluster(t, kube, request)
+		if stored.Status.Phase != servitorv1alpha1.PhaseReady || stored.Status.Auth == nil || stored.Status.Auth.Reason != "publisher-unavailable" {
+			t.Fatalf("failed publication did not retain Ready: %+v", stored.Status)
+		}
+		return
+	}
+	if publishErr != nil {
+		t.Fatalf("publish task result: %v", publishErr)
+	}
+	if !sameConnectedBundle(storedSecret.Data, bundle) {
+		t.Fatalf("published Secret did not receive the complete bundle; auth result=%+v decode=%v", report.Auth, reportErr)
+	}
+	if reportErr != nil || report.Auth == nil || report.Auth.Availability != "available" || report.Auth.Mode != wantMode || (wantMode == "vpn" && report.Auth.Expiry != expiry) {
+		t.Fatalf("published report did not contain the safe endpoint-selected result: %+v, %v", report.Auth, reportErr)
 	}
 
 	run.Status.Status.Conditions = duckv1.Conditions{{Type: apis.ConditionSucceeded, Status: corev1.ConditionTrue}}
@@ -267,10 +291,7 @@ func runConnectedAuthBundleFlow(t *testing.T, task string, endpoints connectedEn
 	if stored.Status.Phase != servitorv1alpha1.PhaseReady || stored.Status.Ready == nil || stored.Status.Auth == nil {
 		t.Fatal("infrastructure readiness was coupled to auth publication")
 	}
-	if publicationFailure && stored.Status.Auth.Availability != "unavailable" {
-		t.Fatal("failed publication was not adopted as unavailable")
-	}
-	if !publicationFailure && (stored.Status.Auth.Mode != wantMode || stored.Status.Auth.Expiry != report.Auth.Expiry) {
+	if stored.Status.Auth.Mode != wantMode || stored.Status.Auth.Expiry != report.Auth.Expiry {
 		t.Fatal("controller adopted inconsistent auth metadata")
 	}
 }
@@ -301,7 +322,7 @@ func connectedCluster(t *testing.T, kube client.Client, request ctrl.Request) *s
 func connectedRecovery(options servitorv1alpha1.ResolvedOptions) *servitorv1alpha1.RecoveryMetadata {
 	return &servitorv1alpha1.RecoveryMetadata{Version: 1, Target: "production", TFVarsSHA256: strings.Repeat("a", 64), Endpoints: map[string]string{
 		"IAM": "https://iam.example.invalid", "ContainerService": "https://containers.example.invalid", "GlobalTagging": "https://tagging.example.invalid", "ResourceManagement": "https://management.example.invalid", "ResourceController": "https://controller.example.invalid", "VPC": "https://vpc.example.invalid",
-	}, Values: servitorv1alpha1.RecoveryValues{ClusterName: options.ClusterName, ResourceGroupName: options.ResourceGroup, Region: "us-south", ClusterMode: "vpc", Platform: options.Platform, KubeVersion: "4.22_openshift", WorkerCount: 2, Zone: options.Network.Zone, Flavor: options.Flavor, AccountID: options.Network.AccountID, VPCRegion: options.Network.VPCRegion, VPCID: options.Network.VPCID, SubnetIDs: []string{options.Network.SubnetID}, PublicGatewayIDs: []string{options.Network.PublicGatewayID}, AuthPolicy: options.Network.AuthPolicy}}
+	}, Values: servitorv1alpha1.RecoveryValues{ClusterName: options.ClusterName, ResourceGroupName: options.ResourceGroup, Region: "us-south", ClusterMode: "vpc", Platform: options.Platform, KubeVersion: "4.22_openshift", WorkerCount: 2, PrivateOnly: options.PrivateOnly, Zone: options.Network.Zone, Flavor: options.Flavor, AccountID: options.Network.AccountID, VPCRegion: options.Network.VPCRegion, VPCID: options.Network.VPCID, SubnetIDs: []string{options.Network.SubnetID}, PublicGatewayIDs: []string{options.Network.PublicGatewayID}, AuthPolicy: options.Network.AuthPolicy}}
 }
 
 func writeConnectedTaskInputs(t *testing.T, directory string, options servitorv1alpha1.ResolvedOptions, recovery servitorv1alpha1.RecoveryMetadata, backend *servitorv1alpha1.BackendIdentity, operation string) {
@@ -324,7 +345,7 @@ func writeConnectedTaskInputs(t *testing.T, directory string, options servitorv1
 	}
 }
 
-func writeConnectedICTFixture(t *testing.T, directory string, endpoints connectedEndpointMetadata, now time.Time) (string, string, map[string][]byte, string, string) {
+func writeConnectedICTFixture(t *testing.T, directory string, endpoints connectedEndpointMetadata, now time.Time, operation string) (string, string, map[string][]byte, string, string) {
 	t.Helper()
 	mode := endpoints.authMode()
 	bundle, expiry := connectedBundle(t, endpoints, now)
@@ -341,17 +362,21 @@ func writeConnectedICTFixture(t *testing.T, directory string, endpoints connecte
 	if mode == "vpn" {
 		artifacts = append(artifacts, map[string]string{"name": "client.ovpn"})
 	}
-	manifest, err := json.Marshal(map[string]any{"version": 1, "availability": "available", "mode": mode, "expiry": expiry, "artifacts": artifacts})
+	manifest := map[string]any{"version": 1, "availability": "available", "mode": mode, "expiry": expiry, "artifacts": artifacts}
+	if mode == "vpn" {
+		manifest["certificate"] = map[string]string{"id": "certificate-123", "allocation_uid": "allocation-uid", "attempt_id": operation}
+	}
+	manifestData, err := json.Marshal(manifest)
 	if err != nil {
 		t.Fatal(err)
 	}
 	manifestPath := filepath.Join(directory, "fixture-manifest.json")
-	if err := os.WriteFile(manifestPath, manifest, 0o600); err != nil {
+	if err := os.WriteFile(manifestPath, manifestData, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	contextPath := filepath.Join(directory, "ict-context.json")
 	ict := filepath.Join(directory, "ict")
-	script := "#!/bin/sh\nset -eu\ncase \"$1\" in\nreview) cp \"$4\" \"$CONTEXT_TRACE\"; cp \"$FRESH_RESULT\" \"$8\" ;;\napply) printf '%s' '{\"version\":1,\"operation\":\"apply\",\"workspace\":\"'\"$WORKSPACE\"'\"}' > \"$8\"; mkdir -p \"$AUTH_OUTPUT\"; cp \"$AUTH_SOURCE\"/* \"$AUTH_OUTPUT\"/; cp \"$FIXTURE_MANIFEST\" \"$AUTH_MANIFEST\" ;;\n*) exit 2 ;;\nesac\n"
+	script := fmt.Sprintf("#!/bin/sh\nset -eu\ncase \"$1\" in\nreview) cp \"$4\" %q; cp %q \"$8\" ;;\napply) printf '%%s' '{\"version\":1,\"operation\":\"apply\",\"workspace\":%q}' > \"$8\" ;;\nauth) mkdir -p \"${10}\"; cp %q/* \"${10}\"/; cp %q \"$8\" ;;\nauth-cleanup) printf '%%s' '{\"version\":1,\"operation\":\"auth-cleanup\",\"auth_cleanup\":\"cleaned\"}' > \"$6\" ;;\n*) exit 2 ;;\nesac\n", contextPath, filepath.Join(directory, "fresh.json"), filepath.Join(directory, "workspace"), source, manifestPath)
 	if err := os.WriteFile(ict, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -359,13 +384,6 @@ func writeConnectedICTFixture(t *testing.T, directory string, endpoints connecte
 	if err := os.WriteFile(terraform, []byte("#!/bin/sh\nif [ \"$#\" -gt 3 ]; then printf '%s' '{\"format_version\":\"1.2\",\"resource_changes\":[]}' ; else printf '%s' '{\"format_version\":\"1.2\",\"values\":{\"root_module\":{}}}' ; fi\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("AUTH_SOURCE", source)
-	t.Setenv("AUTH_OUTPUT", filepath.Join(directory, "auth"))
-	t.Setenv("AUTH_MANIFEST", filepath.Join(directory, "auth", "manifest.json"))
-	t.Setenv("FIXTURE_MANIFEST", manifestPath)
-	t.Setenv("FRESH_RESULT", filepath.Join(directory, "fresh.json"))
-	t.Setenv("CONTEXT_TRACE", contextPath)
-	t.Setenv("WORKSPACE", filepath.Join(directory, "workspace"))
 	return ict, terraform, bundle, mode, expiry
 }
 
@@ -403,7 +421,7 @@ func connectedBundle(t *testing.T, endpoints connectedEndpointMetadata, now time
 	}
 	bundle := map[string][]byte{"kubeconfig.yaml": kubeconfig}
 	if endpoints.authMode() == "vpn" {
-		bundle["client.ovpn"] = []byte("client\nremote vpn.example.invalid 443 udp\n<ca>\n" + string(caPEM) + "</ca>\n<cert>\n" + string(clientPEM) + "</cert>\n<key>\n" + string(keyPEM) + "</key>\n")
+		bundle["client.ovpn"] = []byte("client\nremote vpn.example.invalid 443 udp\n<ca>\n" + string(caPEM) + "</ca>\n<cert>\n" + string(clientPEM) + string(caPEM) + "</cert>\n<key>\n" + string(keyPEM) + "</key>\n")
 		return bundle, expires.Format(time.RFC3339)
 	}
 	return bundle, ""
@@ -413,6 +431,7 @@ func connectedPublisherServer(t *testing.T, initial *corev1.Secret, expected map
 	t.Helper()
 	var lock sync.Mutex
 	secret := initial.DeepCopy()
+	committedFailure := false
 	protoScheme := runtime.NewScheme()
 	if err := corev1.AddToScheme(protoScheme); err != nil {
 		t.Fatal(err)
@@ -430,10 +449,6 @@ func connectedPublisherServer(t *testing.T, initial *corev1.Secret, expected map
 			response.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(response).Encode(secret)
 		case http.MethodPut:
-			if failUpdate {
-				response.WriteHeader(http.StatusInternalServerError)
-				return
-			}
 			body, err := io.ReadAll(request.Body)
 			if err != nil {
 				response.WriteHeader(http.StatusBadRequest)
@@ -445,7 +460,21 @@ func connectedPublisherServer(t *testing.T, initial *corev1.Secret, expected map
 			} else {
 				err = json.Unmarshal(body, update)
 			}
-			if err != nil || !sameConnectedBundle(update.Data, expected) {
+			if err != nil {
+				response.WriteHeader(http.StatusUnprocessableEntity)
+				return
+			}
+			if failUpdate {
+				if (!committedFailure && !sameConnectedBundle(update.Data, expected)) || (committedFailure && len(update.Data) != 0) {
+					response.WriteHeader(http.StatusUnprocessableEntity)
+					return
+				}
+				secret = update.DeepCopy()
+				committedFailure = true
+				response.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			if !sameConnectedBundle(update.Data, expected) {
 				response.WriteHeader(http.StatusUnprocessableEntity)
 				return
 			}

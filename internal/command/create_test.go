@@ -12,7 +12,6 @@ var testCreateDefaults = CreateDefaults{
 	Version:          "4.22",
 	Target:           "synthetic-target",
 	Provider:         "vpc-gen2",
-	ResourceGroup:    "Default",
 	OpenShiftFlavor:  "bx2.4x16",
 	KubernetesFlavor: "bx2.2x8",
 }
@@ -62,13 +61,13 @@ func TestExtensionTargetUsesSnapshotDefaultAndKeepsUTC(t *testing.T) {
 }
 
 func TestParseCreateAcceptsEverySafeFlag(t *testing.T) {
-	request, err := ParseCreate(`create target=test provider=vpc-gen2 version=4.22 resource-group="Platform Team" zone=us-south-3 flavor=custom datacenter=dal10 machine-type=b3c.4x16 public-vlan-id=public-vlan private-vlan-id=private-vlan satellite-zone=us-south-1 satellite-zone=us-south-2 satellite-managed-from=managed-from satellite-location-id=location-id satellite-host-image=image-id satellite-host-profile=bx2-4x16 satellite-ssh-key-id=ssh-key satellite-worker-instance-id=worker-one satellite-worker-instance-id=worker-two satellite-worker-operating-system=RHCOS worker-count=3`, testCreateDefaults)
+	request, err := ParseCreate(`create target=test provider=vpc-gen2 version=4.22 zone=us-south-3 flavor=custom datacenter=dal10 machine-type=b3c.4x16 public-vlan-id=public-vlan private-vlan-id=private-vlan satellite-zone=us-south-1 satellite-zone=us-south-2 satellite-managed-from=managed-from satellite-location-id=location-id satellite-host-image=image-id satellite-host-profile=bx2-4x16 satellite-ssh-key-id=ssh-key satellite-worker-instance-id=worker-one satellite-worker-instance-id=worker-two satellite-worker-operating-system=RHCOS worker-count=3`, testCreateDefaults)
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := []string{
 		"--target", "test", "--provider", "vpc-gen2", "--platform", "openshift", "--version", "4.22",
-		"--resource-group", "Platform Team", "--zone", "us-south-3", "--flavor", "custom",
+		"--zone", "us-south-3", "--flavor", "custom",
 		"--datacenter", "dal10", "--machine-type", "b3c.4x16", "--public-vlan-id", "public-vlan", "--private-vlan-id", "private-vlan",
 		"--satellite-zone", "us-south-1", "--satellite-zone", "us-south-2", "--satellite-managed-from", "managed-from",
 		"--satellite-location-id", "location-id", "--satellite-host-image", "image-id", "--satellite-host-profile", "bx2-4x16",
@@ -82,13 +81,12 @@ func TestParseCreateAcceptsEverySafeFlag(t *testing.T) {
 
 func TestParseCreateOptionsNormalizesAssignments(t *testing.T) {
 	want := map[string][]string{
-		"--target":         {"synthetic-target"},
-		"--provider":       {"vpc-gen2"},
-		"--version":        {"4.22"},
-		"--resource-group": {`Platform "Team"=Core`},
-		"--worker-count":   {"3"},
+		"--target":       {"synthetic-target"},
+		"--provider":     {"vpc-gen2"},
+		"--version":      {"4.22"},
+		"--worker-count": {"3"},
 	}
-	text := `create target=synthetic-target provider=vpc-gen2 version=4.22 resource-group="Platform \"Team\"=Core" worker-count=3`
+	text := `create target=synthetic-target provider=vpc-gen2 version=4.22 worker-count=3`
 	options, err := ParseCreateOptions(text)
 	if err != nil {
 		t.Fatalf("ParseCreateOptions(%q): %v", text, err)
@@ -128,10 +126,6 @@ func TestParseCreateOptionsTreatsAuthAsServitorOnlyDeliveryIntent(t *testing.T) 
 			}
 		})
 	}
-	options, err := ParseCreateOptions("create resource-group=auth version=4.22")
-	if err != nil || options.AuthRequested() || options.Values()["--resource-group"][0] != "auth" {
-		t.Fatalf("explicit auth-named resource = %#v, %v", options, err)
-	}
 }
 
 func TestParseCreateOptionsTreatsApproveAsServitorOnlyApprovalIntent(t *testing.T) {
@@ -165,10 +159,6 @@ func TestParseCreateOptionsTreatsApproveAsServitorOnlyApprovalIntent(t *testing.
 			}
 		})
 	}
-	options, err := ParseCreateOptions("create resource-group=approve version=4.22")
-	if err != nil || options.ApproveRequested() || options.Values()["--resource-group"][0] != "approve" {
-		t.Fatalf("explicit approve-named resource = %#v, %v", options, err)
-	}
 }
 
 func TestParseCreateOptionsRejectsLeadingDashForms(t *testing.T) {
@@ -179,20 +169,35 @@ func TestParseCreateOptionsRejectsLeadingDashForms(t *testing.T) {
 	}
 }
 
-func TestParseCreateAssignmentsRetainOneQuotedArgvValue(t *testing.T) {
-	request, err := ParseCreate(`create target=synthetic-target resource-group="Platform Team=Core" version=4.22`, testCreateDefaults)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for index := 0; index < len(request.Args); index += 2 {
-		if request.Args[index] == "--resource-group" {
-			if request.Args[index+1] != "Platform Team=Core" {
-				t.Fatalf("resource-group argv value = %q", request.Args[index+1])
-			}
-			return
+func TestParseCreateRejectsResourceGroup(t *testing.T) {
+	for _, text := range []string{`create resource-group="Platform Team" version=4.22`, `create resource-group=auth version=4.22`, `create resource-group=approve version=4.22`} {
+		if _, err := ParseCreateOptions(text); err == nil || !strings.Contains(err.Error(), `unknown create option "resource-group"`) {
+			t.Fatalf("ParseCreateOptions(%q) error = %v", text, err)
 		}
 	}
-	t.Fatalf("resource-group was not captured in argv: %#v", request.Args)
+}
+
+func TestParseCreatePrivateOnlyIsServitorPolicy(t *testing.T) {
+	for _, test := range []struct {
+		text string
+		want bool
+	}{
+		{"create private-only version=4.22", true},
+		{"create private-only=true version=4.22", true},
+		{"create private-only=false version=4.22", false},
+	} {
+		t.Run(test.text, func(t *testing.T) {
+			request, err := ParseCreate(test.text, testCreateDefaults)
+			if err != nil || request.PrivateOnly != test.want || slices.Contains(request.Args, "--private-only") {
+				t.Fatalf("ParseCreate(%q) = %#v, %v", test.text, request, err)
+			}
+		})
+	}
+	for _, text := range []string{"create private-only=maybe", "create private-only private-only", "create private-only=true private-only=false"} {
+		if _, err := ParseCreateOptions(text); err == nil {
+			t.Fatalf("ParseCreateOptions(%q) succeeded", text)
+		}
+	}
 }
 
 func TestParseCreateAssignmentErrors(t *testing.T) {
@@ -244,23 +249,23 @@ func TestParseCreateAppliesAndOverridesConfiguredDefaults(t *testing.T) {
 	}{
 		{
 			name: "configured version", text: "create", platform: "openshift",
-			want: []string{"--target", "synthetic-target", "--provider", "vpc-gen2", "--platform", "openshift", "--version", "4.22", "--resource-group", "Default", "--flavor", "bx2.4x16"},
+			want: []string{"--target", "synthetic-target", "--provider", "vpc-gen2", "--platform", "openshift", "--version", "4.22", "--flavor", "bx2.4x16"},
 		},
 		{
 			name: "OpenShift defaults", text: "create version=4.22", platform: "openshift",
-			want: []string{"--target", "synthetic-target", "--provider", "vpc-gen2", "--platform", "openshift", "--version", "4.22", "--resource-group", "Default", "--flavor", "bx2.4x16"},
+			want: []string{"--target", "synthetic-target", "--provider", "vpc-gen2", "--platform", "openshift", "--version", "4.22", "--flavor", "bx2.4x16"},
 		},
 		{
 			name: "Kubernetes defaults", text: "create version=1.31", platform: "kubernetes",
-			want: []string{"--target", "synthetic-target", "--provider", "vpc-gen2", "--platform", "kubernetes", "--version", "1.31", "--resource-group", "Default", "--flavor", "bx2.2x8"},
+			want: []string{"--target", "synthetic-target", "--provider", "vpc-gen2", "--platform", "kubernetes", "--version", "1.31", "--flavor", "bx2.2x8"},
 		},
 		{
-			name: "OpenShift overrides", text: "create version=4.22 target=target provider=classic resource-group=group zone=zone flavor=flavor", platform: "openshift",
-			want: []string{"--target", "target", "--provider", "classic", "--platform", "openshift", "--version", "4.22", "--resource-group", "group", "--zone", "zone", "--flavor", "flavor"},
+			name: "OpenShift overrides", text: "create version=4.22 target=target provider=classic zone=zone flavor=flavor", platform: "openshift",
+			want: []string{"--target", "target", "--provider", "classic", "--platform", "openshift", "--version", "4.22", "--zone", "zone", "--flavor", "flavor"},
 		},
 		{
 			name: "Kubernetes flavor override", text: "create version=1.31 flavor=kubernetes-flavor", platform: "kubernetes",
-			want: []string{"--target", "synthetic-target", "--provider", "vpc-gen2", "--platform", "kubernetes", "--version", "1.31", "--resource-group", "Default", "--flavor", "kubernetes-flavor"},
+			want: []string{"--target", "synthetic-target", "--provider", "vpc-gen2", "--platform", "kubernetes", "--version", "1.31", "--flavor", "kubernetes-flavor"},
 		},
 	}
 	for _, test := range tests {
@@ -293,7 +298,7 @@ func TestParseCreateExposesNormalizedPresentationFields(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if request.Target != "synthetic-target" || request.Platform != "kubernetes" || request.Version != "1.36" || request.Provider != "vpc-gen2" || request.ResourceGroup != "Default" || request.WorkerShape != "bx2.2x8" || request.WorkerCount != "2" || request.Location != "" {
+	if request.Target != "synthetic-target" || request.Platform != "kubernetes" || request.Version != "1.36" || request.Provider != "vpc-gen2" || request.WorkerShape != "bx2.2x8" || request.WorkerCount != "2" || request.Location != "" {
 		t.Fatalf("normalized request = %+v", request)
 	}
 }
@@ -360,7 +365,7 @@ func TestParseCreateRecognizesCloudDefaultAliasesAndCompatibleNumericStreams(t *
 func TestParseCreateRejectsDuplicateAndMissingSingletonValues(t *testing.T) {
 	singletons := []struct{ flag, value string }{
 		{"--target", "target"}, {"--provider", "vpc-gen2"}, {"--version", "4.22"},
-		{"--resource-group", "group"}, {"--zone", "zone"}, {"--flavor", "flavor"}, {"--vpc-id", "vpc"},
+		{"--zone", "zone"}, {"--flavor", "flavor"}, {"--vpc-id", "vpc"},
 		{"--datacenter", "datacenter"}, {"--machine-type", "machine"}, {"--public-vlan-id", "public"}, {"--private-vlan-id", "private"},
 		{"--satellite-managed-from", "managed"}, {"--satellite-location-id", "location"}, {"--satellite-host-image", "image"},
 		{"--satellite-host-profile", "profile"}, {"--satellite-ssh-key-id", "key"}, {"--satellite-worker-operating-system", "os"},
@@ -396,14 +401,14 @@ func TestParseCreateRejectsDuplicateAndMissingSingletonValues(t *testing.T) {
 
 func TestParseCreateParsesQuotedAndEscapedValuesAndRejectsShellSyntax(t *testing.T) {
 	tests := []struct {
-		name, text, wantResourceGroup string
-		wantErr                       bool
+		name, text, wantTarget string
+		wantErr                bool
 	}{
-		{"single quoted", "create version=4.22 resource-group='Platform Team'", "Platform Team", false},
-		{"double quoted escaped quote", `create version=4.22 resource-group="Platform \"Team\""`, `Platform "Team"`, false},
-		{"escaped whitespace", `create version=4.22 resource-group=Platform\ Team`, "Platform Team", false},
-		{"unterminated quote", "create version=4.22 resource-group='Platform Team", "", true},
-		{"unterminated escape", `create version=4.22 resource-group=Platform\`, "", true},
+		{"single quoted", "create version=4.22 target='Platform Team'", "Platform Team", false},
+		{"double quoted escaped quote", `create version=4.22 target="Platform \"Team\""`, `Platform "Team"`, false},
+		{"escaped whitespace", `create version=4.22 target=Platform\ Team`, "Platform Team", false},
+		{"unterminated quote", "create version=4.22 target='Platform Team", "", true},
+		{"unterminated escape", `create version=4.22 target=Platform\`, "", true},
 		{"semicolon", "create version=4.22; destroy", "", true},
 		{"pipe", "create version=4.22 | destroy", "", true},
 		{"ampersand", "create version=4.22 & destroy", "", true},
@@ -424,8 +429,8 @@ func TestParseCreateParsesQuotedAndEscapedValuesAndRejectsShellSyntax(t *testing
 			if err != nil {
 				t.Fatal(err)
 			}
-			if got := one(options.values, "--resource-group"); got != test.wantResourceGroup {
-				t.Fatalf("resource group = %q, want %q", got, test.wantResourceGroup)
+			if got := one(options.values, "--target"); got != test.wantTarget {
+				t.Fatalf("target = %q, want %q", got, test.wantTarget)
 			}
 		})
 	}

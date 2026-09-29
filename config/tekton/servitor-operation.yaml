@@ -1,171 +1,330 @@
 apiVersion: tekton.dev/v1
 kind: Task
 metadata:
-  name: servitor-operation
+        name: servitor-operation
 spec:
-  params:
-    - { name: operation-id, type: string }
-    - { name: operation-kind, type: string }
-    - { name: cluster-uid, type: string }
-    - { name: execution-image, type: string }
-    - { name: resolved-options, type: string }
-    - { name: backend, type: string }
-    - { name: recovery, type: string, default: "" }
-    - { name: ict-config-map, type: string }
-    - { name: ict-config-key, type: string }
-    - { name: cos-secret, type: string }
-    - { name: ibm-secret, type: string }
-    - { name: auth-eligible, type: string }
-    - { name: auth-secret, type: string }
-  stepTemplate:
-    env:
-      - name: HOME
-        value: /tekton/home
-    securityContext:
-      allowPrivilegeEscalation: false
-      capabilities: { drop: ["ALL"] }
-      readOnlyRootFilesystem: true
-      runAsNonRoot: true
-      seccompProfile: { type: RuntimeDefault }
-  volumes:
-    - name: operation-data
-      emptyDir: {}
-    - name: tmp
-      emptyDir: {}
-    - name: auth-data
-      emptyDir: { medium: Memory }
-    - name: publisher-token
-      projected:
-        sources:
-          - serviceAccountToken:
-              {
-                path: token,
-                audience: https://kubernetes.default.svc,
-                expirationSeconds: 3600,
-              }
-          - configMap:
-              name: kube-root-ca.crt
-              items: [{ key: ca.crt, path: ca.crt }]
-    - name: ict-config
-      configMap:
-        name: $(params.ict-config-map)
-        items:
-          - key: $(params.ict-config-key)
-            path: config.yaml
-  steps:
-    - name: execute
-      image: $(params.execution-image)
-      command: ["/usr/local/bin/servitor-task"]
-      args:
-        - -cluster-uid
-        - $(params.cluster-uid)
-        - -operation-id
-        - $(params.operation-id)
-        - -operation-kind
-        - $(params.operation-kind)
-        - -resolved-options
-        - /operation/options.json
-        - -resolved-options-json
-        - $(params.resolved-options)
-        - -backend-config
-        - /operation/backend.json
-        - -backend-json
-        - $(params.backend)
-        - -recovery
-        - /operation/recovery.json
-        - -recovery-json
-        - $(params.recovery)
-        - -ict-result
-        - /operation/ict-result.json
-        - -report
-        - /operation/report.json
-        - -auth-eligible=$(params.auth-eligible)
-        - -auth-manifest
-        - /auth/manifest.json
-        - -auth-output-dir
-        - /auth
-        - -planning-inventory-config
-        - /etc/servitor/ict/config.yaml
-      env:
-        - name: ICT_CONFIG
-          value: /etc/servitor/ict/config.yaml
-        - name: TMPDIR
-          value: /tmp
-      envFrom:
-        - secretRef: { name: $(params.cos-secret) }
-        - secretRef: { name: $(params.ibm-secret) }
-      volumeMounts:
-        - { name: operation-data, mountPath: /operation }
-        - { name: tmp, mountPath: /tmp }
-        - { name: auth-data, mountPath: /auth }
-        - { name: ict-config, mountPath: /etc/servitor/ict, readOnly: true }
-    - name: publish
-      image: $(params.execution-image)
-      command: ["/usr/local/bin/servitor-task"]
-      args:
-        - -publish-auth
-        - -cluster-uid
-        - $(params.cluster-uid)
-        - -operation-id
-        - $(params.operation-id)
-        - -publish-auth-secret
-        - $(params.auth-secret)
-        - -auth-manifest
-        - /auth/manifest.json
-        - -auth-output-dir
-        - /auth
-        - -report
-        - /operation/report.json
-        - -publisher-namespace
-        - $(context.taskRun.namespace)
-        - -publisher-token
-        - /publisher/token
-        - -publisher-ca
-        - /publisher/ca.crt
-      volumeMounts:
-        - { name: operation-data, mountPath: /operation }
-        - { name: auth-data, mountPath: /auth }
-        - { name: publisher-token, mountPath: /publisher, readOnly: true }
-    - name: report
-      image: $(params.execution-image)
-      command: ["/usr/local/bin/servitor-task"]
-      args: ["-emit-report", "/operation/report.json"]
-      volumeMounts: [{ name: operation-data, mountPath: /operation }]
+        params:
+                - { name: operation-id, type: string }
+                - { name: operation-kind, type: string }
+                - { name: cluster-uid, type: string }
+                - { name: cluster-name, type: string }
+                - { name: execution-image, type: string }
+                - { name: resolved-options, type: string }
+                - { name: backend, type: string }
+                - { name: recovery, type: string, default: "" }
+                - { name: ict-config-map, type: string }
+                - { name: ict-config-key, type: string }
+                - { name: cos-secret, type: string }
+                - { name: ibm-secret, type: string }
+                - { name: auth-eligible, type: string }
+                - { name: auth-attempt-id, type: string, default: "" }
+                - { name: auth-secret, type: string }
+                - { name: auth-certificate-refs, type: string, default: "[]" }
+                - {
+                          name: auth-primary-reason,
+                          type: string,
+                          default: "auth-state-failure",
+                  }
+                - {
+                          name: auth-cleanup-outcome,
+                          type: string,
+                          default: "not-required",
+                  }
+                - { name: auth-cleanup-reason, type: string, default: "" }
+                - { name: auth-cleanup-stage, type: string, default: "" }
+                - { name: auth-retry-request, type: string, default: "" }
+        stepTemplate:
+                env:
+                        - name: HOME
+                          value: /tekton/home
+                securityContext:
+                        allowPrivilegeEscalation: false
+                        capabilities: { drop: ["ALL"] }
+                        readOnlyRootFilesystem: true
+                        runAsNonRoot: true
+                        seccompProfile: { type: RuntimeDefault }
+        volumes:
+                - name: operation-data
+                  emptyDir: {}
+                # The bundle has two files and is capped below 2 MiB by the task; 4 MiB
+                # leaves room for atomic replacement without admitting unbounded secrets.
+                - name: auth-data
+                  emptyDir: { medium: Memory, sizeLimit: 4Mi }
+                # Only ICT auth uses this isolated Terraform state, provider cache, and
+                # credentials workspace. ICT requires exactly 512 MiB capacity and at
+                # least 384 MiB free before auth initialization.
+                - name: auth-tmpfs
+                  emptyDir: { medium: Memory, sizeLimit: 512Mi }
+                - name: publisher-token
+                  projected:
+                          sources:
+                                  - serviceAccountToken:
+                                            {
+                                                    path: token,
+                                                    audience: https://kubernetes.default.svc,
+                                                    expirationSeconds: 3600,
+                                            }
+                                  - configMap:
+                                            name: kube-root-ca.crt
+                                            items:
+                                                    [
+                                                            {
+                                                                    key: ca.crt,
+                                                                    path: ca.crt,
+                                                            },
+                                                    ]
+                - name: ict-config
+                  configMap:
+                          name: $(params.ict-config-map)
+                          items:
+                                  - key: $(params.ict-config-key)
+                                    path: config.yaml
+        steps:
+                - name: execute
+                  image: $(params.execution-image)
+                  command: ["/usr/local/bin/servitor-task"]
+                  args:
+                          - -cluster-uid
+                          - $(params.cluster-uid)
+                          - -operation-id
+                          - $(params.operation-id)
+                          - -operation-kind
+                          - $(params.operation-kind)
+                          - -resolved-options
+                          - /operation/options.json
+                          - -resolved-options-json
+                          - $(params.resolved-options)
+                          - -backend-config
+                          - /operation/backend.json
+                          - -backend-json
+                          - $(params.backend)
+                          - -recovery
+                          - /operation/recovery.json
+                          - -recovery-json
+                          - $(params.recovery)
+                          - -ict-result
+                          - /operation/ict-result.json
+                          - -report
+                          - /operation/report.json
+                          - -auth-eligible=$(params.auth-eligible)
+                          - -auth-attempt-id
+                          - $(params.auth-attempt-id)
+                          - -auth-manifest
+                          - /auth/manifest.json
+                          - -auth-output-dir
+                          - /auth
+                          - -auth-tmpfs-dir
+                          - /auth-tmpfs
+                          - -auth-certificate-refs-json
+                          - $(params.auth-certificate-refs)
+                          - -auth-primary-reason
+                          - $(params.auth-primary-reason)
+                          - -auth-cleanup-outcome
+                          - $(params.auth-cleanup-outcome)
+                          - -auth-cleanup-reason
+                          - $(params.auth-cleanup-reason)
+                          - -auth-cleanup-stage
+                          - $(params.auth-cleanup-stage)
+                          - -auth-fence-attempt-id
+                          - $(params.auth-attempt-id)
+                          - -auth-fence-request-timestamp
+                          - $(params.auth-retry-request)
+                          - -auth-fence-cluster
+                          - $(params.cluster-name)
+                          - -auth-fence-namespace
+                          - $(context.taskRun.namespace)
+                          - -auth-fence-token
+                          - /publisher/token
+                          - -auth-fence-ca
+                          - /publisher/ca.crt
+                          - -planning-inventory-config
+                          - /etc/servitor/ict/config.yaml
+                  env:
+                          - name: ICT_CONFIG
+                            value: /etc/servitor/ict/config.yaml
+                          - name: TMPDIR
+                            value: /operation
+                  envFrom:
+                          - secretRef: { name: $(params.cos-secret) }
+                          - secretRef: { name: $(params.ibm-secret) }
+                  volumeMounts:
+                          - { name: operation-data, mountPath: /operation }
+                          - { name: auth-data, mountPath: /auth }
+                          - { name: auth-tmpfs, mountPath: /auth-tmpfs }
+                          - {
+                                    name: publisher-token,
+                                    mountPath: /publisher,
+                                    readOnly: true,
+                            }
+                          - {
+                                    name: ict-config,
+                                    mountPath: /etc/servitor/ict,
+                                    readOnly: true,
+                            }
+                - name: publish
+                  image: $(params.execution-image)
+                  command: ["/usr/local/bin/servitor-task"]
+                  args:
+                          - -publish-auth
+                          - -auth-eligible=$(params.auth-eligible)
+                          - -cluster-uid
+                          - $(params.cluster-uid)
+                          - -operation-id
+                          - $(params.operation-id)
+                          - -auth-attempt-id
+                          - $(params.auth-attempt-id)
+                          - -resolved-options
+                          - /operation/options.json
+                          - -publish-auth-secret
+                          - $(params.auth-secret)
+                          - -auth-manifest
+                          - /auth/manifest.json
+                          - -auth-output-dir
+                          - /auth
+                          - -report
+                          - /operation/report.json
+                          - -publisher-namespace
+                          - $(context.taskRun.namespace)
+                          - -publisher-token
+                          - /publisher/token
+                          - -publisher-ca
+                          - /publisher/ca.crt
+                          - -auth-cleanup-context
+                          - /operation/auth-context.json
+                          - -auth-fence-attempt-id
+                          - $(params.auth-attempt-id)
+                          - -auth-fence-request-timestamp
+                          - $(params.auth-retry-request)
+                          - -auth-fence-cluster
+                          - $(params.cluster-name)
+                          - -auth-fence-namespace
+                          - $(context.taskRun.namespace)
+                          - -auth-fence-token
+                          - /publisher/token
+                          - -auth-fence-ca
+                          - /publisher/ca.crt
+                  # Publication invokes only ICT auth-cleanup after a terminal failure.
+                  # Reuse the execute step's IBM credentials; no additional identity is granted.
+                  envFrom:
+                          - secretRef: { name: $(params.ibm-secret) }
+                  volumeMounts:
+                          - { name: operation-data, mountPath: /operation }
+                          - { name: auth-data, mountPath: /auth }
+                          - {
+                                    name: publisher-token,
+                                    mountPath: /publisher,
+                                    readOnly: true,
+                            }
+                - name: report
+                  image: $(params.execution-image)
+                  command: ["/usr/local/bin/servitor-task"]
+                  args: ["-emit-report", "/operation/report.json"]
+                  volumeMounts:
+                          [{ name: operation-data, mountPath: /operation }]
 ---
 apiVersion: tekton.dev/v1
 kind: Pipeline
 metadata:
-  name: servitor-operation
+        name: servitor-operation
 spec:
-  params:
-    - { name: operation-id, type: string }
-    - { name: operation-kind, type: string }
-    - { name: cluster-uid, type: string }
-    - { name: execution-image, type: string }
-    - { name: resolved-options, type: string }
-    - { name: backend, type: string }
-    - { name: recovery, type: string, default: "" }
-    - { name: ict-config-map, type: string }
-    - { name: ict-config-key, type: string }
-    - { name: cos-secret, type: string }
-    - { name: ibm-secret, type: string }
-    - { name: auth-eligible, type: string }
-    - { name: auth-secret, type: string }
-  tasks:
-    - name: operation
-      taskRef: { name: servitor-operation }
-      timeout: 110m
-      params:
-        - { name: operation-id, value: $(params.operation-id) }
-        - { name: operation-kind, value: $(params.operation-kind) }
-        - { name: cluster-uid, value: $(params.cluster-uid) }
-        - { name: execution-image, value: $(params.execution-image) }
-        - { name: resolved-options, value: $(params.resolved-options) }
-        - { name: backend, value: $(params.backend) }
-        - { name: recovery, value: $(params.recovery) }
-        - { name: ict-config-map, value: $(params.ict-config-map) }
-        - { name: ict-config-key, value: $(params.ict-config-key) }
-        - { name: cos-secret, value: $(params.cos-secret) }
-        - { name: ibm-secret, value: $(params.ibm-secret) }
-        - { name: auth-eligible, value: $(params.auth-eligible) }
-        - { name: auth-secret, value: $(params.auth-secret) }
+        params:
+                - { name: operation-id, type: string }
+                - { name: operation-kind, type: string }
+                - { name: cluster-uid, type: string }
+                - { name: cluster-name, type: string }
+                - { name: execution-image, type: string }
+                - { name: resolved-options, type: string }
+                - { name: backend, type: string }
+                - { name: recovery, type: string, default: "" }
+                - { name: ict-config-map, type: string }
+                - { name: ict-config-key, type: string }
+                - { name: cos-secret, type: string }
+                - { name: ibm-secret, type: string }
+                - { name: auth-eligible, type: string }
+                - { name: auth-attempt-id, type: string, default: "" }
+                - { name: auth-secret, type: string }
+                - { name: auth-certificate-refs, type: string, default: "[]" }
+                - {
+                          name: auth-primary-reason,
+                          type: string,
+                          default: "auth-state-failure",
+                  }
+                - {
+                          name: auth-cleanup-outcome,
+                          type: string,
+                          default: "not-required",
+                  }
+                - { name: auth-cleanup-reason, type: string, default: "" }
+                - { name: auth-cleanup-stage, type: string, default: "" }
+                - { name: auth-retry-request, type: string, default: "" }
+        tasks:
+                - name: operation
+                  taskRef: { name: servitor-operation }
+                  timeout: 110m
+                  params:
+                          - {
+                                    name: operation-id,
+                                    value: $(params.operation-id),
+                            }
+                          - {
+                                    name: operation-kind,
+                                    value: $(params.operation-kind),
+                            }
+                          - { name: cluster-uid, value: $(params.cluster-uid) }
+                          - {
+                                    name: cluster-name,
+                                    value: $(params.cluster-name),
+                            }
+                          - {
+                                    name: execution-image,
+                                    value: $(params.execution-image),
+                            }
+                          - {
+                                    name: resolved-options,
+                                    value: $(params.resolved-options),
+                            }
+                          - { name: backend, value: $(params.backend) }
+                          - { name: recovery, value: $(params.recovery) }
+                          - {
+                                    name: ict-config-map,
+                                    value: $(params.ict-config-map),
+                            }
+                          - {
+                                    name: ict-config-key,
+                                    value: $(params.ict-config-key),
+                            }
+                          - { name: cos-secret, value: $(params.cos-secret) }
+                          - { name: ibm-secret, value: $(params.ibm-secret) }
+                          - {
+                                    name: auth-eligible,
+                                    value: $(params.auth-eligible),
+                            }
+                          - {
+                                    name: auth-attempt-id,
+                                    value: $(params.auth-attempt-id),
+                            }
+                          - { name: auth-secret, value: $(params.auth-secret) }
+                          - {
+                                    name: auth-certificate-refs,
+                                    value: $(params.auth-certificate-refs),
+                            }
+                          - {
+                                    name: auth-primary-reason,
+                                    value: $(params.auth-primary-reason),
+                            }
+                          - {
+                                    name: auth-cleanup-outcome,
+                                    value: $(params.auth-cleanup-outcome),
+                            }
+                          - {
+                                    name: auth-cleanup-reason,
+                                    value: $(params.auth-cleanup-reason),
+                            }
+                          - {
+                                    name: auth-cleanup-stage,
+                                    value: $(params.auth-cleanup-stage),
+                            }
+                          - {
+                                    name: auth-retry-request,
+                                    value: $(params.auth-retry-request),
+                            }

@@ -17,7 +17,7 @@ func TestSnapshotFreezesVPNPolicyAcrossConfigurationChanges(t *testing.T) {
 		t.Fatal(err)
 	}
 	frozen := cluster.Status.ResolvedOptions.Network.AuthPolicy
-	if frozen == nil || frozen.AllocationUID != "allocation-uid" || frozen.VPNServerID != "vpn-original" || cluster.Status.LifecycleSnapshot == nil || !cluster.Status.LifecycleSnapshot.AuthEligible {
+	if frozen == nil || frozen.VPNServerID != "vpn-original" || cluster.Status.LifecycleSnapshot == nil || !cluster.Status.LifecycleSnapshot.AuthEligible {
 		t.Fatalf("snapshot did not freeze private auth policy: %#v", cluster.Status)
 	}
 	changed := reconciler.Config.NetworkBindings["private-target"]

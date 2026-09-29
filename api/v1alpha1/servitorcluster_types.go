@@ -38,7 +38,7 @@ type UserOptions struct {
 	Target                         string   `json:"target,omitempty"`
 	Provider                       string   `json:"provider,omitempty"`
 	Version                        string   `json:"version,omitempty"`
-	ResourceGroup                  string   `json:"resourceGroup,omitempty"`
+	PrivateOnly                    bool     `json:"privateOnly,omitempty"`
 	Zone                           string   `json:"zone,omitempty"`
 	Flavor                         string   `json:"flavor,omitempty"`
 	Datacenter                     string   `json:"datacenter,omitempty"`
@@ -69,7 +69,10 @@ type LifecyclePolicy struct {
 	// AuthRequestTimestamp identifies an explicit owner-thread auth request.
 	// It is monotonic so redelivery and old events cannot replay a delivery.
 	AuthRequestTimestamp string `json:"authRequestTimestamp,omitempty"`
-	CleanupRequested     bool   `json:"cleanupRequested,omitempty"`
+	// AuthRetryRequestTimestamp is a separate monotonic owner intent. It never
+	// shares the delivery request identity.
+	AuthRetryRequestTimestamp string `json:"authRetryRequestTimestamp,omitempty"`
+	CleanupRequested          bool   `json:"cleanupRequested,omitempty"`
 }
 
 // ServitorClusterSpec is immutable after creation except lifecycle intent.
@@ -84,7 +87,6 @@ type ServitorClusterSpec struct {
 // FrozenAuthPolicy identifies the existing non-secret VPN issuer policy.
 // It is selected by the operator and never derived from mutable configuration.
 type FrozenAuthPolicy struct {
-	AllocationUID        string `json:"allocation_uid,omitempty"`
 	VPNServerID          string `json:"vpn_server_id,omitempty"`
 	SecretsManagerID     string `json:"secrets_manager_id,omitempty"`
 	SecretsManagerRegion string `json:"secrets_manager_region,omitempty"`
@@ -109,11 +111,12 @@ type FrozenNetwork struct {
 
 // ResolvedOptions are the once-frozen effective planning inputs.
 type ResolvedOptions struct {
-	UserOptions `json:",inline"`
-	Platform    string        `json:"platform,omitempty"`
-	ClusterName string        `json:"clusterName,omitempty"`
-	Region      string        `json:"region,omitempty"`
-	Network     FrozenNetwork `json:"network,omitempty"`
+	UserOptions   `json:",inline"`
+	ResourceGroup string        `json:"resourceGroup,omitempty"`
+	Platform      string        `json:"platform,omitempty"`
+	ClusterName   string        `json:"clusterName,omitempty"`
+	Region        string        `json:"region,omitempty"`
+	Network       FrozenNetwork `json:"network,omitempty"`
 }
 
 // LifecycleSnapshot is the immutable policy used throughout an allocation.
@@ -128,9 +131,74 @@ type LifecycleSnapshot struct {
 
 // AuthStatus is the bounded, credential-free result of bundle publication.
 type AuthStatus struct {
-	Availability string `json:"availability"`
-	Mode         string `json:"mode,omitempty"`
-	Expiry       string `json:"expiry,omitempty"`
+	Availability                 string                     `json:"availability"`
+	Mode                         string                     `json:"mode,omitempty"`
+	Expiry                       string                     `json:"expiry,omitempty"`
+	Reason                       string                     `json:"reason,omitempty"`
+	CleanupOutcome               string                     `json:"cleanupOutcome,omitempty"`
+	CleanupReason                string                     `json:"cleanupReason,omitempty"`
+	CleanupStage                 string                     `json:"cleanupStage,omitempty"`
+	AttemptID                    string                     `json:"attemptID,omitempty"`
+	Certificate                  *AuthCertificateReference  `json:"certificate,omitempty"`
+	ClearedCertificateReferences []AuthCertificateReference `json:"clearedCertificateReferences,omitempty"`
+}
+
+// MaxAuthCertificateReferences bounds persisted cleanup ownership metadata.
+const MaxAuthCertificateReferences = 8
+
+// AuthAttempt is the runtime ownership identity for one auth generation. It is
+// deliberately separate from FrozenAuthPolicy so retries never change policy.
+type AuthAttempt struct {
+	AllocationUID string `json:"allocationUID"`
+	AttemptID     string `json:"attemptID"`
+}
+
+// AuthCertificateReference is bounded non-secret ownership metadata retained
+// only until ICT has reconciled the allocation certificate.
+type AuthCertificateReference struct {
+	ID            string `json:"id,omitempty"`
+	AllocationUID string `json:"allocationUID"`
+	AttemptID     string `json:"attemptID"`
+}
+
+// ValidAuthFailureReason reports whether reason is a bounded diagnostic code.
+func ValidAuthFailureReason(reason string) bool {
+	switch reason {
+	case "publisher-unavailable", "invalid-artifacts", "auth-manifest-invalid", "auth-artifact-layout-invalid", "auth-kubeconfig-invalid", "auth-vpn-profile-invalid", "auth-vpn-profile-trust-invalid", "auth-vpn-certificate-invalid", "auth-vpn-expiry-mismatch", "auth-state-failure", "certificate-cleanup-pending", "auth-retry-cancelled", "auth-retry-fenced", "vpn-certificate-leaf-parse", "vpn-certificate-leaf-usage", "vpn-certificate-key-parse", "vpn-certificate-key-mismatch", "vpn-certificate-chain-parse", "vpn-certificate-chain-authority", "vpn-certificate-chain-no-root", "vpn-certificate-chain-verify", "vpn-certificate-leaf-verify", "vpn-certificate-server-eku", "vpn-certificate-expiry-mismatch", "vpn-certificate-authority-mismatch":
+		return true
+	default:
+		return false
+	}
+}
+
+// ValidAuthCleanupOutcome reports whether outcome is a bounded cleanup state.
+func ValidAuthCleanupOutcome(outcome string) bool {
+	switch outcome {
+	case "not-required", "cleaned", "pending":
+		return true
+	default:
+		return false
+	}
+}
+
+// ValidAuthCleanupReason reports whether reason is a credential-free cleanup class.
+func ValidAuthCleanupReason(reason string) bool {
+	switch reason {
+	case "ownership-mismatch", "authentication", "rate-limit", "service", "request", "transport", "list", "delete", "unknown":
+		return true
+	default:
+		return false
+	}
+}
+
+// ValidAuthCleanupStage reports whether stage identifies one value-free cleanup boundary.
+func ValidAuthCleanupStage(stage string) bool {
+	switch stage {
+	case "client", "authenticate", "metadata-get", "metadata-list", "delete":
+		return true
+	default:
+		return false
+	}
 }
 
 // PublicAuthStatus is the pre-task-05 status name retained for decoding old objects.
@@ -142,7 +210,7 @@ func (p FrozenAuthPolicy) Validate() error {
 		value string
 		limit int
 	}{
-		{"allocation UID", p.AllocationUID, 128}, {"VPN server ID", p.VPNServerID, 256}, {"Secrets Manager ID", p.SecretsManagerID, 256}, {"Secrets Manager region", p.SecretsManagerRegion, 64}, {"secret group ID", p.SecretGroupID, 256}, {"certificate template", p.CertificateTemplate, 256}, {"issuer", p.Issuer, 256}, {"TTL", p.TTL, 32},
+		{"VPN server ID", p.VPNServerID, 256}, {"Secrets Manager ID", p.SecretsManagerID, 256}, {"Secrets Manager region", p.SecretsManagerRegion, 64}, {"secret group ID", p.SecretGroupID, 256}, {"certificate template", p.CertificateTemplate, 256}, {"issuer", p.Issuer, 256}, {"TTL", p.TTL, 32},
 	} {
 		if field.value == "" || len(field.value) > field.limit || strings.TrimSpace(field.value) != field.value || strings.ContainsFunc(field.value, unicode.IsControl) {
 			return fmt.Errorf("invalid auth policy %s", field.name)
@@ -349,6 +417,7 @@ type RecoveryValues struct {
 	Platform                       string            `json:"platform"`
 	KubeVersion                    string            `json:"kube_version"`
 	WorkerCount                    int               `json:"worker_count"`
+	PrivateOnly                    bool              `json:"private_only,omitempty"`
 	Zone                           string            `json:"zone,omitempty"`
 	Flavor                         string            `json:"flavor,omitempty"`
 	AccountID                      string            `json:"account_id,omitempty"`
@@ -375,6 +444,7 @@ type RecoveryValues struct {
 type OperationReference struct {
 	ID              string      `json:"id"`
 	Kind            string      `json:"kind"`
+	AuthAttemptID   string      `json:"authAttemptID,omitempty"`
 	PipelineRunName string      `json:"pipelineRunName"`
 	StartedAt       metav1.Time `json:"startedAt"`
 	Dispatched      bool        `json:"dispatched,omitempty"`
@@ -412,7 +482,7 @@ type PlanRejection struct {
 
 func (r PlanRejection) Validate() error {
 	if (r.ReasonCode != "target_not_configured" && r.ReasonCode != "provider_not_supported" && r.ReasonCode != "version_not_supported" && r.ReasonCode != "option_not_available") ||
-		(r.OptionKey != "target" && r.OptionKey != "provider" && r.OptionKey != "version" && r.OptionKey != "resource-group" && r.OptionKey != "zone" && r.OptionKey != "flavor" && r.OptionKey != "datacenter" && r.OptionKey != "machine-type" && r.OptionKey != "satellite-host-profile") {
+		(r.OptionKey != "target" && r.OptionKey != "provider" && r.OptionKey != "version" && r.OptionKey != "private-only" && r.OptionKey != "zone" && r.OptionKey != "flavor" && r.OptionKey != "datacenter" && r.OptionKey != "machine-type" && r.OptionKey != "satellite-host-profile") {
 		return fmt.Errorf("invalid planning rejection")
 	}
 	return nil
@@ -466,6 +536,68 @@ type AuthDeliveryStatus struct {
 	Outcome          string `json:"outcome"`
 }
 
+const MaxExecutionImageLength = 512
+
+// CleanupRecoveryRequestAnnotation authorizes one administrator-approved cleanup
+// recovery. Its JSON value must contain uid, generation, statusFingerprint,
+// executionImage, and reason fields for the exact allocation state.
+const CleanupRecoveryRequestAnnotation = "servitor.bevicted.github.io/cleanup-recovery-request"
+
+// CleanupRecoveryReasonTaskExecutionContractMismatch is the only approved
+// reason for the bounded cleanup-recovery annotation.
+const CleanupRecoveryReasonTaskExecutionContractMismatch = "task-execution-contract-mismatch"
+
+// ValidExecutionImage reports whether value is a bounded, immutable image digest.
+func ValidExecutionImage(value string) bool {
+	imageName, digest, found := strings.Cut(value, "@sha256:")
+	if !found || imageName == "" || strings.Contains(imageName, "@") || strings.IndexFunc(value, unicode.IsSpace) >= 0 || len(value) > MaxExecutionImageLength || len(digest) != 64 || digest != strings.ToLower(digest) {
+		return false
+	}
+	_, err := hex.DecodeString(digest)
+	return err == nil
+}
+
+// AuthRetryStatus records an independent auth-only operation. RequestTimestamp
+// is the monotonic Slack intent and AttemptID is the auth ownership identity.
+type AuthRetryStatus struct {
+	RequestTimestamp string `json:"requestTimestamp"`
+	AttemptID        string `json:"attemptID"`
+	ExecutionImage   string `json:"executionImage"`
+	Outcome          string `json:"outcome"`
+}
+
+// CleanupRecoveryState records the sole result of an administrator-approved
+// cleanup recovery.
+type CleanupRecoveryState string
+
+const (
+	CleanupRecoveryPending   CleanupRecoveryState = "Pending"
+	CleanupRecoverySucceeded CleanupRecoveryState = "Succeeded"
+	CleanupRecoveryFailed    CleanupRecoveryState = "Failed"
+)
+
+// CleanupRecoveryAttempt records the bounded identity and outcome of the
+// first cleanup recovery before the explicitly approved second attempt.
+type CleanupRecoveryAttempt struct {
+	ExecutionImage string               `json:"executionImage"`
+	OperationID    string               `json:"operationID"`
+	Outcome        CleanupRecoveryState `json:"outcome"`
+	Timestamp      metav1.Time          `json:"timestamp"`
+}
+
+// CleanupRecoveryStatus freezes the current compatible task image and the
+// observed request revision for one destroy of an otherwise unresolved allocation.
+type CleanupRecoveryStatus struct {
+	Attempt                int                      `json:"attempt"`
+	ExecutionImage         string                   `json:"executionImage"`
+	OperationID            string                   `json:"operationID"`
+	RequestResourceVersion string                   `json:"requestResourceVersion"`
+	StartedAt              metav1.Time              `json:"startedAt"`
+	State                  CleanupRecoveryState     `json:"state"`
+	CompletedAt            *metav1.Time             `json:"completedAt,omitempty"`
+	History                []CleanupRecoveryAttempt `json:"history,omitempty"`
+}
+
 // ServitorClusterStatus is written exclusively by the controller.
 type ServitorClusterStatus struct {
 	Phase             string              `json:"phase,omitempty"`
@@ -484,16 +616,21 @@ type ServitorClusterStatus struct {
 	ReviewApproval   string        `json:"reviewApproval,omitempty"`
 	Ready            *ReadySummary `json:"ready,omitempty"`
 	Auth             *AuthStatus   `json:"auth,omitempty"`
+	// AuthCertificateReferences retains every unresolved allocation-owned
+	// certificate across auth attempts. It contains identifiers only.
+	AuthCertificateReferences []AuthCertificateReference `json:"authCertificateReferences,omitempty"`
 	// PublicAuth is retained only to read pre-task-05 status. New reports write Auth.
-	PublicAuth       *AuthStatus           `json:"publicAuth,omitempty"`
-	LeaseExpiresAt   *metav1.Time          `json:"leaseExpiresAt,omitempty"`
-	LeaseExtension   *LeaseExtensionStatus `json:"leaseExtension,omitempty"`
-	AuthDelivery     *AuthDeliveryStatus   `json:"authDelivery,omitempty"`
-	ApplyDispatched  bool                  `json:"applyDispatched,omitempty"`
-	CleanupRequested bool                  `json:"cleanupRequested,omitempty"`
-	Cleanup          *CleanupStatus        `json:"cleanup,omitempty"`
-	PlanRejection    *PlanRejection        `json:"planRejection,omitempty"`
-	Diagnostic       string                `json:"diagnostic,omitempty"`
+	PublicAuth       *AuthStatus            `json:"publicAuth,omitempty"`
+	LeaseExpiresAt   *metav1.Time           `json:"leaseExpiresAt,omitempty"`
+	LeaseExtension   *LeaseExtensionStatus  `json:"leaseExtension,omitempty"`
+	AuthDelivery     *AuthDeliveryStatus    `json:"authDelivery,omitempty"`
+	AuthRetry        *AuthRetryStatus       `json:"authRetry,omitempty"`
+	CleanupRecovery  *CleanupRecoveryStatus `json:"cleanupRecovery,omitempty"`
+	ApplyDispatched  bool                   `json:"applyDispatched,omitempty"`
+	CleanupRequested bool                   `json:"cleanupRequested,omitempty"`
+	Cleanup          *CleanupStatus         `json:"cleanup,omitempty"`
+	PlanRejection    *PlanRejection         `json:"planRejection,omitempty"`
+	Diagnostic       string                 `json:"diagnostic,omitempty"`
 }
 
 // +kubebuilder:object:root=true
@@ -654,12 +791,23 @@ func (in *ServitorClusterStatus) DeepCopy() *ServitorClusterStatus {
 	}
 	if in.Auth != nil {
 		v := *in.Auth
+		if in.Auth.Certificate != nil {
+			certificate := *in.Auth.Certificate
+			v.Certificate = &certificate
+		}
+		v.ClearedCertificateReferences = append([]AuthCertificateReference(nil), v.ClearedCertificateReferences...)
 		out.Auth = &v
 	}
 	if in.PublicAuth != nil {
 		v := *in.PublicAuth
+		if in.PublicAuth.Certificate != nil {
+			certificate := *in.PublicAuth.Certificate
+			v.Certificate = &certificate
+		}
+		v.ClearedCertificateReferences = append([]AuthCertificateReference(nil), v.ClearedCertificateReferences...)
 		out.PublicAuth = &v
 	}
+	out.AuthCertificateReferences = append([]AuthCertificateReference(nil), in.AuthCertificateReferences...)
 	if in.ReviewDeadline != nil {
 		out.ReviewDeadline = in.ReviewDeadline.DeepCopy()
 	}
@@ -679,6 +827,18 @@ func (in *ServitorClusterStatus) DeepCopy() *ServitorClusterStatus {
 	if in.AuthDelivery != nil {
 		v := *in.AuthDelivery
 		out.AuthDelivery = &v
+	}
+	if in.AuthRetry != nil {
+		v := *in.AuthRetry
+		out.AuthRetry = &v
+	}
+	if in.CleanupRecovery != nil {
+		v := *in.CleanupRecovery
+		if in.CleanupRecovery.CompletedAt != nil {
+			v.CompletedAt = in.CleanupRecovery.CompletedAt.DeepCopy()
+		}
+		v.History = append([]CleanupRecoveryAttempt(nil), in.CleanupRecovery.History...)
+		out.CleanupRecovery = &v
 	}
 	if in.Cleanup != nil {
 		v := *in.Cleanup

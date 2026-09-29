@@ -53,6 +53,40 @@ func validRecoveryPointer() *servitorv1alpha1.RecoveryMetadata {
 	return &recovery
 }
 
+func TestInitialAuthAttemptIDHashesBoundedIdentity(t *testing.T) {
+	const allocation = "allocation-uid"
+	const request = "1710000000.000001"
+	const operation = "auth-retry-operation"
+	const expected = "auth-attempt-2c835c4733fc29bbc13570eab381b26d"
+
+	attempt := initialAuthAttemptID(allocation, operation, request)
+	if attempt != expected {
+		t.Fatalf("attempt = %q, want %q", attempt, expected)
+	}
+	if attempt != initialAuthAttemptID(allocation, operation, request) {
+		t.Fatal("attempt identity is not stable")
+	}
+	for name, candidate := range map[string]string{
+		"allocation": initialAuthAttemptID("another-allocation", operation, request),
+		"operation":  initialAuthAttemptID(allocation, "apply-operation", request),
+		"request":    initialAuthAttemptID(allocation, operation, "1710000000.000002"),
+	} {
+		if attempt == candidate {
+			t.Fatalf("attempt identity did not distinguish %s", name)
+		}
+	}
+
+	longRequest := strings.Repeat("request-", 32)
+	longOperation := operationID(allocation, "auth-retry-"+longRequest)
+	longAttempt := initialAuthAttemptID(allocation, longOperation, longRequest)
+	if len(longAttempt) > 64 || !strings.HasPrefix(longAttempt, "auth-attempt-") {
+		t.Fatalf("long attempt is not a bounded DNS-safe value: %q", longAttempt)
+	}
+	if longAttempt == longOperation {
+		t.Fatalf("attempt reused operation identity: %q", longAttempt)
+	}
+}
+
 func TestReconcilePersistsOneOperationAndAdoptsMatchingReport(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := servitorv1alpha1.AddToScheme(scheme); err != nil {
@@ -64,7 +98,7 @@ func TestReconcilePersistsOneOperationAndAdoptsMatchingReport(t *testing.T) {
 	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "cluster", Namespace: "ns", UID: "cluster-uid", Generation: 1}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "1.2"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 3600, RetrySeconds: []int64{60}, Approval: "approved"}}}
 	client := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&servitorv1alpha1.ServitorCluster{}, &tektonv1.PipelineRun{}, &tektonv1.TaskRun{}).WithObjects(cluster).Build()
 	now := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
-	reconciler := &Reconciler{Client: client, Scheme: scheme, Config: Config{Namespace: "ns", Defaults: servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Target: "target", Provider: "vpc-gen2", Version: "4.22", ResourceGroup: "Default"}, Platform: "openshift"}, NetworkBindings: map[string]servitorv1alpha1.FrozenNetwork{"target": frozenNetwork()}, Backend: servitorv1alpha1.BackendIdentity{Version: 1, Bucket: "ict-state-bucket", Region: "us-south", Endpoint: "https://s3.us-south.example.invalid", SkipCredentialsValidation: true, SkipMetadataAPICheck: true, SkipRegionValidation: true, SkipRequestingAccountID: true, ForcePathStyle: true}, BackendPrefix: "servitor", ExecutionImage: "registry.example/ict@sha256:deadbeef", ReviewTimeout: 5 * time.Minute}, Now: func() time.Time { return now }}
+	reconciler := &Reconciler{Client: client, Scheme: scheme, Config: Config{Namespace: "ns", Defaults: servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Target: "target", Provider: "vpc-gen2", Version: "4.22"}, ResourceGroup: "Default", Platform: "openshift"}, NetworkBindings: map[string]servitorv1alpha1.FrozenNetwork{"target": frozenNetwork()}, Backend: servitorv1alpha1.BackendIdentity{Version: 1, Bucket: "ict-state-bucket", Region: "us-south", Endpoint: "https://s3.us-south.example.invalid", SkipCredentialsValidation: true, SkipMetadataAPICheck: true, SkipRegionValidation: true, SkipRequestingAccountID: true, ForcePathStyle: true}, BackendPrefix: "servitor", ExecutionImage: "registry.example/ict@sha256:deadbeef", ReviewTimeout: 5 * time.Minute}, Now: func() time.Time { return now }}
 	request := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "ns", Name: "cluster"}}
 	for i := 0; i < 4; i++ {
 		if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
@@ -125,14 +159,14 @@ func TestReconcilePersistsOneOperationAndAdoptsMatchingReport(t *testing.T) {
 	if err := client.Get(context.Background(), request.NamespacedName, stored); err != nil {
 		t.Fatal(err)
 	}
-	if stored.Status.Phase != servitorv1alpha1.PhaseAwaitingApproval || !stored.Status.Operation.Adopted || stored.Status.ReviewDeadline == nil || !stored.Status.ReviewDeadline.Time.Equal(now.Add(5*time.Minute)) || stored.Status.ReviewGeneration != stored.Generation || stored.Status.ReviewApproval != "approved" {
+	if stored.Status.Phase != servitorv1alpha1.PhaseAwaitingApproval || stored.Status.Operation != nil || stored.Status.ReviewDeadline == nil || !stored.Status.ReviewDeadline.Time.Equal(now.Add(5*time.Minute)) || stored.Status.ReviewGeneration != stored.Generation || stored.Status.ReviewApproval != "approved" {
 		t.Fatalf("report was not adopted with its approval state: %+v", stored.Status)
 	}
 }
 
 func TestAuthReportAdoptionRequiresCompleteFrozenPolicyMetadata(t *testing.T) {
 	now := time.Date(2026, 9, 16, 0, 0, 0, 0, time.UTC)
-	policy := &servitorv1alpha1.FrozenAuthPolicy{AllocationUID: "uid", VPNServerID: "vpn", SecretsManagerID: "secrets", SecretsManagerRegion: "eu-gb", SecretGroupID: "group", CertificateTemplate: "template", Issuer: "issuer", TTL: "2h"}
+	policy := &servitorv1alpha1.FrozenAuthPolicy{VPNServerID: "vpn", SecretsManagerID: "secrets", SecretsManagerRegion: "eu-gb", SecretGroupID: "group", CertificateTemplate: "template", Issuer: "issuer", TTL: "2h"}
 	for _, test := range []struct {
 		name   string
 		status servitorv1alpha1.AuthStatus
@@ -143,11 +177,42 @@ func TestAuthReportAdoptionRequiresCompleteFrozenPolicyMetadata(t *testing.T) {
 		{"VPN within frozen TTL", servitorv1alpha1.AuthStatus{Availability: "available", Mode: "vpn", Expiry: now.Add(time.Hour).Format(time.RFC3339)}, policy, true},
 		{"VPN without policy", servitorv1alpha1.AuthStatus{Availability: "available", Mode: "vpn", Expiry: now.Add(time.Hour).Format(time.RFC3339)}, nil, false},
 		{"VPN beyond frozen TTL", servitorv1alpha1.AuthStatus{Availability: "available", Mode: "vpn", Expiry: now.Add(3 * time.Hour).Format(time.RFC3339)}, policy, false},
+		{"missing unavailable reason", servitorv1alpha1.AuthStatus{Availability: "unavailable"}, nil, false},
 		{"partial unavailable", servitorv1alpha1.AuthStatus{Availability: "unavailable", Mode: "public"}, nil, false},
+		{"known unavailable reason", servitorv1alpha1.AuthStatus{Availability: "unavailable", Reason: "vpn-certificate-chain-verify"}, nil, true},
+		{"unknown unavailable reason", servitorv1alpha1.AuthStatus{Availability: "unavailable", Reason: "vpn-certificate-chain-verify:private-value"}, nil, false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			if got := validAdoptedAuth(test.status, test.policy, now); got != test.valid {
+			options := servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Provider: "vpc-gen2", PrivateOnly: test.status.Mode == "vpn"}, Network: servitorv1alpha1.FrozenNetwork{AuthPolicy: test.policy}}
+			if got := validAdoptedAuth(test.status, options, "uid", now); got != test.valid {
 				t.Fatalf("validAdoptedAuth(%+v) = %t, want %t", test.status, got, test.valid)
+			}
+		})
+	}
+}
+
+func TestAuthReportModeIsBoundToFrozenEndpointPolicy(t *testing.T) {
+	now := time.Date(2026, 9, 16, 0, 0, 0, 0, time.UTC)
+	policy := &servitorv1alpha1.FrozenAuthPolicy{VPNServerID: "vpn", SecretsManagerID: "secrets", SecretsManagerRegion: "eu-gb", SecretGroupID: "group", CertificateTemplate: "template", Issuer: "issuer", TTL: "2h"}
+	for _, test := range []struct {
+		name    string
+		private bool
+		mode    string
+		valid   bool
+	}{
+		{name: "private VPC VPN", private: true, mode: "vpn", valid: true},
+		{name: "private VPC public", private: true, mode: "public"},
+		{name: "public VPC public", mode: "public", valid: true},
+		{name: "public VPC VPN", mode: "vpn"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			options := servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Provider: "vpc-gen2", PrivateOnly: test.private}, Network: servitorv1alpha1.FrozenNetwork{AuthPolicy: policy}}
+			status := servitorv1alpha1.AuthStatus{Availability: "available", Mode: test.mode}
+			if test.mode == "vpn" {
+				status.Expiry = now.Add(time.Hour).Format(time.RFC3339)
+			}
+			if got := validAdoptedAuth(status, options, "uid", now); got != test.valid {
+				t.Fatalf("validAdoptedAuth(%+v) = %t, want %t", status, got, test.valid)
 			}
 		})
 	}
@@ -230,7 +295,7 @@ func TestReconcileFreezesDerivedStartupDefaults(t *testing.T) {
 	client := fake.NewClientBuilder().WithScheme(cleanupScheme(t)).WithStatusSubresource(&servitorv1alpha1.ServitorCluster{}).WithObjects(cluster).Build()
 	reconciler := cleanupReconciler(client, now)
 	reconciler.Config.Defaults = servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{
-		Version: "4.22", Target: "target", Provider: "vpc-gen2", ResourceGroup: "Default",
+		Version: "4.22", Target: "target", Provider: "vpc-gen2",
 	}}
 	reconciler.Config.NetworkBindings = map[string]servitorv1alpha1.FrozenNetwork{"target": {BindingID: "binding", AccountID: "account", VPCID: "default-vpc", SubnetID: "subnet", PublicGatewayID: "gateway", Zone: "us-south-1"}}
 	reconciler.Config.OpenShiftFlavor = "bx2.4x16"
@@ -297,7 +362,7 @@ func TestReconcileApprovedApplyUsesFrozenInputsAndAdoptsReadyReport(t *testing.T
 		Spec:       servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "1.2"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 3600, RetrySeconds: []int64{60}}},
 		Status: servitorv1alpha1.ServitorClusterStatus{
 			Phase:             servitorv1alpha1.PhaseAwaitingApproval,
-			ResolvedOptions:   &servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Provider: "vpc-gen2", Version: "4.22", ResourceGroup: "Default"}, ClusterName: "frozen", Region: "us-south", Network: frozenNetwork()},
+			ResolvedOptions:   &servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Provider: "vpc-gen2", Version: "4.22"}, ResourceGroup: "Default", ClusterName: "frozen", Region: "us-south", Network: frozenNetwork()},
 			LifecycleSnapshot: &servitorv1alpha1.LifecycleSnapshot{InitialLeaseSeconds: 3600, RetrySeconds: []int64{60}},
 			Backend:           &servitorv1alpha1.BackendIdentity{Version: 1, Bucket: "bucket", Key: "frozen.tfstate", Region: "us-south", Endpoint: "https://s3.example.invalid"},
 			ExecutionImage:    "registry.example/ict@sha256:frozen",
@@ -375,7 +440,7 @@ func TestReconcileApprovedApplyUsesFrozenInputsAndAdoptsReadyReport(t *testing.T
 	if err := client.Get(context.Background(), request.NamespacedName, stored); err != nil {
 		t.Fatal(err)
 	}
-	if stored.Status.Phase != servitorv1alpha1.PhaseReady || !stored.Status.Operation.Adopted || stored.Status.Ready == nil || len(stored.Status.Ready.Resources) != 1 {
+	if stored.Status.Phase != servitorv1alpha1.PhaseReady || stored.Status.Operation != nil || stored.Status.Ready == nil || len(stored.Status.Ready.Resources) != 1 {
 		t.Fatalf("apply report was not adopted as ready: %+v", stored.Status)
 	}
 	if stored.Status.LeaseExpiresAt == nil || !stored.Status.LeaseExpiresAt.Time.Equal(now.Add(time.Hour)) {
@@ -956,6 +1021,65 @@ func TestDestroyRetryPersistsDeadlineAndRetainsUnresolvedFinalizer(t *testing.T)
 	}
 	if stored.Status.Phase != servitorv1alpha1.PhaseUnresolved || stored.Status.Cleanup.NextRetryAt != nil || !contains(stored.Finalizers, servitorv1alpha1.CleanupFinalizer) {
 		t.Fatalf("exhausted cleanup did not retain recovery ownership: %+v", stored.Status)
+	}
+}
+
+func TestPlanFailureRetainsSafeExecuteReasonBeforeRunGC(t *testing.T) {
+	now := time.Date(2026, 9, 20, 0, 0, 0, 0, time.UTC)
+	cluster := cleanupCluster(now)
+	cluster.Status.Phase = servitorv1alpha1.PhasePlanning
+	cluster.Status.Operation = &servitorv1alpha1.OperationReference{ID: "plan", Kind: "plan", PipelineRunName: "plan-run", Dispatched: true}
+	run := &tektonv1.PipelineRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "plan-run", Namespace: "ns", Labels: map[string]string{pipeline.ClusterUIDLabel: string(cluster.UID), pipeline.OperationLabel: "plan"}},
+		Status: tektonv1.PipelineRunStatus{
+			Status:                  duckv1.Status{Conditions: duckv1.Conditions{{Type: apis.ConditionSucceeded, Status: corev1.ConditionFalse}}},
+			PipelineRunStatusFields: tektonv1.PipelineRunStatusFields{ChildReferences: []tektonv1.ChildStatusReference{{TypeMeta: runtime.TypeMeta{Kind: "TaskRun"}, Name: "plan-task", PipelineTaskName: "operation"}}},
+		},
+	}
+	task := &tektonv1.TaskRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "plan-task", Namespace: "ns", Labels: map[string]string{pipeline.ClusterUIDLabel: string(cluster.UID)}},
+		Status: tektonv1.TaskRunStatus{
+			Status: duckv1.Status{Conditions: duckv1.Conditions{{Type: apis.ConditionSucceeded, Status: corev1.ConditionFalse}}},
+			TaskRunStatusFields: tektonv1.TaskRunStatusFields{
+				Steps: []tektonv1.StepState{{
+					Name: "execute",
+					ContainerState: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+						Reason: "Error", Message: "provider download failed: api-key=not-retained",
+					}},
+				}},
+			},
+		},
+	}
+	client := fake.NewClientBuilder().WithScheme(cleanupScheme(t)).WithStatusSubresource(&servitorv1alpha1.ServitorCluster{}, &tektonv1.PipelineRun{}, &tektonv1.TaskRun{}).WithObjects(cluster, run, task).Build()
+	reconciler := cleanupReconciler(client, now)
+	request := cleanupRequest()
+	if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	stored := &servitorv1alpha1.ServitorCluster{}
+	if err := client.Get(context.Background(), request.NamespacedName, stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status.Phase != servitorv1alpha1.PhaseCleanupPending || stored.Status.Diagnostic != "PlanExecuteError" || strings.Contains(stored.Status.Diagnostic, "api-key") {
+		t.Fatalf("unsafe planning diagnostic = %q in %+v", stored.Status.Diagnostic, stored.Status)
+	}
+	// Cleanup first releases the completed plan operation, then removes its runs.
+	for range 2 {
+		if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := client.Get(context.Background(), request.NamespacedName, stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status.Phase != servitorv1alpha1.PhaseCleanupComplete || stored.Status.Diagnostic != "PlanExecuteError" {
+		t.Fatalf("planning diagnostic was not retained through run GC: %+v", stored.Status)
+	}
+	if err := client.Get(context.Background(), types.NamespacedName{Namespace: "ns", Name: "plan-run"}, &tektonv1.PipelineRun{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("planning PipelineRun was not removed: %v", err)
+	}
+	if err := client.Get(context.Background(), types.NamespacedName{Namespace: "ns", Name: "plan-task"}, &tektonv1.TaskRun{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("planning TaskRun was not removed: %v", err)
 	}
 }
 

@@ -127,6 +127,8 @@ func (b Bot) Handle(ctx context.Context, envelope Envelope) error {
 			b.cleanup(ctx, message, thread, false)
 		case "auth":
 			b.auth(ctx, message, thread, reply)
+		case "auth retry":
+			b.authRetry(ctx, message, thread, reply)
 		default:
 			if firstToken(message.Text) == "extend" {
 				b.extend(ctx, message, thread, reply)
@@ -272,7 +274,7 @@ func (b Bot) create(ctx context.Context, message Message, text string, respond f
 			return true
 		}
 	} else if len(options.BareValues()) != 0 {
-		respond(rejectedText("Common-option inventory is missing. Use an explicit key such as resource-group=value or retry later."))
+		respond(rejectedText("Common-option inventory is missing. Use an explicit key such as flavor=value or retry later."))
 		return true
 	}
 	userOptions, err := userOptions(options)
@@ -562,6 +564,10 @@ func (b Bot) auth(ctx context.Context, message Message, thread string, respond f
 		respond(text)
 		return
 	}
+	if text := authUnavailableDiagnostic(cluster); text != "" {
+		respond(text)
+		return
+	}
 	if !b.authDeliveryEligible(cluster) {
 		respond("Authentication delivery is unavailable for this allocation.")
 		return
@@ -576,6 +582,10 @@ func (b Bot) auth(ctx context.Context, message Message, thread string, respond f
 			return false, nil
 		}
 		if text := authUnavailableText(current); text != "" {
+			stateText = text
+			return false, nil
+		}
+		if text := authUnavailableDiagnostic(current); text != "" {
 			stateText = text
 			return false, nil
 		}
@@ -615,6 +625,28 @@ func authUnavailableText(cluster *servitorv1alpha1.ServitorCluster) string {
 	default:
 		return ""
 	}
+}
+
+func authUnavailableDiagnostic(cluster *servitorv1alpha1.ServitorCluster) string {
+	status := cluster.Status.Auth
+	if status == nil {
+		status = cluster.Status.PublicAuth
+	}
+	if status == nil || status.Availability != "unavailable" || !servitorv1alpha1.ValidAuthFailureReason(status.Reason) {
+		return ""
+	}
+	diagnostic := "`" + status.Reason + "`"
+	if servitorv1alpha1.ValidAuthCleanupOutcome(status.CleanupOutcome) {
+		diagnostic += " (cleanup outcome: `" + status.CleanupOutcome + "`"
+		if servitorv1alpha1.ValidAuthCleanupReason(status.CleanupReason) {
+			diagnostic += ", reason: `" + status.CleanupReason + "`"
+		}
+		if servitorv1alpha1.ValidAuthCleanupStage(status.CleanupStage) {
+			diagnostic += ", stage: `" + status.CleanupStage + "`"
+		}
+		diagnostic += ")"
+	}
+	return "Authentication delivery is unavailable for this allocation. Diagnostic: " + diagnostic + "."
 }
 
 // authDeliveryEligible uses frozen policy before Ready and the adopted stored
@@ -929,7 +961,7 @@ func splitSlackTimestamp(value string) (string, string, bool) {
 }
 func (b Bot) matchBareOptions(ctx context.Context, options command.ExplicitCreateOptions) (command.ExplicitCreateOptions, error) {
 	if b.Client == nil || b.Namespace == "" || b.InventoryConfigKey == "" {
-		return command.ExplicitCreateOptions{}, fmt.Errorf("common-option inventory is missing; use an explicit key such as resource-group=value or retry later")
+		return command.ExplicitCreateOptions{}, fmt.Errorf("common-option inventory is missing; use an explicit key such as flavor=value or retry later")
 	}
 	configMap := &corev1.ConfigMap{}
 	if err := b.Client.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: b.InventoryConfigMap}, configMap); err != nil {
@@ -955,7 +987,7 @@ func (b Bot) matchBareOptions(ctx context.Context, options command.ExplicitCreat
 		return command.ExplicitCreateOptions{}, fmt.Errorf("configured target inventory is unavailable; use an explicit key or retry later")
 	}
 	if disposition != state.InventorySucceeded {
-		return command.ExplicitCreateOptions{}, fmt.Errorf("common-option inventory is %s; use an explicit key such as resource-group=value or retry later", disposition)
+		return command.ExplicitCreateOptions{}, fmt.Errorf("common-option inventory is %s; use an explicit key such as flavor=value or retry later", disposition)
 	}
 	return command.MatchBareCreateOptions(options, b.Defaults, catalog)
 }
@@ -986,7 +1018,7 @@ func userOptions(options command.ExplicitCreateOptions) (servitorv1alpha1.UserOp
 	if err != nil {
 		return servitorv1alpha1.UserOptions{}, err
 	}
-	return servitorv1alpha1.UserOptions{Target: one("--target"), Provider: one("--provider"), Version: one("--version"), ResourceGroup: one("--resource-group"), Zone: one("--zone"), Flavor: one("--flavor"), Datacenter: one("--datacenter"), MachineType: one("--machine-type"), PublicVLANID: one("--public-vlan-id"), PrivateVLANID: one("--private-vlan-id"), SatelliteZones: append([]string(nil), values["--satellite-zone"]...), SatelliteManagedFrom: one("--satellite-managed-from"), SatelliteLocationID: one("--satellite-location-id"), SatelliteHostImage: one("--satellite-host-image"), SatelliteHostProfile: one("--satellite-host-profile"), SatelliteSSHKeyID: one("--satellite-ssh-key-id"), SatelliteWorkerInstanceIDs: append([]string(nil), values["--satellite-worker-instance-id"]...), SatelliteWorkerOperatingSystem: one("--satellite-worker-operating-system"), WorkerCount: workerCount}, nil
+	return servitorv1alpha1.UserOptions{Target: one("--target"), Provider: one("--provider"), Version: one("--version"), PrivateOnly: options.PrivateOnly(), Zone: one("--zone"), Flavor: one("--flavor"), Datacenter: one("--datacenter"), MachineType: one("--machine-type"), PublicVLANID: one("--public-vlan-id"), PrivateVLANID: one("--private-vlan-id"), SatelliteZones: append([]string(nil), values["--satellite-zone"]...), SatelliteManagedFrom: one("--satellite-managed-from"), SatelliteLocationID: one("--satellite-location-id"), SatelliteHostImage: one("--satellite-host-image"), SatelliteHostProfile: one("--satellite-host-profile"), SatelliteSSHKeyID: one("--satellite-ssh-key-id"), SatelliteWorkerInstanceIDs: append([]string(nil), values["--satellite-worker-instance-id"]...), SatelliteWorkerOperatingSystem: one("--satellite-worker-operating-system"), WorkerCount: workerCount}, nil
 }
 func seconds(values []time.Duration) []int64 {
 	result := make([]int64, len(values))
@@ -1157,7 +1189,7 @@ func helpOverview(maintainer bool, maxAllocationsPerUser int) []string {
 }
 func createHelp(defaults command.CreateDefaults, maxAllocationsPerUser int) []string {
 	intro := fmt.Sprintf("`create` starts planning from the configured channel root, up to %d active allocations per user. Repeating create in the same thread preserves that allocation. Configured defaults: version %s, target %s, provider %s.", maxAllocationsPerUser, safeHelpCell(defaults.Version), safeHelpCell(defaults.Target), safeHelpCell(defaults.Provider))
-	return []string{intro + " `provider=value` chooses VPC Gen 2 or Classic infrastructure; Satellite provisioning is not supported for new allocations. Version chooses Kubernetes or OpenShift. Cluster names are generated internally.\n\nSpecify provisioning options as `key=value`. A current common-option inventory also recognizes unique bare values, for example `create target=synthetic-target vpc-gen2 us-south-1 bx2.4x16 resource-group=\"Platform Team\"`. The environment target synonyms `prestage`/`pretest` and `test`/`stage` are interchangeable; `dev` selects the configured dev target. `auth`, `auth=true`, and `auth=false` control eligible authentication-bundle delivery; the default is no delivery. `approve`, `approve=true`, and `approve=false` control create-time automatic approval; the default remains manual. Automatic approval follows successful plan-summary delivery before the persisted deadline. `yes` cannot bypass that delivery; `no` and `done` retain their existing behavior. An eligible `auth` opt-in queues one owner-DM delivery after Ready. A VPN bundle includes both stored files and reports its certificate expiry; extending the lease does not renew it. Unknown or colliding shorthand must use a key such as `flavor=value`; worker counts stay keyed. Use `roks` (also `openshift` or `default_openshift`) for the cloud default OpenShift stream, or `iks` (also `kubernetes`, `k8s`, or `default_kubernetes`) for Kubernetes. A compatible numeric stream can refine an alias: `create roks 4.17`. These reserved aliases require a key when used as resource names.\n\nReview the resolved stream and configuration in its thread. The review prompt shows the persisted approval deadline; reply with exact `yes` or `no` before that deadline.", "Safe create options\n```\nCommon\n  target= provider= version= resource-group= worker-count=\n  auth | auth=true | auth=false (eligible bundle delivery)\n  approve | approve=true | approve=false (automatic after plan-summary delivery)\n\nVPC Gen 2\n  zone= flavor=\n\nClassic\n  datacenter= machine-type= public-vlan-id= private-vlan-id=\n```"}
+	return []string{intro + " `provider=value` chooses VPC Gen 2 or Classic infrastructure; Satellite provisioning is not supported for new allocations. Version chooses Kubernetes or OpenShift. Cluster names are generated internally.\n\nSpecify provisioning options as `key=value`. A current common-option inventory also recognizes unique bare values, for example `create target=synthetic-target vpc-gen2 us-south-1 bx2.4x16`. The configured resource group is always used; resource-group is not a request option. `private-only`, `private-only=true`, and `private-only=false` control whether VPC Gen 2 omits the public endpoint; the default is false. The environment target synonyms `prestage`/`pretest` and `test`/`stage` are interchangeable; `dev` selects the configured dev target. `auth`, `auth=true`, and `auth=false` control eligible authentication-bundle delivery; the default is no delivery. `approve`, `approve=true`, and `approve=false` control create-time automatic approval; the default remains manual. Automatic approval follows successful plan-summary delivery before the persisted deadline. `yes` cannot bypass that delivery; `no` and `done` retain their existing behavior. An eligible `auth` opt-in queues one owner-DM delivery after Ready. A VPN bundle includes both stored files and reports its certificate expiry; extending the lease does not renew it. Unknown or colliding shorthand must use a key such as `flavor=value`; worker counts stay keyed. Use `roks` (also `openshift` or `default_openshift`) for the cloud default OpenShift stream, or `iks` (also `kubernetes`, `k8s`, or `default_kubernetes`) for Kubernetes. A compatible numeric stream can refine an alias: `create roks 4.17`. These reserved aliases require a key when used as resource names.\n\nReview the resolved stream and configuration in its thread. The review prompt shows the persisted approval deadline; reply with exact `yes` or `no` before that deadline.", "Safe create options\n```\nCommon\n  target= provider= version= worker-count=\n  private-only | private-only=true | private-only=false (VPC Gen 2 only)\n  auth | auth=true | auth=false (eligible bundle delivery)\n  approve | approve=true | approve=false (automatic after plan-summary delivery)\n\nVPC Gen 2\n  zone= flavor=\n\nClassic\n  datacenter= machine-type= public-vlan-id= private-vlan-id=\n```"}
 }
 func safeHelpCell(value string) string {
 	value = strings.Map(func(character rune) rune {

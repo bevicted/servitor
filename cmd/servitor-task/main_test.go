@@ -1,8 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -20,15 +24,21 @@ import (
 	"github.com/bevicted/servitor/internal/slackbot"
 	"github.com/bevicted/servitor/internal/state"
 	"github.com/bevicted/servitor/internal/terraformview"
+	tektonv1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"knative.dev/pkg/apis"
+	duckv1 "knative.dev/pkg/apis/duck/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
 func frozenVPCOptions(options servitorv1alpha1.ResolvedOptions) servitorv1alpha1.ResolvedOptions {
+	if options.ResourceGroup == "" {
+		options.ResourceGroup = "Default"
+	}
 	options.Zone = "us-south-1"
 	options.Network = servitorv1alpha1.FrozenNetwork{BindingID: "existing", AccountID: "account", VPCRegion: "us-south", VPCID: "vpc", SubnetID: "subnet", PublicGatewayID: "gateway", Zone: "us-south-1"}
 	return options
@@ -47,7 +57,7 @@ func frozenVPCValues(values servitorv1alpha1.RecoveryValues) servitorv1alpha1.Re
 func TestValidateRecoveredNetworkRejectsFrozenFieldOmissionsAndSubstitutions(t *testing.T) {
 	options := frozenVPCOptions(servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Provider: "vpc-gen2"}})
 	options.Network.AuthPolicy = &servitorv1alpha1.FrozenAuthPolicy{
-		AllocationUID: "allocation", VPNServerID: "vpn", SecretsManagerID: "secrets", SecretsManagerRegion: "eu-gb", SecretGroupID: "group", CertificateTemplate: "template", Issuer: "issuer", TTL: "2h",
+		VPNServerID: "vpn", SecretsManagerID: "secrets", SecretsManagerRegion: "eu-gb", SecretGroupID: "group", CertificateTemplate: "template", Issuer: "issuer", TTL: "2h",
 	}
 	values := frozenVPCValues(servitorv1alpha1.RecoveryValues{})
 	policy := *options.Network.AuthPolicy
@@ -75,7 +85,6 @@ func TestValidateRecoveredNetworkRejectsFrozenFieldOmissionsAndSubstitutions(t *
 		{"zone", func(v *servitorv1alpha1.RecoveryValues) { v.Zone = "us-south-2" }, func(v *servitorv1alpha1.RecoveryValues) { v.Zone = "" }},
 		{"subnet", func(v *servitorv1alpha1.RecoveryValues) { v.SubnetIDs[0] = "other-subnet" }, func(v *servitorv1alpha1.RecoveryValues) { v.SubnetIDs = nil }},
 		{"public gateway", func(v *servitorv1alpha1.RecoveryValues) { v.PublicGatewayIDs[0] = "other-gateway" }, func(v *servitorv1alpha1.RecoveryValues) { v.PublicGatewayIDs = nil }},
-		{"allocation UID", func(v *servitorv1alpha1.RecoveryValues) { v.AuthPolicy.AllocationUID = "other-allocation" }, func(v *servitorv1alpha1.RecoveryValues) { v.AuthPolicy.AllocationUID = "" }},
 		{"VPN server", func(v *servitorv1alpha1.RecoveryValues) { v.AuthPolicy.VPNServerID = "other-vpn" }, func(v *servitorv1alpha1.RecoveryValues) { v.AuthPolicy.VPNServerID = "" }},
 		{"Secrets Manager ID", func(v *servitorv1alpha1.RecoveryValues) { v.AuthPolicy.SecretsManagerID = "other-secrets" }, func(v *servitorv1alpha1.RecoveryValues) { v.AuthPolicy.SecretsManagerID = "" }},
 		{"Secrets Manager region", func(v *servitorv1alpha1.RecoveryValues) { v.AuthPolicy.SecretsManagerRegion = "us-south" }, func(v *servitorv1alpha1.RecoveryValues) { v.AuthPolicy.SecretsManagerRegion = "" }},
@@ -111,7 +120,7 @@ func planningValidationFixture(t *testing.T, directory string) (string, string) 
 		case "/iam/identity/userinfo":
 			_, _ = w.Write([]byte(`{"account_id":"account-1"}`))
 		case "/rm/v2/resource_groups":
-			_, _ = w.Write([]byte(`{"resources":[{"name":"New Group","state":"ACTIVE"}]}`))
+			_, _ = w.Write([]byte(`{"resources":[{"name":"Default","state":"ACTIVE"}]}`))
 		case "/containers/v1/versions":
 			_, _ = w.Write([]byte(`{"openshift":[{"major":4,"minor":22,"default":true}],"kubernetes":[{"major":1,"minor":31,"default":true}]}`))
 		case "/containers/v2/vpc/getZones":
@@ -144,6 +153,60 @@ targets:
 		t.Fatal(err)
 	}
 	return configPath, "synthetic-key"
+}
+
+func TestFrozenRecoveryEndpointsPreserveConfiguredCanonicalValues(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	config := `version: 1
+targets:
+  target:
+    providers: [vpc-gen2, satellite]
+    default_region: us-south
+    endpoints:
+      iam: https://iam.example.invalid/identity
+      container_service: https://containers.example.invalid/global
+      global_tagging: https://tagging.example.invalid
+      resource_management: https://management.example.invalid/v2
+      resource_controller: https://controller.example.invalid
+      vpc: https://vpc.{region}.example.invalid/v1
+      satellite: https://satellite.example.invalid
+      satellite_config: https://satellite-config.example.invalid
+`
+	if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	vpc, err := frozenRecoveryEndpoints(configPath, frozenVPCOptions(servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Target: "target", Provider: "vpc-gen2"}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantVPC := map[string]string{
+		"IAM": "https://iam.example.invalid/identity", "ContainerService": "https://containers.example.invalid/global", "GlobalTagging": "https://tagging.example.invalid", "ResourceManagement": "https://management.example.invalid/v2", "ResourceController": "https://controller.example.invalid", "VPC": "https://vpc.us-south.example.invalid/v1",
+	}
+	if !reflect.DeepEqual(vpc, wantVPC) {
+		t.Fatalf("VPC endpoints = %#v, want %#v", vpc, wantVPC)
+	}
+	satellite, err := frozenRecoveryEndpoints(configPath, servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Target: "target", Provider: "satellite"}, Region: "us-south"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantSatellite := map[string]string{"IAM": wantVPC["IAM"], "ContainerService": wantVPC["ContainerService"], "GlobalTagging": wantVPC["GlobalTagging"], "ResourceManagement": wantVPC["ResourceManagement"], "ResourceController": wantVPC["ResourceController"], "VPC": wantVPC["VPC"], "Satellite": "https://satellite.example.invalid", "SatelliteConfig": "https://satellite-config.example.invalid"}
+	if !reflect.DeepEqual(satellite, wantSatellite) {
+		t.Fatalf("Satellite endpoints = %#v, want %#v", satellite, wantSatellite)
+	}
+	for name, test := range map[string]struct {
+		target    string
+		endpoints map[string]string
+	}{
+		"different VPC path": {"target", map[string]string{"IAM": wantVPC["IAM"], "ContainerService": wantVPC["ContainerService"], "GlobalTagging": wantVPC["GlobalTagging"], "ResourceManagement": wantVPC["ResourceManagement"], "ResourceController": wantVPC["ResourceController"], "VPC": "https://vpc.us-south.example.invalid"}},
+		"trailing slash":     {"target", map[string]string{"IAM": wantVPC["IAM"], "ContainerService": wantVPC["ContainerService"], "GlobalTagging": wantVPC["GlobalTagging"], "ResourceManagement": wantVPC["ResourceManagement"], "ResourceController": wantVPC["ResourceController"], "VPC": "https://vpc.us-south.example.invalid/v1/"}},
+		"different target":   {"other", wantVPC},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := validateFrozenRecoveryEndpoints("target", wantVPC, test.target, test.endpoints); err == nil {
+				t.Fatal("accepted a recovery endpoint or target substitution")
+			}
+		})
+	}
 }
 
 type planningSlackResponder struct{}
@@ -222,7 +285,7 @@ func TestKeyedCreateWithoutCatalogReachesFreshPlanningPreflight(t *testing.T) {
 		t.Fatal(err)
 	}
 	kube := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&servitorv1alpha1.ServitorCluster{}).WithObjects(&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "targets", Namespace: "servitor"}, Data: map[string]string{"config.yaml": string(configData)}}).Build()
-	defaults := frozenVPCOptions(servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Target: "target", Provider: "vpc-gen2", Version: "4.22", ResourceGroup: "Default"}, Platform: "openshift"})
+	defaults := frozenVPCOptions(servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Target: "target", Provider: "vpc-gen2", Version: "4.22"}, Platform: "openshift"})
 	bot := slackbot.Bot{ChannelID: "C1", SelfUserID: "BOT", Namespace: "servitor", Client: kube, Events: state.NewEventStore(kube, "servitor"), Defaults: command.CreateDefaults{Target: "target", Provider: "vpc-gen2", Version: "4.22"}, InventoryConfigMap: "targets", InventoryConfigKey: "config.yaml", InventoryMaximumAge: time.Hour, Lease: time.Hour, RetryIntervals: []time.Duration{time.Minute}, Responder: planningSlackResponder{}}
 
 	if err := bot.Handle(context.Background(), slackbot.Envelope{ID: "bare", Message: slackbot.Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "<@BOT> create New\\ Group", Timestamp: "1"}}); err != nil {
@@ -233,11 +296,17 @@ func TestKeyedCreateWithoutCatalogReachesFreshPlanningPreflight(t *testing.T) {
 		t.Fatalf("bare create clusters=%+v, err=%v", clusters.Items, err)
 	}
 
-	if err := bot.Handle(context.Background(), slackbot.Envelope{ID: "keyed", Message: slackbot.Message{Channel: "C1", ChannelType: "channel", User: "U2", Text: "<@BOT> create resource-group=New\\ Group", Timestamp: "2"}}); err != nil {
+	if err := bot.Handle(context.Background(), slackbot.Envelope{ID: "resource-group", Message: slackbot.Message{Channel: "C1", ChannelType: "channel", User: "U2", Text: "<@BOT> create resource-group=New\\ Group", Timestamp: "2"}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := kube.List(context.Background(), clusters); err != nil || len(clusters.Items) != 1 || clusters.Items[0].Spec.UserOptions.ResourceGroup != "New Group" {
-		t.Fatalf("keyed create clusters=%+v, err=%v", clusters.Items, err)
+	if err := kube.List(context.Background(), clusters); err != nil || len(clusters.Items) != 0 {
+		t.Fatalf("resource-group request was accepted: clusters=%+v, err=%v", clusters.Items, err)
+	}
+	if err := bot.Handle(context.Background(), slackbot.Envelope{ID: "valid", Message: slackbot.Message{Channel: "C1", ChannelType: "channel", User: "U2", Text: "<@BOT> create flavor=bx2.4x16", Timestamp: "3"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := kube.List(context.Background(), clusters); err != nil || len(clusters.Items) != 1 {
+		t.Fatalf("valid request clusters=%+v, err=%v", clusters.Items, err)
 	}
 
 	reconciler := &controller.Reconciler{Client: kube, Scheme: scheme, Config: controller.Config{Namespace: "servitor", Defaults: defaults, OpenShiftFlavor: "bx2.4x16", NetworkBindings: map[string]servitorv1alpha1.FrozenNetwork{"target": defaults.Network}}}
@@ -250,16 +319,15 @@ func TestKeyedCreateWithoutCatalogReachesFreshPlanningPreflight(t *testing.T) {
 	if err := kube.Get(context.Background(), request.NamespacedName, &clusters.Items[0]); err != nil {
 		t.Fatal(err)
 	}
-	if clusters.Items[0].Status.ResolvedOptions == nil || clusters.Items[0].Status.ResolvedOptions.ResourceGroup != "New Group" {
+	if clusters.Items[0].Status.ResolvedOptions == nil || clusters.Items[0].Status.ResolvedOptions.ResourceGroup != "Default" {
 		t.Fatalf("controller resolved options=%+v", clusters.Items[0].Status.ResolvedOptions)
 	}
 
 	ictTrace := filepath.Join(directory, "ict.trace")
 	ict := filepath.Join(directory, "ict")
-	if err := os.WriteFile(ict, []byte("#!/bin/sh\nprintf invoked > \"$ICT_TRACE_FILE\"\nexit 1\n"), 0o700); err != nil {
+	if err := os.WriteFile(ict, []byte(fmt.Sprintf("#!/bin/sh\nprintf invoked > %q\nexit 1\n", ictTrace)), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("ICT_TRACE_FILE", ictTrace)
 	err = runPlan(context.Background(), "uid", "plan-keyed", *clusters.Items[0].Status.ResolvedOptions, filepath.Join(directory, "backend.json"), filepath.Join(directory, "result.json"), filepath.Join(directory, "report.json"), ict, filepath.Join(directory, "terraform"), planningConfig, apiKey)
 	if err == nil {
 		t.Fatal("runPlan unexpectedly succeeded with a failing synthetic ICT")
@@ -270,6 +338,8 @@ func TestKeyedCreateWithoutCatalogReachesFreshPlanningPreflight(t *testing.T) {
 }
 
 func TestRunPlanUsesInitializedWorkspaceAndSanitizesOversizedPlan(t *testing.T) {
+	const terraformSentinel = "connected-plan-review"
+	t.Setenv("SERVITOR_TERRAFORM_SENTINEL", terraformSentinel)
 	directory := t.TempDir()
 	workspace := filepath.Join(directory, "workspace")
 	if err := os.MkdirAll(filepath.Join(workspace, ".cluster"), 0o700); err != nil {
@@ -283,7 +353,7 @@ func TestRunPlanUsesInitializedWorkspaceAndSanitizesOversizedPlan(t *testing.T) 
 	recovery := servitorv1alpha1.RecoveryMetadata{
 		Version: 1, Target: "target", TFVarsSHA256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
 		Endpoints: map[string]string{
-			"IAM": "https://iam.example.invalid", "ContainerService": "https://containers.example.invalid", "GlobalTagging": "https://tagging.example.invalid", "ResourceManagement": "https://management.example.invalid", "ResourceController": "https://controller.example.invalid", "VPC": "https://vpc.example.invalid",
+			"IAM": "https://iam.example.invalid", "ContainerService": "https://containers.example.invalid", "GlobalTagging": "https://tagging.example.invalid", "ResourceManagement": "https://management.example.invalid", "ResourceController": "https://controller.example.invalid", "VPC": "https://vpc.us-south.example.invalid",
 		},
 		Values: frozenVPCValues(servitorv1alpha1.RecoveryValues{ClusterName: "cluster", ResourceGroupName: "Default", Region: "us-south", ClusterMode: "vpc", Platform: "openshift", KubeVersion: "4.22_openshift", WorkerCount: 2, Flavor: "bx2.4x16"}),
 	}
@@ -303,21 +373,27 @@ func TestRunPlanUsesInitializedWorkspaceAndSanitizesOversizedPlan(t *testing.T) 
 	if err := os.WriteFile(planShowFile, planShow, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("PLAN_RESULT", planResultFile)
-	t.Setenv("PLAN_SHOW", planShowFile)
-	t.Setenv("TRACE_FILE", filepath.Join(directory, "terraform.args"))
-	t.Setenv("ICT_TRACE_FILE", filepath.Join(directory, "ict.args"))
-	t.Setenv("WORKSPACE", workspace)
 	ict := filepath.Join(directory, "ict")
-	if err := os.WriteFile(ict, []byte("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$ICT_TRACE_FILE\"\n[ \"$1\" = plan ] && [ \"$2\" = plan-a ] || exit 2\ncp \"$PLAN_RESULT\" \"$6\"\n"), 0o700); err != nil {
+	ictScript := fmt.Sprintf("#!/bin/sh\nprintf '%%s\\n' \"$@\" > %q\n[ \"$1\" = plan ] && [ \"$2\" = plan-a ] || exit 2\ncp %q \"$6\"\n", filepath.Join(directory, "ict.args"), planResultFile)
+	if err := os.WriteFile(ict, []byte(ictScript), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	terraform := filepath.Join(directory, "terraform")
-	if err := os.WriteFile(terraform, []byte("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$TRACE_FILE\"\n[ \"$1\" = \"-chdir=$WORKSPACE\" ] && [ \"$2\" = show ] && [ \"$3\" = -json ] && [ \"$4\" = .cluster/create.tfplan ] || exit 3\ncat \"$PLAN_SHOW\"\n"), 0o700); err != nil {
+	terraformScript := fmt.Sprintf("#!/bin/sh\n[ \"$SERVITOR_TERRAFORM_SENTINEL\" = %q ] || exit 4\nprintf '%%s\\n' \"$@\" > %q\n[ \"$1\" = %q ] && [ \"$2\" = show ] && [ \"$3\" = -json ] && [ \"$4\" = .cluster/create.tfplan ] || exit 3\ncat %q\n", terraformSentinel, filepath.Join(directory, "terraform.args"), "-chdir="+workspace, planShowFile)
+	if err := os.WriteFile(terraform, []byte(terraformScript), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	planningConfig, apiKey := planningValidationFixture(t, directory)
-	options := frozenVPCOptions(servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Target: "target", Provider: "vpc-gen2", Version: "default_openshift", ResourceGroup: "New Group"}, Platform: "openshift"})
+	options := frozenVPCOptions(servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Target: "target", Provider: "vpc-gen2", Version: "default_openshift"}, Platform: "openshift"})
+	endpoints, err := frozenRecoveryEndpoints(planningConfig, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovery.Endpoints = endpoints
+	result.Recovery.Endpoints = recovery.Endpoints
+	if err := writeJSON(planResultFile, result); err != nil {
+		t.Fatal(err)
+	}
 	if err := runPlan(context.Background(), "uid", "plan-a", options, backendFile, resultFile, reportFile, ict, terraform, planningConfig, apiKey); err != nil {
 		t.Fatal(err)
 	}
@@ -396,14 +472,12 @@ func TestRunPlanRejectsInconsistentRecoveryValues(t *testing.T) {
 			if err := os.WriteFile(planShowFile, []byte(`{"format_version":"1.2","resource_changes":[]}`), 0o600); err != nil {
 				t.Fatal(err)
 			}
-			t.Setenv("PLAN_RESULT", planResultFile)
-			t.Setenv("PLAN_SHOW", planShowFile)
 			ict := filepath.Join(directory, "ict")
-			if err := os.WriteFile(ict, []byte("#!/bin/sh\ncp \"$PLAN_RESULT\" \"$6\"\n"), 0o700); err != nil {
+			if err := os.WriteFile(ict, []byte(fmt.Sprintf("#!/bin/sh\ncp %q \"$6\"\n", planResultFile)), 0o700); err != nil {
 				t.Fatal(err)
 			}
 			terraform := filepath.Join(directory, "terraform")
-			if err := os.WriteFile(terraform, []byte("#!/bin/sh\ncat \"$PLAN_SHOW\"\n"), 0o700); err != nil {
+			if err := os.WriteFile(terraform, []byte("#!/bin/sh\ncat "+planShowFile+"\n"), 0o700); err != nil {
 				t.Fatal(err)
 			}
 			reportFile := filepath.Join(directory, "report.json")
@@ -538,21 +612,21 @@ func TestResolvedOptionsFromValuesAdoptsAllProviderValues(t *testing.T) {
 	}{
 		{
 			name:     "vpc",
-			values:   servitorv1alpha1.RecoveryValues{ClusterName: "vpc-cluster", ResourceGroupName: "group", Region: "us-south", ClusterMode: "vpc", Platform: "openshift", KubeVersion: "4.22_openshift", WorkerCount: 2, Zone: "us-south-1", Flavor: "bx2.4x16", VPCID: "vpc", SubnetIDs: []string{"subnet"}, PublicGatewayIDs: []string{"gateway"}},
+			values:   servitorv1alpha1.RecoveryValues{ClusterName: "vpc-cluster", ResourceGroupName: "Default", Region: "us-south", ClusterMode: "vpc", Platform: "openshift", KubeVersion: "4.22_openshift", WorkerCount: 2, Zone: "us-south-1", Flavor: "bx2.4x16", VPCID: "vpc", SubnetIDs: []string{"subnet"}, PublicGatewayIDs: []string{"gateway"}},
 			platform: "openshift",
-			want:     servitorv1alpha1.UserOptions{Target: "target", Provider: "vpc-gen2", Version: "4.22_openshift", ResourceGroup: "group", WorkerCount: 2, Zone: "us-south-1", Flavor: "bx2.4x16"},
+			want:     servitorv1alpha1.UserOptions{Target: "target", Provider: "vpc-gen2", Version: "4.22_openshift", WorkerCount: 2, Zone: "us-south-1", Flavor: "bx2.4x16"},
 		},
 		{
 			name:     "classic",
-			values:   servitorv1alpha1.RecoveryValues{ClusterName: "classic-cluster", ResourceGroupName: "group", Region: "us-south", ClusterMode: "classic", Platform: "kubernetes", KubeVersion: "1.31", WorkerCount: 3, Datacenter: "dal10", MachineType: "bx2.4x16", PublicVLANID: "123", PrivateVLANID: "456"},
+			values:   servitorv1alpha1.RecoveryValues{ClusterName: "classic-cluster", ResourceGroupName: "Default", Region: "us-south", ClusterMode: "classic", Platform: "kubernetes", KubeVersion: "1.31", WorkerCount: 3, Datacenter: "dal10", MachineType: "bx2.4x16", PublicVLANID: "123", PrivateVLANID: "456"},
 			platform: "kubernetes",
-			want:     servitorv1alpha1.UserOptions{Target: "target", Provider: "classic", Version: "1.31", ResourceGroup: "group", WorkerCount: 3, Datacenter: "dal10", MachineType: "bx2.4x16", PublicVLANID: "123", PrivateVLANID: "456"},
+			want:     servitorv1alpha1.UserOptions{Target: "target", Provider: "classic", Version: "1.31", WorkerCount: 3, Datacenter: "dal10", MachineType: "bx2.4x16", PublicVLANID: "123", PrivateVLANID: "456"},
 		},
 		{
 			name:     "satellite",
-			values:   servitorv1alpha1.RecoveryValues{ClusterName: "satellite-cluster", ResourceGroupName: "group", Region: "us-south", ClusterMode: "satellite", Platform: "openshift", KubeVersion: "4.22_openshift", WorkerCount: 3, VPCID: "vpc", SubnetIDs: []string{"subnet-a", "subnet-b", "subnet-c"}, PublicGatewayIDs: []string{"gateway-a", "gateway-b", "gateway-c"}, SatelliteZones: []string{"us-south-1", "us-south-2", "us-south-3"}, SatelliteManagedFrom: "us-south", SatelliteLocationID: "location", SatelliteHostImage: "image", SatelliteHostProfile: "bx2-4x16", SatelliteSSHKeyID: "key", SatelliteWorkerInstanceIDs: []string{"worker-a", "worker-b", "worker-c"}, SatelliteWorkerOperatingSystem: "RHCOS"},
+			values:   servitorv1alpha1.RecoveryValues{ClusterName: "satellite-cluster", ResourceGroupName: "Default", Region: "us-south", ClusterMode: "satellite", Platform: "openshift", KubeVersion: "4.22_openshift", WorkerCount: 3, VPCID: "vpc", SubnetIDs: []string{"subnet-a", "subnet-b", "subnet-c"}, PublicGatewayIDs: []string{"gateway-a", "gateway-b", "gateway-c"}, SatelliteZones: []string{"us-south-1", "us-south-2", "us-south-3"}, SatelliteManagedFrom: "us-south", SatelliteLocationID: "location", SatelliteHostImage: "image", SatelliteHostProfile: "bx2-4x16", SatelliteSSHKeyID: "key", SatelliteWorkerInstanceIDs: []string{"worker-a", "worker-b", "worker-c"}, SatelliteWorkerOperatingSystem: "RHCOS"},
 			platform: "openshift",
-			want:     servitorv1alpha1.UserOptions{Target: "target", Provider: "satellite", Version: "4.22_openshift", ResourceGroup: "group", WorkerCount: 3, SatelliteZones: []string{"us-south-1", "us-south-2", "us-south-3"}, SatelliteManagedFrom: "us-south", SatelliteLocationID: "location", SatelliteHostImage: "image", SatelliteHostProfile: "bx2-4x16", SatelliteSSHKeyID: "key", SatelliteWorkerInstanceIDs: []string{"worker-a", "worker-b", "worker-c"}, SatelliteWorkerOperatingSystem: "RHCOS"},
+			want:     servitorv1alpha1.UserOptions{Target: "target", Provider: "satellite", Version: "4.22_openshift", WorkerCount: 3, SatelliteZones: []string{"us-south-1", "us-south-2", "us-south-3"}, SatelliteManagedFrom: "us-south", SatelliteLocationID: "location", SatelliteHostImage: "image", SatelliteHostProfile: "bx2-4x16", SatelliteSSHKeyID: "key", SatelliteWorkerInstanceIDs: []string{"worker-a", "worker-b", "worker-c"}, SatelliteWorkerOperatingSystem: "RHCOS"},
 		},
 	}
 	for _, test := range tests {
@@ -590,7 +664,7 @@ func TestRunPlanPassesKubernetesPlatformToICT(t *testing.T) {
 	recovery := servitorv1alpha1.RecoveryMetadata{
 		Version: 1, Target: "target", TFVarsSHA256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
 		Endpoints: map[string]string{
-			"IAM": "https://iam.example.invalid", "ContainerService": "https://containers.example.invalid", "GlobalTagging": "https://tagging.example.invalid", "ResourceManagement": "https://management.example.invalid", "ResourceController": "https://controller.example.invalid", "VPC": "https://vpc.example.invalid",
+			"IAM": "https://iam.example.invalid", "ContainerService": "https://containers.example.invalid", "GlobalTagging": "https://tagging.example.invalid", "ResourceManagement": "https://management.example.invalid", "ResourceController": "https://controller.example.invalid", "VPC": "https://vpc.us-south.example.invalid",
 		},
 		Values: values,
 	}
@@ -606,19 +680,26 @@ func TestRunPlanPassesKubernetesPlatformToICT(t *testing.T) {
 	if err := os.WriteFile(planShowFile, []byte(`{"format_version":"1.2","resource_changes":[]}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("PLAN_RESULT", planResultFile)
-	t.Setenv("PLAN_SHOW", planShowFile)
-	t.Setenv("ICT_TRACE_FILE", filepath.Join(directory, "ict.args"))
 	ict := filepath.Join(directory, "ict")
-	if err := os.WriteFile(ict, []byte("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$ICT_TRACE_FILE\"\ncp \"$PLAN_RESULT\" \"$6\"\n"), 0o700); err != nil {
+	ictScript := fmt.Sprintf("#!/bin/sh\nprintf '%%s\\n' \"$@\" > %q\ncp %q \"$6\"\n", filepath.Join(directory, "ict.args"), planResultFile)
+	if err := os.WriteFile(ict, []byte(ictScript), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	terraform := filepath.Join(directory, "terraform")
-	if err := os.WriteFile(terraform, []byte("#!/bin/sh\ncat \"$PLAN_SHOW\"\n"), 0o700); err != nil {
+	if err := os.WriteFile(terraform, []byte("#!/bin/sh\ncat "+planShowFile+"\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	planningConfig, apiKey := planningValidationFixture(t, directory)
 	options := frozenVPCOptions(servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Target: "target", Provider: "vpc-gen2", Version: "1.31"}, Platform: "kubernetes"})
+	endpoints, err := frozenRecoveryEndpoints(planningConfig, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovery.Endpoints = endpoints
+	result.Recovery.Endpoints = recovery.Endpoints
+	if err := writeJSON(planResultFile, result); err != nil {
+		t.Fatal(err)
+	}
 	if err := runPlan(context.Background(), "uid", "plan-kubernetes", options, filepath.Join(directory, "backend.json"), resultFile, filepath.Join(directory, "report.json"), ict, terraform, planningConfig, apiKey); err != nil {
 		t.Fatal(err)
 	}
@@ -641,6 +722,349 @@ func TestRunPlanRejectsManagedSharedNetwork(t *testing.T) {
 	if err := rejectManagedNetworkPlan(plan); err == nil {
 		t.Fatal("managed shared subnet was accepted")
 	}
+}
+
+func TestRunApplyOmitsPendingAuthAndPublishesOnlyTerminalManifestResult(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		manifest   authManifest
+		wantReason string
+		valid      bool
+	}{
+		{name: "terminal unavailable stable reason", manifest: authManifest{Version: 1, Availability: "unavailable", Reason: "vpn-certificate-chain-verify"}, wantReason: "vpn-certificate-chain-verify", valid: true},
+		{name: "blank unavailable reason", manifest: authManifest{Version: 1, Availability: "unavailable"}, wantReason: "auth-manifest-invalid", valid: true},
+		{name: "unsafe unavailable reason", manifest: authManifest{Version: 1, Availability: "unavailable", Reason: "vpn-certificate-chain-verify:private-value"}, wantReason: "auth-manifest-invalid", valid: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			directory := t.TempDir()
+			outputDir := filepath.Join(directory, "auth")
+			if err := os.Mkdir(outputDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			manifestPath := filepath.Join(outputDir, "manifest.json")
+			manifest, err := json.Marshal(test.manifest)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(manifestPath, manifest, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			reportPath := runAuthApplyFixture(t, directory, manifestPath, outputDir)
+			baseData := mustRead(t, reportPath)
+			base, err := pipeline.DecodeReport(baseData, "uid", "apply-a")
+			if err != nil || base.Auth != nil {
+				t.Fatalf("apply serialized pending auth result: %#v, %v", base.Auth, err)
+			}
+
+			err = publishPublicAuth(true, base.ResolvedOptions, "auth", "uid", "apply-a", manifestPath, outputDir, reportPath, "ns", filepath.Join(directory, "token"), filepath.Join(directory, "ca.crt"), "/bin/false", filepath.Join(directory, "auth-context.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			reportData := mustRead(t, reportPath)
+			report, err := pipeline.DecodeReport(reportData, "uid", "apply-a")
+			if err != nil || report.Auth == nil || report.Auth.Availability != "unavailable" || report.Auth.Reason != test.wantReason {
+				t.Fatalf("terminal auth report = %#v, %v", report.Auth, err)
+			}
+			adopted := adoptAuthReport(t, reportData, base.ResolvedOptions, base.Recovery)
+			if adopted.Status.Phase != servitorv1alpha1.PhaseReady || !reflect.DeepEqual(adopted.Status.Auth, report.Auth) {
+				t.Fatalf("TaskRun result was not adopted: %+v", adopted.Status)
+			}
+		})
+	}
+}
+
+type authReportLogs struct{ data []byte }
+
+func (l authReportLogs) ReadContainerLog(context.Context, string, string, string) (io.ReadCloser, error) {
+	return io.NopCloser(bytes.NewReader(l.data)), nil
+}
+
+func adoptAuthReport(t *testing.T, report []byte, options servitorv1alpha1.ResolvedOptions, recovery servitorv1alpha1.RecoveryMetadata) *servitorv1alpha1.ServitorCluster {
+	t.Helper()
+	scheme, err := controller.NewScheme()
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 9, 20, 0, 0, 0, 0, time.UTC)
+	cluster := &servitorv1alpha1.ServitorCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "cluster", Namespace: "ns", UID: "uid", Finalizers: []string{servitorv1alpha1.CleanupFinalizer}},
+		Spec:       servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "1.2"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 3600, RetrySeconds: []int64{60}}},
+		Status: servitorv1alpha1.ServitorClusterStatus{
+			Phase:             servitorv1alpha1.PhaseApplying,
+			ResolvedOptions:   &options,
+			Recovery:          &recovery,
+			LifecycleSnapshot: &servitorv1alpha1.LifecycleSnapshot{InitialLeaseSeconds: 3600, RetrySeconds: []int64{60}, AuthEligible: true},
+			Operation:         &servitorv1alpha1.OperationReference{ID: "apply-a", Kind: "apply", PipelineRunName: "apply-run"},
+		},
+	}
+	run := &tektonv1.PipelineRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "apply-run", Namespace: "ns", Labels: map[string]string{pipeline.ClusterUIDLabel: "uid", pipeline.OperationLabel: "apply-a"}},
+		Status: tektonv1.PipelineRunStatus{
+			Status:                  duckv1.Status{Conditions: duckv1.Conditions{{Type: apis.ConditionSucceeded, Status: corev1.ConditionTrue}}},
+			PipelineRunStatusFields: tektonv1.PipelineRunStatusFields{ChildReferences: []tektonv1.ChildStatusReference{{TypeMeta: runtime.TypeMeta{Kind: "TaskRun"}, Name: "apply-task", PipelineTaskName: "operation"}}},
+		},
+	}
+	task := &tektonv1.TaskRun{ObjectMeta: metav1.ObjectMeta{Name: "apply-task", Namespace: "ns"}, Status: tektonv1.TaskRunStatus{TaskRunStatusFields: tektonv1.TaskRunStatusFields{PodName: "pod", Steps: []tektonv1.StepState{{Name: pipeline.ReportContainerName, Container: "step-report"}}}}}
+	kube := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&servitorv1alpha1.ServitorCluster{}, &tektonv1.PipelineRun{}, &tektonv1.TaskRun{}).WithObjects(cluster, run, task).Build()
+	reconciler := &controller.Reconciler{Client: kube, Scheme: scheme, Config: controller.Config{Namespace: "ns"}, Logs: authReportLogs{data: report}, Now: func() time.Time { return now }}
+	request := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "ns", Name: "cluster"}}
+	if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	stored := &servitorv1alpha1.ServitorCluster{}
+	if err := kube.Get(context.Background(), request.NamespacedName, stored); err != nil {
+		t.Fatal(err)
+	}
+	return stored
+}
+
+func TestAuthIssuanceFailureReconcilesOwnershipWithoutManifest(t *testing.T) {
+	for _, operation := range []string{"apply-uid", "auth-retry-uid"} {
+		t.Run(operation, func(t *testing.T) {
+			directory := t.TempDir()
+			contextPath := filepath.Join(directory, "auth-context.json")
+			handoff := ictContext{Values: servitorv1alpha1.RecoveryValues{AuthPolicy: &servitorv1alpha1.FrozenAuthPolicy{}}}
+			if err := writeJSON(contextPath, handoff); err != nil {
+				t.Fatal(err)
+			}
+			trace, ict := filepath.Join(directory, "trace"), filepath.Join(directory, "ict")
+			script := fmt.Sprintf("#!/bin/sh\nset -eu\n[ \"$1\" = auth-cleanup ]\nprintf '%%s\\n' \"$@\" > %q\nprintf '%%s' '{\"version\":1,\"operation\":\"auth-cleanup\",\"auth_cleanup\":\"pending\",\"reason\":\"certificate-cleanup-pending\",\"certificate\":{\"allocation_uid\":\"uid\",\"attempt_id\":\"'\"$2\"'\"}}' > \"$6\"\n", trace)
+			if err := os.WriteFile(ict, []byte(script), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			manifestPath := filepath.Join(directory, "manifest.json")
+			if err := cleanupAfterAuthFailure(context.Background(), ict, operation, contextPath, filepath.Join(directory, "result.json"), manifestPath, servitorv1alpha1.AuthAttempt{AllocationUID: "uid", AttemptID: operation}); err != nil {
+				t.Fatal(err)
+			}
+			manifest, err := readJSON[authManifest](manifestPath)
+			if err != nil || manifest.Availability != "unavailable" || manifest.Reason != "auth-state-failure" || manifest.CleanupOutcome != "pending" || manifest.CleanupReason != "unknown" || manifest.Certificate == nil || manifest.Certificate.ID != "" || manifest.Certificate.AllocationUID != "uid" || manifest.Certificate.AttemptID != operation {
+				t.Fatalf("issuance failure manifest = %#v, %v", manifest, err)
+			}
+			args, err := os.ReadFile(trace)
+			if err != nil || strings.Contains(string(args), "--certificate-id") || !strings.Contains(string(args), "--certificate-allocation-uid\nuid\n--certificate-attempt-id\n"+operation+"\n") {
+				t.Fatalf("issuance failure cleanup did not reconcile by runtime ownership: %q, %v", args, err)
+			}
+		})
+	}
+}
+
+func TestAuthRetryPrecleanClearsPersistedReferencesBeforeIssuance(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		cleanupResult string
+		cleanupFails  bool
+		wantTrace     string
+		wantAuth      bool
+	}{
+		{name: "cleaned before issuance", cleanupResult: "cleaned", wantTrace: "auth-cleanup\nauth-cleanup\nauth\n", wantAuth: true},
+		{name: "not found before issuance", cleanupResult: "not-found", wantTrace: "auth-cleanup\nauth-cleanup\nauth\n", wantAuth: true},
+		{name: "pending blocks issuance", cleanupResult: "pending", wantTrace: "auth-cleanup\nauth-cleanup\n"},
+		{name: "failure blocks issuance", cleanupFails: true, wantTrace: "auth-cleanup\nauth-cleanup\n"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			directory := t.TempDir()
+			options, recoveryFile := authRetryPrecleanFixture(t, directory)
+			trace, ict := filepath.Join(directory, "trace"), filepath.Join(directory, "ict")
+			script := fmt.Sprintf("#!/bin/sh\nset -eu\nprintf '%%s\\n' \"$1\" >> %q\ncase \"$1\" in\nauth-cleanup) [ %t != true ] || exit 1; printf '%%s' '{\"version\":1,\"operation\":\"auth-cleanup\",\"auth_cleanup\":%q}' > \"$6\" ;;\nauth) printf '%%s' '{\"version\":1,\"availability\":\"unavailable\",\"reason\":\"auth-state-failure\"}' > \"$8\" ;;\n*) exit 2 ;;\nesac\n", trace, test.cleanupFails, test.cleanupResult)
+			if err := os.WriteFile(ict, []byte(script), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			previousFence := checkAuthRetryFence
+			checkAuthRetryFence = func(context.Context, authRetryFence) error { return nil }
+			t.Cleanup(func() { checkAuthRetryFence = previousFence })
+			manifestPath := filepath.Join(directory, "manifest.json")
+			reference := servitorv1alpha1.AuthCertificateReference{ID: "certificate-daqcara", AllocationUID: "daqcara-allocation", AttemptID: "apply-daqcara"}
+			fence := authRetryFence{Namespace: "ns", Name: "daqcara", UID: "daqcara-allocation", Operation: "auth-retry-daqcara", AttemptID: "auth-retry-daqcara", RequestTimestamp: "1710000000.000001", TokenPath: "/token", CAPath: "/ca"}
+			if err := runAuthRetry(context.Background(), "daqcara-allocation", fence.Operation, options, recoveryFile, filepath.Join(directory, "result.json"), filepath.Join(directory, "report.json"), ict, manifestPath, filepath.Join(directory, "auth"), filepath.Join(directory, "auth-tmpfs"), "vpn-certificate-chain-parse", fence, []servitorv1alpha1.AuthCertificateReference{reference, reference}); err != nil {
+				t.Fatal(err)
+			}
+			if got := string(mustRead(t, trace)); got != test.wantTrace {
+				t.Fatalf("ICT operation order = %q, want %q", got, test.wantTrace)
+			}
+			manifest, err := readJSON[authManifest](manifestPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !test.wantAuth {
+				if manifest.Availability != "unavailable" || manifest.Reason != "vpn-certificate-chain-parse" || manifest.CleanupOutcome != "pending" || !servitorv1alpha1.ValidAuthCleanupReason(manifest.CleanupReason) || manifest.Certificate == nil || manifest.Certificate.AttemptID != fence.Operation {
+					t.Fatalf("pending preclean issued or lost ownership: %#v", manifest)
+				}
+				return
+			}
+			if len(manifest.ClearedCertificateReferences) != 1 || manifest.ClearedCertificateReferences[0].ID != reference.ID {
+				t.Fatalf("successful preclean did not report resolved reference: %#v", manifest.ClearedCertificateReferences)
+			}
+		})
+	}
+}
+
+func TestAuthRetryFenceRecheckedAfterPrecleanBeforeIssuance(t *testing.T) {
+	directory := t.TempDir()
+	options, recoveryFile := authRetryPrecleanFixture(t, directory)
+	trace, ict := filepath.Join(directory, "trace"), filepath.Join(directory, "ict")
+	script := fmt.Sprintf("#!/bin/sh\nset -eu\nprintf '%%s\\n' \"$1\" >> %q\ncase \"$1\" in\nauth-cleanup) printf '%%s' '{\"version\":1,\"operation\":\"auth-cleanup\",\"auth_cleanup\":\"cleaned\"}' > \"$6\" ;;\nauth) exit 9 ;;\n*) exit 2 ;;\nesac\n", trace)
+	if err := os.WriteFile(ict, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	previousFence := checkAuthRetryFence
+	checks := 0
+	checkAuthRetryFence = func(context.Context, authRetryFence) error {
+		checks++
+		if checks == 2 {
+			return errors.New("cleanup won")
+		}
+		return nil
+	}
+	t.Cleanup(func() { checkAuthRetryFence = previousFence })
+	operation := "auth-retry-race"
+	fence := authRetryFence{Namespace: "ns", Name: "cluster", UID: "uid", Operation: operation, AttemptID: operation, RequestTimestamp: "1710000000.000001", TokenPath: "/token", CAPath: "/ca"}
+	reference := servitorv1alpha1.AuthCertificateReference{ID: "certificate-old", AllocationUID: "uid", AttemptID: "apply-old"}
+	manifestPath := filepath.Join(directory, "manifest.json")
+	if err := runAuthRetry(context.Background(), "uid", operation, options, recoveryFile, filepath.Join(directory, "result.json"), filepath.Join(directory, "report.json"), ict, manifestPath, filepath.Join(directory, "auth"), filepath.Join(directory, "auth-tmpfs"), "certificate-cleanup-pending", fence, []servitorv1alpha1.AuthCertificateReference{reference}); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(mustRead(t, trace)); got != "auth-cleanup\nauth-cleanup\n" {
+		t.Fatalf("fenced retry issued auth after preclean: %q", got)
+	}
+	manifest, err := readJSON[authManifest](manifestPath)
+	if err != nil || checks != 2 || manifest.Availability != "unavailable" || manifest.Reason != "auth-retry-fenced" || manifest.CleanupOutcome != "not-required" || manifest.Certificate != nil || len(manifest.ClearedCertificateReferences) != 1 || manifest.ClearedCertificateReferences[0].ID != reference.ID || manifest.ClearedCertificateReferences[0].AllocationUID != reference.AllocationUID || manifest.ClearedCertificateReferences[0].AttemptID != reference.AttemptID {
+		t.Fatalf("fenced terminal manifest lost preclean bookkeeping: %#v, checks=%d, err=%v", manifest, checks, err)
+	}
+}
+
+func TestFenceAuthRetryAfterIssuanceTreatsNotFoundAsCleaned(t *testing.T) {
+	directory := t.TempDir()
+	ict := filepath.Join(directory, "ict")
+	if err := os.WriteFile(ict, []byte("#!/bin/sh\nset -eu\n[ \"$1\" = auth-cleanup ]\nprintf '%s' '{\"version\":1,\"operation\":\"auth-cleanup\",\"auth_cleanup\":\"not-found\"}' > \"$6\"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	operation := "auth-retry-current"
+	manifestPath := filepath.Join(directory, "manifest.json")
+	attempt := servitorv1alpha1.AuthAttempt{AllocationUID: "uid", AttemptID: operation}
+	if err := fenceAuthRetryAfterIssuance(context.Background(), ict, operation, filepath.Join(directory, "auth-context.json"), filepath.Join(directory, "result.json"), manifestPath, attempt); err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := readJSON[authManifest](manifestPath)
+	if err != nil || manifest.Availability != "unavailable" || manifest.Reason != "auth-retry-fenced" || manifest.CleanupOutcome != "cleaned" || manifest.Certificate != nil {
+		t.Fatalf("not-found fence cleanup manifest = %#v, %v", manifest, err)
+	}
+}
+
+func TestAuthRetryPendingPrecleanPreservesLegacyReasonAndUpdatesCleanupContext(t *testing.T) {
+	directory := t.TempDir()
+	options, recoveryFile := authRetryPrecleanFixture(t, directory)
+	trace, ict := filepath.Join(directory, "trace"), filepath.Join(directory, "ict")
+	script := fmt.Sprintf("#!/bin/sh\nset -eu\nprintf '%%s\\n' \"$1\" >> %q\n[ \"$1\" = auth-cleanup ] || exit 2\nprintf '%%s' '{\"version\":1,\"operation\":\"auth-cleanup\",\"auth_cleanup\":\"pending\",\"cleanup_reason\":\"rate-limit\"}' > \"$6\"\n", trace)
+	if err := os.WriteFile(ict, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	previousFence := checkAuthRetryFence
+	checkAuthRetryFence = func(context.Context, authRetryFence) error { return nil }
+	t.Cleanup(func() { checkAuthRetryFence = previousFence })
+	operation, attempt := "auth-retry-operation", "retry-attempt"
+	fence := authRetryFence{Namespace: "ns", Name: "cluster", UID: "uid", Operation: operation, AttemptID: attempt, RequestTimestamp: "1710000000.000001", TokenPath: "/token", CAPath: "/ca"}
+	manifestPath := filepath.Join(directory, "manifest.json")
+	if err := runAuthRetryWithAttempt(context.Background(), "uid", operation, options, recoveryFile, filepath.Join(directory, "result.json"), filepath.Join(directory, "report.json"), ict, manifestPath, filepath.Join(directory, "auth"), filepath.Join(directory, "auth-tmpfs"), attempt, "certificate-cleanup-pending", "pending", "transport", "", fence); err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := readJSON[authManifest](manifestPath)
+	if err != nil || manifest.Reason != "certificate-cleanup-pending" || manifest.CleanupOutcome != "pending" || manifest.CleanupReason != "rate-limit" || manifest.Certificate == nil || manifest.Certificate.AttemptID != attempt {
+		t.Fatalf("pending retry manifest = %#v, %v", manifest, err)
+	}
+	if got := string(mustRead(t, trace)); got != "auth-cleanup\n" {
+		t.Fatalf("pending preclean issued auth: %q", got)
+	}
+}
+
+func authRetryPrecleanFixture(t *testing.T, directory string) (servitorv1alpha1.ResolvedOptions, string) {
+	t.Helper()
+	policy := &servitorv1alpha1.FrozenAuthPolicy{VPNServerID: "vpn", SecretsManagerID: "secrets", SecretsManagerRegion: "eu-gb", SecretGroupID: "group", CertificateTemplate: "template", Issuer: "issuer", TTL: "2h"}
+	options := frozenVPCOptions(servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Target: "target", Provider: "vpc-gen2", PrivateOnly: true, Version: "4.22"}, Platform: "openshift", ClusterName: "cluster", Region: "us-south"})
+	options.Network.AuthPolicy = policy
+	values := frozenVPCValues(servitorv1alpha1.RecoveryValues{ClusterName: "cluster", ResourceGroupName: "Default", Region: "us-south", ClusterMode: "vpc", Platform: "openshift", KubeVersion: "4.22_openshift", WorkerCount: 2, Flavor: "bx2.4x16", PrivateOnly: true, AuthPolicy: policy})
+	recovery := servitorv1alpha1.RecoveryMetadata{Version: 1, Target: "target", TFVarsSHA256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", Endpoints: map[string]string{"IAM": "https://iam.example.invalid", "ContainerService": "https://containers.example.invalid", "GlobalTagging": "https://tagging.example.invalid", "ResourceManagement": "https://management.example.invalid", "ResourceController": "https://controller.example.invalid", "VPC": "https://vpc.example.invalid"}, Values: values}
+	recoveryFile := filepath.Join(directory, "recovery.json")
+	if err := writeJSON(recoveryFile, recovery); err != nil {
+		t.Fatal(err)
+	}
+	return options, recoveryFile
+}
+
+func TestAuthRetryUsesOnlyBackendFreeAuthContext(t *testing.T) {
+	directory := t.TempDir()
+	options, recoveryFile := authRetryPrecleanFixture(t, directory)
+	trace, ict := filepath.Join(directory, "trace"), filepath.Join(directory, "ict")
+	script := fmt.Sprintf("#!/bin/sh\nset -eu\nprintf '%%s\\n' \"$@\" >> %q\n! grep -Eq 'backend|plan_path' \"$4\"\ncase \"$1\" in\nauth-cleanup) printf '%%s' '{\"version\":1,\"operation\":\"auth-cleanup\",\"auth_cleanup\":\"cleaned\"}' > \"$6\" ;;\nauth) printf '%%s' '{\"version\":1,\"availability\":\"unavailable\",\"reason\":\"auth-state-failure\"}' > \"$8\" ;;\n*) exit 2 ;;\nesac\n", trace)
+	if err := os.WriteFile(ict, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	previousFence := checkAuthRetryFence
+	checkAuthRetryFence = func(context.Context, authRetryFence) error { return nil }
+	t.Cleanup(func() { checkAuthRetryFence = previousFence })
+	operation := "auth-retry-context"
+	fence := authRetryFence{Namespace: "ns", Name: "cluster", UID: "uid", Operation: operation, AttemptID: operation, RequestTimestamp: "1710000000.000001", TokenPath: "/token", CAPath: "/ca"}
+	if err := runAuthRetry(context.Background(), "uid", operation, options, recoveryFile, filepath.Join(directory, "result.json"), filepath.Join(directory, "report.json"), ict, filepath.Join(directory, "manifest.json"), filepath.Join(directory, "auth"), filepath.Join(directory, "auth-tmpfs"), "auth-state-failure", fence); err != nil {
+		t.Fatal(err)
+	}
+	data := mustRead(t, filepath.Join(directory, "auth-context.json"))
+	var contextFields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &contextFields); err != nil {
+		t.Fatal(err)
+	}
+	if len(contextFields) != 4 || contextFields["version"] == nil || contextFields["state_id"] == nil || contextFields["values"] == nil || contextFields["recovery"] == nil || contextFields["backend"] != nil || contextFields["plan_path"] != nil {
+		t.Fatalf("auth context fields = %s", data)
+	}
+	if got := string(mustRead(t, trace)); strings.Contains(got, "terraform") || !strings.Contains(got, "auth-cleanup\n") || !strings.Contains(got, "auth\n") {
+		t.Fatalf("auth retry commands = %q", got)
+	}
+}
+
+func runAuthApplyFixture(t *testing.T, directory, manifestPath, outputDir string) string {
+	t.Helper()
+	backendFile := filepath.Join(directory, "backend.json")
+	recoveryFile := filepath.Join(directory, "recovery.json")
+	resultFile := filepath.Join(directory, "result.json")
+	reportFile := filepath.Join(directory, "report.json")
+	backend := backendConfig{Version: 1, Bucket: "bucket", Key: "key", Region: "us-south", Endpoint: "https://s3.example.invalid"}
+	if err := writeJSON(backendFile, backend); err != nil {
+		t.Fatal(err)
+	}
+	values := frozenVPCValues(servitorv1alpha1.RecoveryValues{ClusterName: "cluster", ResourceGroupName: "Default", Region: "us-south", ClusterMode: "vpc", Platform: "openshift", KubeVersion: "4.22_openshift", WorkerCount: 2, Flavor: "bx2.4x16"})
+	recovery := servitorv1alpha1.RecoveryMetadata{Version: 1, Target: "target", TFVarsSHA256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", Endpoints: map[string]string{"IAM": "https://iam.example.invalid", "ContainerService": "https://containers.example.invalid", "GlobalTagging": "https://tagging.example.invalid", "ResourceManagement": "https://management.example.invalid", "ResourceController": "https://controller.example.invalid", "VPC": "https://vpc.example.invalid"}, Values: values}
+	if err := writeJSON(recoveryFile, recovery); err != nil {
+		t.Fatal(err)
+	}
+	workspace := filepath.Join(directory, "fresh-workspace")
+	if err := os.MkdirAll(filepath.Join(workspace, ".cluster"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	fresh := ictPlanResult{Version: 1, StateID: "apply-a", PlanPath: filepath.Join(workspace, ".cluster", "create.tfplan"), Values: values, Backend: backend}
+	fresh.Recovery.Values = values
+	freshResult := filepath.Join(directory, "fresh-result.json")
+	if err := writeJSON(freshResult, fresh); err != nil {
+		t.Fatal(err)
+	}
+	planShowFile, stateFile := filepath.Join(directory, "plan.json"), filepath.Join(directory, "state.json")
+	if err := os.WriteFile(planShowFile, []byte(`{"format_version":"1.2","resource_changes":[]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(stateFile, []byte(`{"format_version":"1.2","values":{"root_module":{}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ict := filepath.Join(directory, "ict")
+	ictScript := fmt.Sprintf("#!/bin/sh\ncase \"$1\" in\nreview) cp %q \"$8\" ;;\napply) printf '%%s' '{\"version\":1,\"operation\":\"apply\",\"workspace\":\"/tmp/workspace\"}' > \"$8\" ;;\n*) exit 2 ;;\nesac\n", freshResult)
+	if err := os.WriteFile(ict, []byte(ictScript), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	terraform := filepath.Join(directory, "terraform")
+	if err := os.WriteFile(terraform, []byte("#!/bin/sh\nif [ -n \"$4\" ]; then cat "+planShowFile+"; else cat "+stateFile+"; fi\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	options := frozenVPCOptions(servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Target: "target", Provider: "vpc-gen2", Version: "4.22"}, Platform: "openshift", ClusterName: "cluster", Region: "us-south"})
+	if err := runApply(context.Background(), "uid", "apply-a", options, backendFile, recoveryFile, resultFile, reportFile, ict, terraform, true, manifestPath, outputDir); err != nil {
+		t.Fatal(err)
+	}
+	return reportFile
 }
 
 func TestRunApplyReviewsFrozenExistingNetworkBeforeApply(t *testing.T) {
@@ -678,17 +1102,13 @@ func TestRunApplyReviewsFrozenExistingNetworkBeforeApply(t *testing.T) {
 	if err := os.WriteFile(stateFile, []byte(`{"format_version":"1.2","values":{"root_module":{}}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("CONTEXT_TRACE", contextTrace)
-	t.Setenv("ICT_TRACE", ictTrace)
-	t.Setenv("FRESH_RESULT", freshResult)
-	t.Setenv("PLAN_SHOW", planShowFile)
-	t.Setenv("STATE_FILE", stateFile)
 	ict := filepath.Join(directory, "ict")
-	if err := os.WriteFile(ict, []byte("#!/bin/sh\nprintf '%s\\n' \"$1\" >> \"$ICT_TRACE\"\ncase \"$1\" in\nreview) cp \"$4\" \"$CONTEXT_TRACE\"; cp \"$FRESH_RESULT\" \"$8\" ;;\napply) printf '%s' '{\"version\":1,\"operation\":\"apply\",\"workspace\":\"/tmp/workspace\"}' > \"$8\" ;;\n*) exit 2 ;;\nesac\n"), 0o700); err != nil {
+	ictScript := fmt.Sprintf("#!/bin/sh\nprintf '%%s\\n' \"$1\" >> %q\ncase \"$1\" in\nreview) cp \"$4\" %q; cp %q \"$8\" ;;\napply) printf '%%s' '{\"version\":1,\"operation\":\"apply\",\"workspace\":\"/tmp/workspace\"}' > \"$8\" ;;\n*) exit 2 ;;\nesac\n", ictTrace, contextTrace, freshResult)
+	if err := os.WriteFile(ict, []byte(ictScript), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	terraform := filepath.Join(directory, "terraform")
-	if err := os.WriteFile(terraform, []byte("#!/bin/sh\nif [ -n \"$4\" ]; then cat \"$PLAN_SHOW\"; else cat \"$STATE_FILE\"; fi\n"), 0o700); err != nil {
+	if err := os.WriteFile(terraform, []byte("#!/bin/sh\nif [ -n \"$4\" ]; then cat "+planShowFile+"; else cat "+stateFile+"; fi\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	options := frozenVPCOptions(servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Target: "target", Provider: "vpc-gen2", Version: "4.22"}, Platform: "openshift", ClusterName: "cluster", Region: "us-south"})
@@ -741,15 +1161,13 @@ func TestRunApplyRejectsFreshManagedNetworkBeforeApply(t *testing.T) {
 		t.Fatal(err)
 	}
 	applyTrace := filepath.Join(directory, "apply-trace")
-	t.Setenv("FRESH_RESULT", freshResult)
-	t.Setenv("PLAN_SHOW", planShowFile)
-	t.Setenv("APPLY_TRACE", applyTrace)
 	ict := filepath.Join(directory, "ict")
-	if err := os.WriteFile(ict, []byte("#!/bin/sh\ncase \"$1\" in\nreview) cp \"$FRESH_RESULT\" \"$8\" ;;\napply) touch \"$APPLY_TRACE\" ;;\n*) exit 2 ;;\nesac\n"), 0o700); err != nil {
+	ictScript := fmt.Sprintf("#!/bin/sh\ncase \"$1\" in\nreview) cp %q \"$8\" ;;\napply) touch %q ;;\n*) exit 2 ;;\nesac\n", freshResult, applyTrace)
+	if err := os.WriteFile(ict, []byte(ictScript), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	terraform := filepath.Join(directory, "terraform")
-	if err := os.WriteFile(terraform, []byte("#!/bin/sh\ncat \"$PLAN_SHOW\"\n"), 0o700); err != nil {
+	if err := os.WriteFile(terraform, []byte("#!/bin/sh\ncat "+planShowFile+"\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	options := frozenVPCOptions(servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Target: "target", Provider: "vpc-gen2", Version: "4.22"}, Platform: "openshift", ClusterName: "cluster", Region: "us-south"})
@@ -856,6 +1274,44 @@ func TestEmitValidatedInventoryReportRejectsUnknownFields(t *testing.T) {
 	}
 }
 
+func TestRunDestroyUsesRuntimeUIDAndDeduplicatesHistoricalAuthReferences(t *testing.T) {
+	directory := t.TempDir()
+	backendFile := filepath.Join(directory, "backend.json")
+	recoveryFile := filepath.Join(directory, "recovery.json")
+	resultFile := filepath.Join(directory, "result.json")
+	reportFile := filepath.Join(directory, "report.json")
+	if err := writeJSON(backendFile, backendConfig{Version: 1, Bucket: "bucket", Key: "key", Region: "us-south", Endpoint: "https://s3.example.invalid"}); err != nil {
+		t.Fatal(err)
+	}
+	values := frozenVPCValues(servitorv1alpha1.RecoveryValues{ClusterName: "cluster", ResourceGroupName: "Default", Region: "us-south", ClusterMode: "vpc", Platform: "openshift", KubeVersion: "4.22_openshift", WorkerCount: 2, Flavor: "bx2.4x16", AuthPolicy: &servitorv1alpha1.FrozenAuthPolicy{VPNServerID: "vpn", SecretsManagerID: "secrets", SecretsManagerRegion: "us-south", SecretGroupID: "group", CertificateTemplate: "template", Issuer: "issuer", TTL: "2h"}})
+	recovery := servitorv1alpha1.RecoveryMetadata{Version: 1, Target: "target", TFVarsSHA256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", Endpoints: map[string]string{"IAM": "https://iam.example.invalid", "ContainerService": "https://containers.example.invalid", "GlobalTagging": "https://tagging.example.invalid", "ResourceManagement": "https://management.example.invalid", "ResourceController": "https://controller.example.invalid", "VPC": "https://vpc.example.invalid"}, Values: values}
+	if err := writeJSON(recoveryFile, recovery); err != nil {
+		t.Fatal(err)
+	}
+	trace, ict := filepath.Join(directory, "trace"), filepath.Join(directory, "ict")
+	script := fmt.Sprintf("#!/bin/sh\nset -eu\nif [ \"$1\" = auth-cleanup ]; then\n  printf '%%s\\n' \"$@\" >> %q\n  printf '\\n' >> %q\n  printf '%%s' '{\"version\":1,\"operation\":\"auth-cleanup\",\"auth_cleanup\":\"not-found\"}' > \"$6\"\n  exit 0\nfi\n[ \"$1\" = destroy ] && [ \"$2\" = destroy-a ] || exit 2\nprintf '%%s' '{\"version\":1,\"operation\":\"destroy\"}' > \"$8\"\n", trace, trace)
+	if err := os.WriteFile(ict, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	options := frozenVPCOptions(servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Provider: "vpc-gen2", Version: "4.22"}, ClusterName: "cluster"})
+	references := []servitorv1alpha1.AuthCertificateReference{{ID: "certificate-apply", AllocationUID: "runtime-uid", AttemptID: "apply-a"}, {ID: "certificate-retry", AllocationUID: "runtime-uid", AttemptID: "auth-retry-a"}, {ID: "certificate-retry", AllocationUID: "runtime-uid", AttemptID: "auth-retry-a"}}
+	if err := runDestroy(context.Background(), "runtime-uid", "destroy-a", options, backendFile, recoveryFile, resultFile, reportFile, ict, references); err != nil {
+		t.Fatal(err)
+	}
+	args, err := os.ReadFile(trace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	invocation := string(args)
+	if strings.Count(invocation, "auth-cleanup\n") != 3 || !strings.Contains(invocation, "--certificate-allocation-uid\nruntime-uid\n") || strings.Count(invocation, "certificate-apply") != 1 || strings.Count(invocation, "certificate-retry") != 1 || !strings.Contains(invocation, "--certificate-attempt-id\napply-a\n") || !strings.Contains(invocation, "--certificate-attempt-id\nauth-retry-a\n") {
+		t.Fatalf("destroy auth cleanup invocations = %q", invocation)
+	}
+	contextData, err := os.ReadFile(filepath.Join(directory, "context.json"))
+	if err != nil || strings.Contains(string(contextData), "allocation_uid") {
+		t.Fatalf("destroy context inferred frozen allocation identity: %q, %v", contextData, err)
+	}
+}
+
 func TestRunDestroyUsesStoredSatelliteRecoveryAndProducesValidatedReport(t *testing.T) {
 	directory := t.TempDir()
 	backendFile := filepath.Join(directory, "backend.json")
@@ -876,9 +1332,9 @@ func TestRunDestroyUsesStoredSatelliteRecoveryAndProducesValidatedReport(t *test
 		t.Fatal(err)
 	}
 	ictTrace := filepath.Join(directory, "ict.trace")
-	t.Setenv("ICT_TRACE_FILE", ictTrace)
 	ict := filepath.Join(directory, "ict")
-	if err := os.WriteFile(ict, []byte("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$ICT_TRACE_FILE\"\n[ \"$1\" = destroy ] && [ \"$2\" = destroy-a ] || exit 2\n[ -f \"$4\" ] || exit 3\nprintf '%s' '{\"version\":1,\"operation\":\"destroy\"}' > \"$8\"\n"), 0o700); err != nil {
+	ictScript := fmt.Sprintf("#!/bin/sh\nprintf '%%s\\n' \"$@\" > %q\n[ \"$1\" = destroy ] && [ \"$2\" = destroy-a ] || exit 2\n[ -f \"$4\" ] || exit 3\nprintf '%%s' '{\"version\":1,\"operation\":\"destroy\"}' > \"$8\"\n", ictTrace)
+	if err := os.WriteFile(ict, []byte(ictScript), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	if err := recovery.Validate(); err != nil {

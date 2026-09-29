@@ -14,6 +14,8 @@ import (
 	"k8s.io/apiextensions-apiserver/pkg/apiserver/schema/pruning"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/kube-openapi/pkg/validation/strfmt"
+	"k8s.io/kube-openapi/pkg/validation/validate"
 )
 
 func TestServitorClusterSpecRequiresWholeHourInitialLease(t *testing.T) {
@@ -26,6 +28,18 @@ func TestServitorClusterSpecRequiresWholeHourInitialLease(t *testing.T) {
 	}
 	if err := spec.Validate(); err == nil || !strings.Contains(err.Error(), "whole number of hours") {
 		t.Fatalf("Validate() = %v, want whole-hour error", err)
+	}
+}
+
+func TestValidExecutionImageRequiresBoundedImmutableDigest(t *testing.T) {
+	valid := "registry.example/servitor-task@sha256:" + strings.Repeat("a", 64)
+	if !ValidExecutionImage(valid) {
+		t.Fatalf("ValidExecutionImage(%q) = false", valid)
+	}
+	for _, image := range []string{"registry.example/servitor-task:latest", "registry.example/servitor-task@sha256:" + strings.Repeat("A", 64), "registry.example/servitor-task@sha256:" + strings.Repeat("a", 63), strings.Repeat("a", MaxExecutionImageLength+1)} {
+		if ValidExecutionImage(image) {
+			t.Fatalf("ValidExecutionImage(%q) = true", image)
+		}
 	}
 }
 
@@ -61,6 +75,32 @@ func TestServitorClusterDeepCopyPreservesLeaseStatus(t *testing.T) {
 	copy.Status.LeaseExtension.NewExpiry.Time = copy.Status.LeaseExtension.NewExpiry.Time.AddDate(0, 0, 1)
 	if cluster.Status.LeaseExpiresAt.Equal(copy.Status.LeaseExpiresAt) || cluster.Status.LeaseExtension.NewExpiry.Equal(copy.Status.LeaseExtension.NewExpiry) {
 		t.Fatal("DeepCopy() aliases lease timestamp pointers")
+	}
+}
+
+func TestValidAuthFailureReasonAllowsOnlyStablePublicationPredicates(t *testing.T) {
+	for _, reason := range []string{"auth-manifest-invalid", "auth-artifact-layout-invalid", "auth-kubeconfig-invalid", "auth-vpn-profile-invalid", "auth-vpn-profile-trust-invalid", "auth-vpn-certificate-invalid", "auth-vpn-expiry-mismatch", "vpn-certificate-leaf-parse", "vpn-certificate-leaf-usage", "vpn-certificate-key-parse", "vpn-certificate-key-mismatch", "vpn-certificate-chain-parse", "vpn-certificate-chain-authority", "vpn-certificate-chain-no-root", "vpn-certificate-chain-verify", "vpn-certificate-leaf-verify", "vpn-certificate-server-eku", "vpn-certificate-expiry-mismatch", "vpn-certificate-authority-mismatch"} {
+		if !ValidAuthFailureReason(reason) {
+			t.Fatalf("rejected stable reason %q", reason)
+		}
+	}
+	for _, reason := range []string{"", "vpn-certificate", "vpn-certificate-chain-verify:private-value", "private-value"} {
+		if ValidAuthFailureReason(reason) {
+			t.Fatalf("accepted unsafe reason %q", reason)
+		}
+	}
+}
+
+func TestValidAuthCleanupStageAllowsOnlyBoundedValues(t *testing.T) {
+	for _, stage := range []string{"client", "authenticate", "metadata-get", "metadata-list", "delete"} {
+		if !ValidAuthCleanupStage(stage) {
+			t.Fatalf("rejected cleanup stage %q", stage)
+		}
+	}
+	for _, stage := range []string{"", "metadata-list:https://malicious.example.invalid", "token-secret"} {
+		if ValidAuthCleanupStage(stage) {
+			t.Fatalf("accepted unsafe cleanup stage %q", stage)
+		}
 	}
 }
 
@@ -285,6 +325,66 @@ func TestCRDPrunesRemovedPlatformAndStrictTypedValidationRejectsIt(t *testing.T)
 	}
 	if strict.Spec.UserOptions.Version != "default_openshift" {
 		t.Fatalf("cloud-default alias was not preserved: %+v", strict.Spec.UserOptions)
+	}
+}
+
+func TestCRDPersistsPrivateOnlyRecoveryAndRejectsRawResourceGroup(t *testing.T) {
+	contents, err := os.ReadFile(filepath.Join("..", "..", "config", "crd", "bases", "servitor.bevicted.github.io_servitorclusters.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]any
+	if err := yaml.Unmarshal(contents, &document); err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var crd apiextensionsv1.CustomResourceDefinition
+	if err := json.Unmarshal(encoded, &crd); err != nil {
+		t.Fatal(err)
+	}
+	var schemaProps apiextensions.JSONSchemaProps
+	if err := apiextensionsv1.Convert_v1_JSONSchemaProps_To_apiextensions_JSONSchemaProps(crd.Spec.Versions[0].Schema.OpenAPIV3Schema, &schemaProps, nil); err != nil {
+		t.Fatal(err)
+	}
+	structural, err := structuralschema.NewStructural(&schemaProps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	presenceRule := false
+	for _, validation := range schemaProps.Properties["spec"].Properties["userOptions"].XValidations {
+		presenceRule = presenceRule || validation.Rule == "!has(self.resourceGroup)"
+	}
+	if !presenceRule {
+		t.Fatal("resourceGroup presence validation is missing")
+	}
+	object := map[string]any{
+		"apiVersion": "servitor.bevicted.github.io/v1alpha1", "kind": "ServitorCluster",
+		"metadata": map[string]any{"name": "example"},
+		"spec": map[string]any{
+			"slack":       map[string]any{"ownerID": "U1", "channelID": "C1", "threadTimestamp": "1.2"},
+			"userOptions": map[string]any{"privateOnly": true},
+			"lifecycle":   map[string]any{"initialLeaseSeconds": int64(3600), "retrySeconds": []any{int64(60)}},
+		},
+		"status": map[string]any{"recovery": map[string]any{"values": map[string]any{"private_only": true}}},
+	}
+	pruning.PruneWithOptions(object, structural, true, structuralschema.UnknownFieldPathOptions{})
+	var decoded ServitorCluster
+	if err := k8sruntime.DefaultUnstructuredConverter.FromUnstructuredWithValidation(object, &decoded, true); err != nil {
+		t.Fatalf("pruned CR did not decode: %v", err)
+	}
+	if !decoded.Status.Recovery.Values.PrivateOnly {
+		t.Fatalf("private-only recovery value was pruned: %+v", decoded.Status.Recovery.Values)
+	}
+	validator := validate.NewSchemaValidator(structural.ToKubeOpenAPI(), nil, "", strfmt.Default)
+	if result := validator.Validate(object); !result.IsValid() {
+		t.Fatalf("baseline CR did not validate: %v", result.Errors)
+	}
+	object["spec"].(map[string]any)["userOptions"].(map[string]any)["resourceGroup"] = "caller-selected"
+	if result := validator.Validate(object); result.IsValid() {
+		t.Fatal("raw resourceGroup input was accepted")
 	}
 }
 

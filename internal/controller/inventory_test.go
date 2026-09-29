@@ -272,7 +272,7 @@ func TestPublishedInventoryMatchesBareSlackCreate(t *testing.T) {
 
 	responder := &inventoryBotResponder{}
 	bot := slackbot.Bot{ChannelID: "C1", SelfUserID: "BOT", Namespace: "servitor", Client: kube, Events: state.NewEventStore(kube, "servitor"), Defaults: command.CreateDefaults{Target: "target-a", Provider: "vpc-gen2"}, InventoryConfigMap: "servitor-ict-config", InventoryConfigKey: "config.yaml", InventoryMaximumAge: time.Hour, Lease: time.Hour, RetryIntervals: []time.Duration{time.Minute}, Responder: responder, Clock: func() time.Time { return now }}
-	if err := bot.Handle(context.Background(), slackbot.Envelope{ID: "mixed", Message: slackbot.Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "<@BOT> create bx2.4x16 Platform\\ Team target-a vpc-gen2 us-south-1 version=4.22", Timestamp: "123"}}); err != nil {
+	if err := bot.Handle(context.Background(), slackbot.Envelope{ID: "mixed", Message: slackbot.Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "<@BOT> create bx2.4x16 target-a vpc-gen2 us-south-1 version=4.22", Timestamp: "123"}}); err != nil {
 		t.Fatal(err)
 	}
 	clusters := &servitorv1alpha1.ServitorClusterList{}
@@ -280,7 +280,7 @@ func TestPublishedInventoryMatchesBareSlackCreate(t *testing.T) {
 		t.Fatalf("Slack create clusters=%+v, %v", clusters.Items, err)
 	}
 	got := clusters.Items[0].Spec.UserOptions
-	want := servitorv1alpha1.UserOptions{Target: "target-a", Provider: "vpc-gen2", Version: "4.22", ResourceGroup: "Platform Team", Zone: "us-south-1", Flavor: "bx2.4x16"}
+	want := servitorv1alpha1.UserOptions{Target: "target-a", Provider: "vpc-gen2", Version: "4.22", Zone: "us-south-1", Flavor: "bx2.4x16"}
 	if len(responder.responses) != 1 || !reflect.DeepEqual(got, want) {
 		t.Fatalf("Slack create options=%+v, responses=%+v", got, responder.responses)
 	}

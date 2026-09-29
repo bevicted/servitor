@@ -18,14 +18,14 @@ func TestNewEligiblePublicApplyUsesScopedPublisherAndApplyBudget(t *testing.T) {
 			Backend:           &servitorv1alpha1.BackendIdentity{Version: 1, Bucket: "bucket", Key: "key", Region: "region", Endpoint: "https://s3.example.invalid"},
 			ExecutionImage:    "registry.example/servitor-task@sha256:deadbeef",
 			Recovery:          &servitorv1alpha1.RecoveryMetadata{Version: 1, Target: "target", TFVarsSHA256: "digest"},
-			Operation:         &servitorv1alpha1.OperationReference{ID: "apply-a", Kind: "apply", PipelineRunName: "run"},
+			Operation:         &servitorv1alpha1.OperationReference{ID: "apply-a", Kind: "apply", AuthAttemptID: "auth-attempt-a", PipelineRunName: "run"},
 		},
 	}
 	run, err := NewApplyRun(cluster, testTaskConfig)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if run.Spec.TaskRunTemplate.ServiceAccountName != AuthResourceName(string(cluster.UID)) || run.Spec.TaskRunTemplate.PodTemplate == nil || run.Spec.TaskRunTemplate.PodTemplate.AutomountServiceAccountToken == nil || *run.Spec.TaskRunTemplate.PodTemplate.AutomountServiceAccountToken {
+	if run.Spec.TaskRunTemplate.ServiceAccountName != AuthAttemptResourceName(string(cluster.UID), cluster.Status.Operation.AuthAttemptID) || run.Spec.TaskRunTemplate.PodTemplate == nil || run.Spec.TaskRunTemplate.PodTemplate.AutomountServiceAccountToken == nil || *run.Spec.TaskRunTemplate.PodTemplate.AutomountServiceAccountToken {
 		t.Fatalf("eligible apply identity = %#v", run.Spec.TaskRunTemplate)
 	}
 	if run.Spec.Timeouts == nil || run.Spec.Timeouts.Pipeline == nil || run.Spec.Timeouts.Tasks == nil || run.Spec.Timeouts.Pipeline.Duration != 120*time.Minute || run.Spec.Timeouts.Tasks.Duration != 115*time.Minute {
@@ -35,8 +35,41 @@ func TestNewEligiblePublicApplyUsesScopedPublisherAndApplyBudget(t *testing.T) {
 	for _, param := range run.Spec.Params {
 		params[param.Name] = param.Value.StringVal
 	}
-	if params["auth-eligible"] != "true" || params["auth-secret"] != AuthResourceName(string(cluster.UID)) {
+	if params["auth-eligible"] != "true" || params["auth-attempt-id"] != cluster.Status.Operation.AuthAttemptID || params["auth-secret"] != AuthResourceName(string(cluster.UID)) {
 		t.Fatalf("public auth params = %#v", params)
+	}
+}
+
+func TestNewAuthRetryRunPassesDistinctAttemptAndPriorCleanupContext(t *testing.T) {
+	cluster := &servitorv1alpha1.ServitorCluster{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "cluster", UID: types.UID("allocation-uid")},
+		Status: servitorv1alpha1.ServitorClusterStatus{
+			ResolvedOptions:   &servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Provider: "vpc-gen2", Version: "4.22"}, ClusterName: "frozen"},
+			LifecycleSnapshot: &servitorv1alpha1.LifecycleSnapshot{AuthEligible: true},
+			ExecutionImage:    "registry.example/servitor-task@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			Recovery:          &servitorv1alpha1.RecoveryMetadata{Version: 1, Target: "target", TFVarsSHA256: "digest"},
+			Operation:         &servitorv1alpha1.OperationReference{ID: "auth-retry-operation", Kind: "auth-retry", AuthAttemptID: "retry-attempt", PipelineRunName: "run"},
+			AuthRetry:         &servitorv1alpha1.AuthRetryStatus{RequestTimestamp: "1710000000.000001", AttemptID: "retry-attempt", ExecutionImage: "registry.example/servitor-task@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+			Auth:              &servitorv1alpha1.AuthStatus{Availability: "unavailable", Reason: "certificate-cleanup-pending", CleanupOutcome: "pending", CleanupReason: "transport"},
+		},
+	}
+	run, err := NewAuthRetryRun(cluster, testTaskConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	params := map[string]string{}
+	for _, param := range run.Spec.Params {
+		params[param.Name] = param.Value.StringVal
+	}
+	if params["operation-id"] != "auth-retry-operation" || params["execution-image"] != cluster.Status.AuthRetry.ExecutionImage || params["backend"] != "" || params["auth-attempt-id"] != "retry-attempt" || params["auth-primary-reason"] != "certificate-cleanup-pending" || params["auth-cleanup-outcome"] != "pending" || params["auth-cleanup-reason"] != "transport" || params["auth-retry-request"] != "1710000000.000001" {
+		t.Fatalf("auth retry params = %#v", params)
+	}
+	if run.Spec.TaskRunTemplate.ServiceAccountName != AuthAttemptResourceName(string(cluster.UID), "retry-attempt") {
+		t.Fatalf("auth retry service account = %q", run.Spec.TaskRunTemplate.ServiceAccountName)
+	}
+	cluster.Status.AuthRetry.ExecutionImage = "registry.example/servitor-task:latest"
+	if _, err := NewAuthRetryRun(cluster, testTaskConfig); err == nil {
+		t.Fatal("auth retry accepted a mutable execution image")
 	}
 }
 

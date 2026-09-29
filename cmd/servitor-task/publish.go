@@ -5,9 +5,11 @@ import (
 	"crypto"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/url"
 	"os"
@@ -26,57 +28,377 @@ import (
 )
 
 const (
-	publisherTimeout        = time.Minute
-	publisherUIDLabel       = "servitor.bevicted.github.io/auth-uid"
-	publisherOperationKey   = "servitor.bevicted.github.io/auth-operation"
-	publishedKubeconfigKey  = "kubeconfig.yaml"
-	publishedVPNKey         = "client.ovpn"
-	maxPublishedBundleBytes = 2 << 20
-	maxPublishedFileBytes   = 1 << 20
+	publisherTimeout               = time.Minute
+	publisherUIDLabel              = "servitor.bevicted.github.io/auth-uid"
+	publisherOperationKey          = "servitor.bevicted.github.io/auth-operation"
+	publisherPendingCertificateKey = "servitor.bevicted.github.io/auth-pending-certificate"
+	publishedKubeconfigKey         = "kubeconfig.yaml"
+	publishedVPNKey                = "client.ovpn"
+	maxPublishedBundleBytes        = 2 << 20
+	maxPublishedFileBytes          = 1 << 20
 )
 
-// publishPublicAuth is deliberately best effort. Infrastructure success already
-// exists in reportPath, and a publication failure must not fail the TaskRun.
-func publishPublicAuth(secretName, uid, operation, manifestPath, outputDir, reportPath, namespace, tokenPath, caPath string) {
-	if !validPublicationInputs(secretName, uid, operation, manifestPath, outputDir, reportPath, namespace, tokenPath, caPath) {
-		return
+type publicationValidationError uint8
+
+type publicationCommitError struct {
+	cause error
+}
+
+func (err *publicationCommitError) Error() string {
+	return err.cause.Error()
+}
+
+func (err *publicationCommitError) Unwrap() error {
+	return err.cause
+}
+
+type publicationRevocationError struct {
+	phase string
+	cause error
+}
+
+func (err *publicationRevocationError) Error() string {
+	return "auth Secret revocation " + err.phase + " failed"
+}
+
+func (err *publicationRevocationError) Unwrap() error {
+	return err.cause
+}
+
+const (
+	publicationManifestInvalid publicationValidationError = iota + 1
+	publicationArtifactLayoutInvalid
+	publicationKubeconfigInvalid
+	publicationVPNProfileInvalid
+	publicationVPNProfileTrustInvalid
+	publicationVPNCertificateInvalid
+	publicationVPNExpiryMismatch
+)
+
+func (publicationValidationError) Error() string {
+	return "publication validation failed"
+}
+
+func (err publicationValidationError) reason() string {
+	switch err {
+	case publicationManifestInvalid:
+		return "auth-manifest-invalid"
+	case publicationArtifactLayoutInvalid:
+		return "auth-artifact-layout-invalid"
+	case publicationKubeconfigInvalid:
+		return "auth-kubeconfig-invalid"
+	case publicationVPNProfileInvalid:
+		return "auth-vpn-profile-invalid"
+	case publicationVPNProfileTrustInvalid:
+		return "auth-vpn-profile-trust-invalid"
+	case publicationVPNCertificateInvalid:
+		return "auth-vpn-certificate-invalid"
+	case publicationVPNExpiryMismatch:
+		return "auth-vpn-expiry-mismatch"
+	default:
+		return "auth-manifest-invalid"
+	}
+}
+
+func publicationFailureReason(err error) string {
+	var validation publicationValidationError
+	if errors.As(err, &validation) {
+		return validation.reason()
+	}
+	return publicationManifestInvalid.reason()
+}
+
+// publishPublicAuth writes an auth result only after it has a valid terminal
+// outcome. Unknown publication failures fail the TaskRun instead of emitting a
+// malformed report that could be adopted as Ready.
+func publishPublicAuth(authEligible bool, options servitorv1alpha1.ResolvedOptions, secretName, uid, operation, manifestPath, outputDir, reportPath, namespace, tokenPath, caPath, ictPath, cleanupContextPath string, fences ...authRetryFence) error {
+	return publishPublicAuthWithAttempt(authEligible, options, secretName, uid, operation, operation, manifestPath, outputDir, reportPath, namespace, tokenPath, caPath, ictPath, cleanupContextPath, fences...)
+}
+
+func publishPublicAuthWithAttempt(authEligible bool, options servitorv1alpha1.ResolvedOptions, secretName, uid, operation, authAttemptID, manifestPath, outputDir, reportPath, namespace, tokenPath, caPath, ictPath, cleanupContextPath string, fences ...authRetryFence) error {
+	if !authEligible {
+		return nil
+	}
+	if !validPublicationInputs(secretName, uid, operation, authAttemptID, manifestPath, outputDir, reportPath, namespace, tokenPath, caPath) {
+		return errors.New("auth publication inputs are invalid")
 	}
 	bundle, status, err := publicationBundle(manifestPath, outputDir)
+	status.AttemptID = authAttemptID
+	certificate := publicationCertificate(status, options, uid, authAttemptID)
+	// A valid unavailable manifest may carry an unresolved certificate from a
+	// prior attempt. Validation failures must still clean only this attempt.
+	if err == nil && certificate == nil {
+		certificate = historicalPendingPublicationCertificate(status, options, uid)
+	}
+	status.Certificate = certificate
+	fence, fenceRequired, fenceErr := publicationFence(fences)
+	if fenceErr != nil || fenceRequired && (fence.UID != uid || fence.Operation != operation || fence.AttemptID != authAttemptID) {
+		return unavailableAfterPublicationFailureWithAttempt(reportPath, uid, operation, authAttemptID, "auth-retry-fenced", ictPath, cleanupContextPath, certificate)
+	}
 	if err != nil {
-		return
+		return unavailableAfterPublicationFailureWithAttempt(reportPath, uid, operation, authAttemptID, publicationFailureReason(err), ictPath, cleanupContextPath, certificate)
+	}
+	if status.Availability == "available" && !publicationModeMatches(options, status.Mode) {
+		return unavailableAfterPublicationFailureWithAttempt(reportPath, uid, operation, authAttemptID, publicationManifestInvalid.reason(), ictPath, cleanupContextPath, certificate)
+	}
+	if status.Availability == "unavailable" {
+		if certificate != nil {
+			return unavailableAfterPublicationFailureWithAttempt(reportPath, uid, operation, authAttemptID, status.Reason, ictPath, cleanupContextPath, certificate)
+		}
+		return markPublished(reportPath, uid, operation, status)
 	}
 	config, err := publisherConfig(tokenPath, caPath)
 	if err != nil {
-		return
+		return unavailableAfterPublicationFailureWithAttempt(reportPath, uid, operation, authAttemptID, "publisher-unavailable", ictPath, cleanupContextPath, certificate)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), publisherTimeout)
 	defer cancel()
-	clientset, err := kubernetes.NewForConfig(config)
+	clientset, err := newPublisherClient(config)
 	if err != nil {
-		return
+		return unavailableAfterPublicationFailureWithAttempt(reportPath, uid, operation, authAttemptID, "publisher-unavailable", ictPath, cleanupContextPath, certificate)
 	}
-	publishAuthBundle(ctx, clientset.CoreV1().Secrets(namespace), secretName, uid, operation, bundle, status, reportPath)
+	var publishFences []authRetryFence
+	if fenceRequired {
+		publishFences = append(publishFences, fence)
+	}
+	secrets := clientset.CoreV1().Secrets(namespace)
+	if err := publishAuthBundle(ctx, secrets, secretName, uid, operation, bundle, status, reportPath, publishFences...); err != nil {
+		reason := "publisher-unavailable"
+		if errors.Is(err, errAuthRetryFenced) {
+			reason = "auth-retry-fenced"
+		}
+		var committed *publicationCommitError
+		if errors.As(err, &committed) {
+			return compensatePublishedAuthBundle(ctx, secrets, secretName, uid, authAttemptID, reportPath, operation, reason, ictPath, cleanupContextPath, certificate)
+		}
+		return unavailableAfterPublicationFailureWithAttempt(reportPath, uid, operation, authAttemptID, reason, ictPath, cleanupContextPath, certificate)
+	}
+	return nil
+}
+
+// unavailableAfterPublicationFailure never leaves an issued private certificate
+// behind after a failed Secret publication. ICT owns the provider interaction;
+// its bounded result is the only cleanup success signal.
+func unavailableAfterPublicationFailure(reportPath, uid, operation, reason, ictPath, contextPath string, certificate *servitorv1alpha1.AuthCertificateReference) error {
+	return unavailableAfterPublicationFailureWithAttempt(reportPath, uid, operation, operation, reason, ictPath, contextPath, certificate)
+}
+
+func unavailableAfterPublicationFailureWithAttempt(reportPath, uid, operation, authAttemptID, reason, ictPath, contextPath string, certificate *servitorv1alpha1.AuthCertificateReference) error {
+	return markPublished(reportPath, uid, operation, unavailablePublicationStatus(operation, authAttemptID, reason, ictPath, contextPath, certificate))
+}
+
+func unavailablePublicationStatus(operation, authAttemptID, reason, ictPath, contextPath string, certificate *servitorv1alpha1.AuthCertificateReference) servitorv1alpha1.AuthStatus {
+	status := servitorv1alpha1.AuthStatus{Availability: "unavailable", Reason: reason, CleanupOutcome: "not-required", AttemptID: authAttemptID}
+	if certificate == nil {
+		return status
+	}
+	cleaned, cleanupReason, cleanupStage, pending := cleanupPublishedCertificate(ictPath, contextPath, operation, *certificate)
+	if cleaned {
+		status.CleanupOutcome = "cleaned"
+		return status
+	}
+	status.CleanupOutcome = "pending"
+	status.CleanupReason = cleanupReason
+	status.CleanupStage = cleanupStage
+	status.Certificate = pending
+	return status
+}
+
+// compensatePublishedAuthBundle revokes delivered bytes before cleanup, while
+// retaining only the bounded certificate ownership reference for recovery.
+func compensatePublishedAuthBundle(ctx context.Context, secrets corev1client.SecretInterface, secretName, uid, authAttemptID, reportPath, operation, reason, ictPath, contextPath string, certificate *servitorv1alpha1.AuthCertificateReference) error {
+	beforeCleanup := revokePublishedAuthBundle(ctx, secrets, secretName, uid, authAttemptID, certificate)
+	status := unavailablePublicationStatus(operation, authAttemptID, reason, ictPath, contextPath, certificate)
+	afterCleanup := revokePublishedAuthBundle(ctx, secrets, secretName, uid, authAttemptID, status.Certificate)
+	if reportErr := compensatePublishedReport(reportPath, uid, operation, authAttemptID, status); reportErr != nil {
+		return errors.Join(
+			reportErr,
+			publicationRevocationFailure("before certificate cleanup", beforeCleanup),
+			publicationRevocationFailure("after certificate cleanup", afterCleanup),
+		)
+	}
+	return nil
+}
+
+func publicationRevocationFailure(phase string, cause error) error {
+	if cause == nil {
+		return nil
+	}
+	return &publicationRevocationError{phase: phase, cause: cause}
+}
+
+// revokePublishedAuthBundle never mutates a replacement attempt. Its annotation
+// contains only the bounded non-secret certificate ownership reference.
+func revokePublishedAuthBundle(ctx context.Context, secrets corev1client.SecretInterface, secretName, uid, authAttemptID string, certificate *servitorv1alpha1.AuthCertificateReference) error {
+	secret, err := secrets.Get(ctx, secretName, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("read auth Secret for revocation: %w", err)
+	}
+	if secret.Labels[publisherUIDLabel] != uid || secret.Annotations[publisherOperationKey] != authAttemptID {
+		return errors.New("auth Secret is not bound to the active operation")
+	}
+	secret.Data = nil
+	if secret.Annotations == nil {
+		secret.Annotations = make(map[string]string)
+	}
+	if certificate == nil {
+		delete(secret.Annotations, publisherPendingCertificateKey)
+	} else {
+		encoded, err := json.Marshal(certificate)
+		if err != nil {
+			return fmt.Errorf("encode pending certificate reference: %w", err)
+		}
+		secret.Annotations[publisherPendingCertificateKey] = string(encoded)
+	}
+	if _, err := secrets.Update(ctx, secret, metav1.UpdateOptions{}); err != nil {
+		return fmt.Errorf("revoke published auth Secret: %w", err)
+	}
+	return nil
+}
+
+// publicationCertificate validates current-attempt ownership separately from
+// artifact mode so a mode mismatch or malformed bundle cannot strand a private
+// certificate.
+func publicationCertificate(status servitorv1alpha1.AuthStatus, options servitorv1alpha1.ResolvedOptions, uid, authAttemptID string) *servitorv1alpha1.AuthCertificateReference {
+	certificate := status.Certificate
+	if !validPublicationCertificateReference(certificate, options, uid, status) || certificate.AttemptID != authAttemptID {
+		return nil
+	}
+	return certificate
+}
+
+// historicalPendingPublicationCertificate is limited to a fully valid pending
+// cleanup manifest. A preclean retry may still be reconciling a certificate
+// issued by a prior attempt for this allocation.
+func historicalPendingPublicationCertificate(status servitorv1alpha1.AuthStatus, options servitorv1alpha1.ResolvedOptions, uid string) *servitorv1alpha1.AuthCertificateReference {
+	certificate := status.Certificate
+	if status.Availability != "unavailable" || status.CleanupOutcome != "pending" || !validPublicationCertificateReference(certificate, options, uid, status) {
+		return nil
+	}
+	return certificate
+}
+
+func validPublicationCertificateReference(certificate *servitorv1alpha1.AuthCertificateReference, options servitorv1alpha1.ResolvedOptions, uid string, status servitorv1alpha1.AuthStatus) bool {
+	return options.Provider == "vpc-gen2" && options.PrivateOnly && certificate != nil && certificate.AllocationUID == uid && len(certificate.AllocationUID) <= 128 && certificate.AttemptID != "" && len(certificate.AttemptID) <= 128 && len(certificate.ID) <= 256 && (certificate.ID != "" || status.Reason == "certificate-cleanup-pending" || status.CleanupOutcome == "pending")
+}
+
+func cleanupPublishedCertificate(ictPath, contextPath, operation string, certificate servitorv1alpha1.AuthCertificateReference) (bool, string, string, *servitorv1alpha1.AuthCertificateReference) {
+	if ictPath == "" || !filepath.IsAbs(contextPath) {
+		return false, "transport", "", &certificate
+	}
+	resultPath := filepath.Join(filepath.Dir(contextPath), "auth-publication-cleanup.json")
+	args := []string{"auth-cleanup", operation, "--context-file", contextPath, "--result-file", resultPath}
+	if certificate.ID != "" {
+		args = append(args, "--certificate-id", certificate.ID)
+	}
+	args = append(args, "--certificate-allocation-uid", certificate.AllocationUID, "--certificate-attempt-id", certificate.AttemptID)
+	ctx, cancel := context.WithTimeout(context.Background(), publisherTimeout)
+	defer cancel()
+	_, err := runICT(ctx, ictPath, 64*1024, io.Discard, io.Discard, nil, args...)
+	if err != nil {
+		return false, "transport", "", &certificate
+	}
+	result, err := readJSON[ictOperationResult](resultPath)
+	if err == nil && result.Version == 1 && result.Operation == "auth-cleanup" && authCleanupSucceeded(result) {
+		return true, "", "", nil
+	}
+	if err == nil && result.Certificate != nil && result.Certificate.AllocationUID == certificate.AllocationUID && result.Certificate.AttemptID == certificate.AttemptID && len(result.Certificate.ID) <= 256 {
+		return false, cleanupFailureReason(result, nil, nil), cleanupFailureStage(result), &servitorv1alpha1.AuthCertificateReference{ID: result.Certificate.ID, AllocationUID: result.Certificate.AllocationUID, AttemptID: result.Certificate.AttemptID}
+	}
+	return false, cleanupFailureReason(result, nil, err), cleanupFailureStage(result), &certificate
+}
+
+var (
+	errAuthRetryFenced = errors.New("auth retry is fenced")
+	newPublisherClient = func(config *rest.Config) (kubernetes.Interface, error) {
+		return kubernetes.NewForConfig(config)
+	}
+	writePublishedReport = writeReport
+)
+
+func publicationFence(fences []authRetryFence) (authRetryFence, bool, error) {
+	if len(fences) == 0 {
+		return authRetryFence{}, false, nil
+	}
+	if len(fences) != 1 || !fences[0].valid() {
+		return authRetryFence{}, true, errors.New("auth retry fence inputs are invalid")
+	}
+	return fences[0], true, nil
 }
 
 // publishAuthBundle is the single checked update path. The publisher can only
-// update a pre-created, UID and operation-bound Secret; it never creates one.
-func publishAuthBundle(ctx context.Context, secrets corev1client.SecretInterface, secretName, uid, operation string, bundle map[string][]byte, status servitorv1alpha1.AuthStatus, reportPath string) bool {
-	if ctx.Err() != nil {
-		return false
+// update a pre-created, UID and auth-attempt-bound Secret; it never creates one.
+// A retry checks the live allocation fence immediately before each delivery
+// Secret access so cleanup and newer requests win over publication.
+func publishAuthBundle(ctx context.Context, secrets corev1client.SecretInterface, secretName, uid, operation string, bundle map[string][]byte, status servitorv1alpha1.AuthStatus, reportPath string, fences ...authRetryFence) error {
+	fence, fenceRequired, err := publicationFence(fences)
+	if err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if fenceRequired {
+		if err := checkAuthRetryFence(ctx, fence); err != nil {
+			return fmt.Errorf("%w: %v", errAuthRetryFenced, err)
+		}
 	}
 	secret, err := secrets.Get(ctx, secretName, metav1.GetOptions{})
-	if err != nil || secret.Labels[publisherUIDLabel] != uid || secret.Annotations[publisherOperationKey] != operation {
-		return false
+	if err != nil {
+		return fmt.Errorf("read auth Secret: %w", err)
 	}
-	if ctx.Err() != nil {
-		return false
+	attemptID := status.AttemptID
+	if attemptID == "" { // pre-auth-attempt manifests used the operation identity.
+		attemptID = operation
+	}
+	if secret.Labels[publisherUIDLabel] != uid || secret.Annotations[publisherOperationKey] != attemptID {
+		return errors.New("auth Secret is not bound to the active operation")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if fenceRequired {
+		if err := checkAuthRetryFence(ctx, fence); err != nil {
+			return fmt.Errorf("%w: %v", errAuthRetryFenced, err)
+		}
 	}
 	secret.Data = bundle
+	if certificate := status.Certificate; certificate != nil {
+		encoded, err := json.Marshal(certificate)
+		if err != nil {
+			return err
+		}
+		if secret.Annotations == nil {
+			secret.Annotations = make(map[string]string)
+		}
+		secret.Annotations[publisherPendingCertificateKey] = string(encoded)
+	}
 	if _, err := secrets.Update(ctx, secret, metav1.UpdateOptions{}); err != nil {
+		// Kubernetes may persist an update before a timeout or transport error
+		// reaches the publisher. Compensate this ambiguous outcome as a commit.
+		return &publicationCommitError{cause: fmt.Errorf("publish auth Secret: %w", err)}
+	}
+	if fenceRequired {
+		if err := checkAuthRetryFence(ctx, fence); err != nil {
+			return &publicationCommitError{cause: fmt.Errorf("%w: %v", errAuthRetryFenced, err)}
+		}
+	}
+	if err := markPublished(reportPath, uid, operation, status); err != nil {
+		return &publicationCommitError{cause: err}
+	}
+	return nil
+}
+
+// publicationModeMatches rejects a worker-provided mode that is inconsistent
+// with the allocation endpoint policy frozen in the operation parameter.
+func publicationModeMatches(options servitorv1alpha1.ResolvedOptions, mode string) bool {
+	if options.Provider == "satellite" {
 		return false
 	}
-	markPublished(reportPath, uid, operation, status)
-	return true
+	if options.Provider == "vpc-gen2" && options.PrivateOnly {
+		return mode == "vpn"
+	}
+	return mode == "public"
 }
 
 func validPublicationInputs(values ...string) bool {
@@ -85,7 +407,7 @@ func validPublicationInputs(values ...string) bool {
 			return false
 		}
 	}
-	for _, index := range []int{3, 4, 5, 7, 8} {
+	for _, index := range []int{4, 5, 6, 8, 9} {
 		if !filepath.IsAbs(values[index]) {
 			return false
 		}
@@ -117,33 +439,61 @@ func publicationKubeconfig(manifestPath, outputDir string) ([]byte, error) {
 	return bundle[publishedKubeconfigKey], nil
 }
 
+func validManifestCleanup(outcome, reason, stage string) bool {
+	if outcome == "" {
+		return reason == "" && stage == "" // manifests from before cleanup observability
+	}
+	return validAuthCleanup(outcome, reason, stage)
+}
+
 func publicationBundle(manifestPath, outputDir string) (map[string][]byte, servitorv1alpha1.AuthStatus, error) {
 	manifest, err := readJSON[authManifest](manifestPath)
-	if err != nil || manifest.Version != 1 || manifest.Availability != "available" {
-		return nil, servitorv1alpha1.AuthStatus{}, errors.New("invalid auth manifest")
+	if err != nil {
+		return nil, servitorv1alpha1.AuthStatus{}, publicationManifestInvalid
 	}
-	status := servitorv1alpha1.AuthStatus{Availability: "available", Mode: manifest.Mode, Expiry: manifest.Expiry}
+	// Preserve a parsed reference even when the rest of the manifest is invalid;
+	// cleanup ownership must not depend on a worker-reported artifact mode.
+	status := servitorv1alpha1.AuthStatus{Availability: manifest.Availability, Mode: manifest.Mode, Expiry: manifest.Expiry, Reason: manifest.Reason, CleanupOutcome: manifest.CleanupOutcome, CleanupReason: manifest.CleanupReason, CleanupStage: manifest.CleanupStage}
+	if manifest.Certificate != nil {
+		status.Certificate = &servitorv1alpha1.AuthCertificateReference{ID: manifest.Certificate.ID, AllocationUID: manifest.Certificate.AllocationUID, AttemptID: manifest.Certificate.AttemptID}
+	}
+	for _, reference := range manifest.ClearedCertificateReferences {
+		status.ClearedCertificateReferences = append(status.ClearedCertificateReferences, servitorv1alpha1.AuthCertificateReference{ID: reference.ID, AllocationUID: reference.AllocationUID, AttemptID: reference.AttemptID})
+	}
+	if manifest.Version != 1 {
+		return nil, status, publicationManifestInvalid
+	}
+	if manifest.Availability == "unavailable" {
+		if manifest.Mode != "" || manifest.Expiry != "" || len(manifest.Artifacts) != 0 || !servitorv1alpha1.ValidAuthFailureReason(manifest.Reason) || !validManifestCleanup(manifest.CleanupOutcome, manifest.CleanupReason, manifest.CleanupStage) {
+			return nil, status, publicationManifestInvalid
+		}
+		status.Mode, status.Expiry = "", ""
+		return nil, status, nil
+	}
+	if manifest.Availability != "available" || manifest.Reason != "" || !validManifestCleanup(manifest.CleanupOutcome, manifest.CleanupReason, manifest.CleanupStage) {
+		return nil, status, publicationManifestInvalid
+	}
 	expected := []string{publishedKubeconfigKey}
 	switch manifest.Mode {
 	case "public":
 		if manifest.Expiry != "" {
-			return nil, status, errors.New("public auth has expiry")
+			return nil, status, publicationManifestInvalid
 		}
 	case "vpn":
 		if _, err := time.Parse(time.RFC3339, manifest.Expiry); err != nil {
-			return nil, status, errors.New("VPN auth has invalid expiry")
+			return nil, status, publicationManifestInvalid
 		}
 		expected = append(expected, publishedVPNKey)
 	default:
-		return nil, status, errors.New("invalid auth mode")
+		return nil, status, publicationManifestInvalid
 	}
 	if len(manifest.Artifacts) != len(expected) {
-		return nil, status, errors.New("auth manifest is incomplete")
+		return nil, status, publicationArtifactLayoutInvalid
 	}
 	allowed := make(map[string]bool, len(expected)+1)
 	for index, name := range expected {
 		if manifest.Artifacts[index].Name != name {
-			return nil, status, errors.New("auth manifest artifacts are invalid")
+			return nil, status, publicationArtifactLayoutInvalid
 		}
 		allowed[name] = true
 	}
@@ -152,48 +502,59 @@ func publicationBundle(manifestPath, outputDir string) (map[string][]byte, servi
 	}
 	entries, err := os.ReadDir(outputDir)
 	if err != nil || len(entries) != len(allowed) {
-		return nil, status, errors.New("auth output is incomplete or contains extra artifacts")
+		return nil, status, publicationArtifactLayoutInvalid
 	}
 	bundle := make(map[string][]byte, len(expected))
 	total := int64(0)
 	for _, entry := range entries {
 		if !allowed[entry.Name()] || !entry.Type().IsRegular() {
-			return nil, status, errors.New("auth output contains an invalid artifact")
+			return nil, status, publicationArtifactLayoutInvalid
 		}
 	}
 	for _, name := range expected {
 		path := filepath.Join(outputDir, name)
 		info, err := os.Lstat(path)
 		if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() <= 0 || info.Size() > maxPublishedFileBytes {
-			return nil, status, errors.New("invalid auth artifact")
+			return nil, status, publicationArtifactLayoutInvalid
 		}
 		total += info.Size()
 		if total > maxPublishedBundleBytes {
-			return nil, status, errors.New("auth bundle exceeds size limit")
+			return nil, status, publicationArtifactLayoutInvalid
 		}
 		contents, err := os.ReadFile(path)
 		if err != nil {
-			return nil, status, errors.New("read auth artifact")
+			return nil, status, publicationArtifactLayoutInvalid
 		}
 		bundle[name] = contents
 	}
-	if validatePublishedKubeconfig(bundle[publishedKubeconfigKey]) != nil || (status.Mode == "vpn" && validatePublishedVPN(bundle[publishedVPNKey], status.Expiry) != nil) {
-		return nil, status, errors.New("invalid auth bundle contents")
+	if validatePublishedKubeconfig(bundle[publishedKubeconfigKey]) != nil {
+		return nil, status, publicationKubeconfigInvalid
+	}
+	if status.Mode == "vpn" {
+		if err := validatePublishedVPN(bundle[publishedVPNKey], status.Expiry); err != nil {
+			return nil, status, err
+		}
 	}
 	return bundle, status, nil
 }
 
 func validatePublishedVPN(contents []byte, reportedExpiry string) error {
 	if len(contents) == 0 || len(contents) > maxPublishedFileBytes {
-		return errors.New("invalid VPN profile size")
+		return publicationVPNProfileInvalid
 	}
 	blocks, directives, err := publishedVPNBlocks(string(contents))
 	if err != nil || validatePublishedVPNDirectives(directives) != nil {
-		return errors.New("unsafe VPN profile")
+		return publicationVPNProfileInvalid
 	}
-	expiry, err := validatePublishedCertificate(blocks["cert"], blocks["key"], blocks["ca"])
-	if err != nil || reportedExpiry != expiry.Format(time.RFC3339) {
-		return errors.New("invalid VPN certificate")
+	if err := validatePublishedProfileTrust(blocks["ca"]); err != nil {
+		return publicationVPNProfileTrustInvalid
+	}
+	expiry, err := validatePublishedVPNCertificate(blocks["cert"], blocks["key"])
+	if err != nil {
+		return publicationVPNCertificateInvalid
+	}
+	if reportedExpiry != expiry.Format(time.RFC3339) {
+		return publicationVPNExpiryMismatch
 	}
 	return nil
 }
@@ -309,9 +670,86 @@ func validPublishedVPNProtocol(value string) bool {
 	}
 }
 
+func validatePublishedProfileTrust(trustPEM string) error {
+	trust, err := publishedCertificates(trustPEM)
+	if err != nil || len(trust) == 0 {
+		return errors.New("invalid trust")
+	}
+	now := time.Now()
+	roots, intermediates := x509.NewCertPool(), x509.NewCertPool()
+	rootCount := 0
+	for _, authority := range trust {
+		if !authority.IsCA || now.Before(authority.NotBefore) || !now.Before(authority.NotAfter) || authority.KeyUsage&x509.KeyUsageCertSign == 0 {
+			return errors.New("invalid trust authority")
+		}
+		if authority.CheckSignatureFrom(authority) == nil {
+			roots.AddCert(authority)
+			rootCount++
+		} else {
+			intermediates.AddCert(authority)
+		}
+	}
+	if rootCount == 0 {
+		return errors.New("missing trust root")
+	}
+	for _, authority := range trust {
+		if authority.CheckSignatureFrom(authority) != nil {
+			if _, err := authority.Verify(x509.VerifyOptions{Roots: roots, Intermediates: intermediates, CurrentTime: now, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageAny}}); err != nil {
+				return errors.New("invalid trust chain")
+			}
+		}
+	}
+	return nil
+}
+
+func validatePublishedVPNCertificate(certificatePEM, keyPEM string) (time.Time, error) {
+	certificates, err := publishedCertificates(certificatePEM)
+	if err != nil || len(certificates) < 2 {
+		return time.Time{}, errors.New("invalid certificate")
+	}
+	certificate := certificates[0]
+	now := time.Now()
+	if certificate.IsCA || now.Before(certificate.NotBefore) || !now.Before(certificate.NotAfter) || certificate.KeyUsage&x509.KeyUsageDigitalSignature == 0 || !containsPublishedUsage(certificate.ExtKeyUsage, x509.ExtKeyUsageClientAuth) || containsPublishedUsage(certificate.ExtKeyUsage, x509.ExtKeyUsageServerAuth) {
+		return time.Time{}, errors.New("invalid certificate usage")
+	}
+	key, err := publishedPrivateKey(keyPEM)
+	if err != nil {
+		return time.Time{}, errors.New("invalid certificate key")
+	}
+	if !publishedPublicKeysEqual(key.Public(), certificate.PublicKey) {
+		return time.Time{}, errors.New("invalid certificate key")
+	}
+	chain := certificates[1:]
+	for _, authority := range chain {
+		if !authority.IsCA || now.Before(authority.NotBefore) || !now.Before(authority.NotAfter) || authority.KeyUsage&x509.KeyUsageCertSign == 0 {
+			return time.Time{}, errors.New("invalid certificate chain authority")
+		}
+	}
+	if certificate.CheckSignatureFrom(chain[0]) != nil {
+		return time.Time{}, errors.New("invalid certificate chain")
+	}
+	for index := 0; index+1 < len(chain); index++ {
+		if chain[index].CheckSignatureFrom(chain[index+1]) != nil {
+			return time.Time{}, errors.New("invalid certificate chain")
+		}
+	}
+	roots, intermediates := x509.NewCertPool(), x509.NewCertPool()
+	for index, authority := range chain {
+		if index == len(chain)-1 {
+			roots.AddCert(authority)
+		} else {
+			intermediates.AddCert(authority)
+		}
+	}
+	if _, err := certificate.Verify(x509.VerifyOptions{Roots: roots, Intermediates: intermediates, CurrentTime: now, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}}); err != nil {
+		return time.Time{}, errors.New("invalid certificate chain")
+	}
+	return certificate.NotAfter.UTC(), nil
+}
+
 func validatePublishedCertificate(certificatePEM, keyPEM, trustPEM string) (time.Time, error) {
 	certificates, err := publishedCertificates(certificatePEM)
-	if err != nil || len(certificates) == 0 {
+	if err != nil || len(certificates) != 1 {
 		return time.Time{}, errors.New("invalid certificate")
 	}
 	certificate := certificates[0]
@@ -328,7 +766,7 @@ func validatePublishedCertificate(certificatePEM, keyPEM, trustPEM string) (time
 		return time.Time{}, errors.New("invalid trust")
 	}
 	roots, intermediates := x509.NewCertPool(), x509.NewCertPool()
-	for _, authority := range append(trust, certificates[1:]...) {
+	for _, authority := range trust {
 		if authority.IsCA && authority.KeyUsage&x509.KeyUsageCertSign != 0 {
 			if authority.CheckSignatureFrom(authority) == nil {
 				roots.AddCert(authority)
@@ -409,56 +847,93 @@ func publishedPublicKeysEqual(left, right crypto.PublicKey) bool {
 func validatePublishedKubeconfig(contents []byte) error {
 	config, err := clientcmd.Load(contents)
 	if err != nil {
-		return fmt.Errorf("decode kubeconfig: %w", err)
+		return publicationKubeconfigInvalid
 	}
 	if config.CurrentContext == "" {
-		return errors.New("kubeconfig has no current context")
+		return publicationKubeconfigInvalid
 	}
 	context, ok := config.Contexts[config.CurrentContext]
 	if !ok || context.Cluster == "" || context.AuthInfo == "" {
-		return errors.New("kubeconfig has an incomplete current context")
+		return publicationKubeconfigInvalid
 	}
 	if len(config.Clusters) == 0 || len(config.AuthInfos) == 0 || len(config.Contexts) == 0 {
-		return errors.New("kubeconfig is incomplete")
+		return publicationKubeconfigInvalid
 	}
-	for name, cluster := range config.Clusters {
+	for _, cluster := range config.Clusters {
 		endpoint, err := url.ParseRequestURI(cluster.Server)
 		if err != nil || endpoint.Scheme != "https" || endpoint.Host == "" {
-			return fmt.Errorf("cluster %q has an invalid API endpoint", name)
+			return publicationKubeconfigInvalid
 		}
 		if cluster.CertificateAuthority != "" || cluster.InsecureSkipTLSVerify || len(cluster.CertificateAuthorityData) == 0 {
-			return fmt.Errorf("cluster %q is not self-contained", name)
+			return publicationKubeconfigInvalid
 		}
 		pool := x509.NewCertPool()
 		if !pool.AppendCertsFromPEM(cluster.CertificateAuthorityData) {
-			return fmt.Errorf("cluster %q has invalid certificate authority data", name)
+			return publicationKubeconfigInvalid
 		}
 	}
-	for name, authInfo := range config.AuthInfos {
+	for _, authInfo := range config.AuthInfos {
 		if authInfo.Token != "" || authInfo.TokenFile != "" || authInfo.ClientCertificate != "" || authInfo.ClientKey != "" || authInfo.Exec != nil || authInfo.AuthProvider != nil || len(authInfo.ClientCertificateData) == 0 || len(authInfo.ClientKeyData) == 0 {
-			return fmt.Errorf("user %q is not self-contained certificate authentication", name)
+			return publicationKubeconfigInvalid
 		}
 		if _, err := tls.X509KeyPair(authInfo.ClientCertificateData, authInfo.ClientKeyData); err != nil {
-			return fmt.Errorf("user %q has invalid certificate authentication data", name)
+			return publicationKubeconfigInvalid
 		}
 		cluster := config.Clusters[context.Cluster]
 		if _, err := validatePublishedCertificate(string(authInfo.ClientCertificateData), string(authInfo.ClientKeyData), string(cluster.CertificateAuthorityData)); err != nil {
-			return fmt.Errorf("user %q has invalid certificate authentication data", name)
+			return publicationKubeconfigInvalid
 		}
 	}
-	for name, kubeContext := range config.Contexts {
+	for _, kubeContext := range config.Contexts {
 		if kubeContext.Cluster == "" || kubeContext.AuthInfo == "" || config.Clusters[kubeContext.Cluster] == nil || config.AuthInfos[kubeContext.AuthInfo] == nil {
-			return fmt.Errorf("context %q has unresolved authentication", name)
+			return publicationKubeconfigInvalid
 		}
 	}
 	return nil
 }
 
-func markPublished(path, uid, operation string, status servitorv1alpha1.AuthStatus) {
+// markPublished atomically replaces a valid unauthenticated report with one
+// terminal auth status. It never writes a pending auth status.
+func markPublished(path, uid, operation string, status servitorv1alpha1.AuthStatus) error {
 	report, err := readJSON[pipeline.Report](path)
-	if err != nil || report.Validate(uid, operation) != nil || report.Auth == nil || report.Auth.Availability != "unavailable" {
-		return
+	if err != nil {
+		return fmt.Errorf("read infrastructure report: %w", err)
+	}
+	if report.ClusterUID != uid || report.OperationID != operation || report.Auth != nil || report.Validate(uid, operation) != nil {
+		return errors.New("infrastructure report is not a valid unauthenticated active-operation report")
 	}
 	report.Auth = &status
-	_ = writeReport(path, report)
+	if err := report.Validate(uid, operation); err != nil {
+		return fmt.Errorf("terminal auth report is invalid: %w", err)
+	}
+	if err := writePublishedReport(path, report); err != nil {
+		return fmt.Errorf("persist terminal auth report: %w", err)
+	}
+	return nil
+}
+
+// compensatePublishedReport replaces only this attempt's unauthenticated or
+// available terminal report after an ambiguous persistence failure.
+func compensatePublishedReport(path, uid, operation, attempt string, status servitorv1alpha1.AuthStatus) error {
+	if status.Availability != "unavailable" || status.AttemptID != attempt {
+		return errors.New("compensation auth status does not match the active attempt")
+	}
+	report, err := readJSON[pipeline.Report](path)
+	if err != nil {
+		return fmt.Errorf("read terminal auth report for compensation: %w", err)
+	}
+	if report.Version != 1 || report.ClusterUID != uid || report.OperationID != operation || report.Validate(uid, operation) != nil {
+		return errors.New("terminal auth report does not match the active operation")
+	}
+	if report.Auth != nil && (report.Auth.Availability != "available" || report.Auth.AttemptID != attempt) {
+		return errors.New("terminal auth report does not match the active attempt")
+	}
+	report.Auth = &status
+	if err := report.Validate(uid, operation); err != nil {
+		return fmt.Errorf("compensation auth report is invalid: %w", err)
+	}
+	if err := writeReport(path, report); err != nil {
+		return fmt.Errorf("persist compensation auth report: %w", err)
+	}
+	return nil
 }

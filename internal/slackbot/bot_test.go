@@ -357,11 +357,11 @@ func TestCreateAutoApprovePersistsImmutableIntentAndEarlyYesDoesNotMutate(t *tes
 
 func TestHandleCreateNormalizesAssignmentsWithoutDefaults(t *testing.T) {
 	want := servitorv1alpha1.UserOptions{
-		Target: "synthetic-target", Version: "4.22", ResourceGroup: "Platform Team=Core", WorkerCount: 3,
+		Target: "synthetic-target", Version: "4.22", WorkerCount: 3,
 	}
 	bot, responses := botForTest(t)
 	bot.Defaults = command.CreateDefaults{Provider: "vpc-gen2"}
-	event := Envelope{ID: "assignments", Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: `<@BOT> create target=synthetic-target version=4.22 resource-group="Platform Team=Core" worker-count=3`, Timestamp: "123"}}
+	event := Envelope{ID: "assignments", Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: `<@BOT> create target=synthetic-target version=4.22 worker-count=3`, Timestamp: "123"}}
 	if err := bot.Handle(context.Background(), event); err != nil {
 		t.Fatal(err)
 	}
@@ -1150,12 +1150,12 @@ func TestCreateRejectsPlatformAndHelpDoesNotAdvertiseIt(t *testing.T) {
 
 func TestCreateHelpDistinguishesDefaultsAliasesStreamsAndProvider(t *testing.T) {
 	help := strings.Join(createHelp(command.CreateDefaults{}, 3), "\n")
-	for _, wanted := range []string{"Configured defaults", "provider=", "key=value", "target=synthetic-target", "resource-group=\"Platform Team\"", "auth=true", "auth=false", "eligible `auth`", "Satellite provisioning is not supported", "roks", "iks", "k8s", "default_openshift", "default_kubernetes", "4.17", "prestage", "pretest", "test`/`stage", "dev target"} {
+	for _, wanted := range []string{"Configured defaults", "provider=", "key=value", "target=synthetic-target", "private-only=true", "auth=true", "auth=false", "eligible `auth`", "Satellite provisioning is not supported", "roks", "iks", "k8s", "default_openshift", "default_kubernetes", "4.17", "prestage", "pretest", "test`/`stage", "dev target"} {
 		if !containsText(help, wanted) {
 			t.Fatalf("create help missing %q: %s", wanted, help)
 		}
 	}
-	for _, forbidden := range []string{"--key=value", "--key value", "--provider", "config=", "satellite-zone=", "Satellite\n  "} {
+	for _, forbidden := range []string{"--key=value", "--key value", "--provider", "config=", "resource-group=", "satellite-zone=", "Satellite\n  "} {
 		if containsText(help, forbidden) {
 			t.Fatalf("create help advertises unsupported form %q: %s", forbidden, help)
 		}
@@ -1334,7 +1334,7 @@ func TestLifecycleHelpExplainsAvailableStates(t *testing.T) {
 
 func TestCreateMatchesPublishedInventoryBareValues(t *testing.T) {
 	bot, responses := botWithPublishedInventory(t, false)
-	event := Envelope{ID: "mixed-bare", Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "<@BOT> create bx2.4x16 Platform\\ Team target-a vpc-gen2 us-south-1 version=4.22", Timestamp: "123"}}
+	event := Envelope{ID: "mixed-bare", Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "<@BOT> create bx2.4x16 target-a vpc-gen2 us-south-1 version=4.22", Timestamp: "123"}}
 	if err := bot.Handle(context.Background(), event); err != nil {
 		t.Fatal(err)
 	}
@@ -1342,13 +1342,13 @@ func TestCreateMatchesPublishedInventoryBareValues(t *testing.T) {
 	if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: allocationClusterName("C1", "123")}, cluster); err != nil {
 		t.Fatal(err)
 	}
-	want := servitorv1alpha1.UserOptions{Target: "target-a", Provider: "vpc-gen2", Version: "4.22", ResourceGroup: "Platform Team", Zone: "us-south-1", Flavor: "bx2.4x16"}
+	want := servitorv1alpha1.UserOptions{Target: "target-a", Provider: "vpc-gen2", Version: "4.22", Zone: "us-south-1", Flavor: "bx2.4x16"}
 	if !reflect.DeepEqual(cluster.Spec.UserOptions, want) || len(responses.responses) != 1 {
 		t.Fatalf("bare create = %+v, responses=%+v", cluster.Spec.UserOptions, responses.responses)
 	}
 
 	explicit, _ := botWithPublishedInventory(t, false)
-	if err := explicit.Handle(context.Background(), Envelope{ID: "explicit", Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "<@BOT> create target=target-a provider=vpc-gen2 version=4.22 resource-group=Platform\\ Team zone=us-south-1 flavor=bx2.4x16", Timestamp: "123"}}); err != nil {
+	if err := explicit.Handle(context.Background(), Envelope{ID: "explicit", Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "<@BOT> create target=target-a provider=vpc-gen2 version=4.22 zone=us-south-1 flavor=bx2.4x16", Timestamp: "123"}}); err != nil {
 		t.Fatal(err)
 	}
 	explicitCluster := &servitorv1alpha1.ServitorCluster{}
@@ -1361,7 +1361,7 @@ func TestCreateMatchesPublishedInventoryBareValues(t *testing.T) {
 		t.Fatal(err)
 	}
 	defaultCluster := &servitorv1alpha1.ServitorCluster{}
-	if err := defaults.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: allocationClusterName("C1", "124")}, defaultCluster); err != nil || !reflect.DeepEqual(defaultCluster.Spec.UserOptions, servitorv1alpha1.UserOptions{ResourceGroup: "Platform Team"}) {
+	if err := defaults.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: allocationClusterName("C1", "124")}, defaultCluster); err == nil {
 		t.Fatalf("default create = %+v, %v", defaultCluster.Spec.UserOptions, err)
 	}
 }
@@ -1438,10 +1438,10 @@ func TestCreateBareValuesRequireCurrentInventoryButKeysProceed(t *testing.T) {
 		t.Fatal(err)
 	}
 	cluster := &servitorv1alpha1.ServitorCluster{}
-	if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: allocationClusterName("C1", "124")}, cluster); err != nil || cluster.Spec.UserOptions.ResourceGroup != "Uncatalogued" {
+	if err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: "servitor", Name: allocationClusterName("C1", "124")}, cluster); err == nil {
 		t.Fatalf("keyed create = %+v, %v", cluster.Spec.UserOptions, err)
 	}
-	for _, text := range []string{"<@BOT> create target=unknown resource-group=value", "<@BOT> create provider=classic resource-group=value"} {
+	for _, text := range []string{"<@BOT> create target=unknown", "<@BOT> create provider=classic"} {
 		invalid, responses := botWithPublishedInventory(t, false)
 		if err := invalid.Handle(context.Background(), Envelope{ID: text, Message: Message{Channel: "C1", ChannelType: "channel", User: "U3", Text: text, Timestamp: "125"}}); err != nil {
 			t.Fatal(err)

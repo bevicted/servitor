@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"reflect"
 	"testing"
 	"time"
 
@@ -91,6 +92,7 @@ func TestDecodeReportAcceptsOnlyPlanOnlyRejection(t *testing.T) {
 func TestDecodeReportRejectsPartialOrExpiredAuthMetadata(t *testing.T) {
 	for _, status := range []servitorv1alpha1.AuthStatus{
 		{Availability: "available"},
+		{Availability: "unavailable"},
 		{Availability: "unavailable", Mode: "public"},
 		{Availability: "available", Mode: "public", Expiry: time.Now().Add(time.Hour).Format(time.RFC3339)},
 		{Availability: "available", Mode: "vpn", Expiry: time.Now().Add(-time.Hour).Format(time.RFC3339)},
@@ -103,6 +105,117 @@ func TestDecodeReportRejectsPartialOrExpiredAuthMetadata(t *testing.T) {
 		if _, err := DecodeReport(data, "uid", "plan-a"); err == nil {
 			t.Fatalf("accepted auth metadata %+v", status)
 		}
+	}
+}
+
+func TestDecodeReportAcceptsOnlyAllowlistedPublicationPredicates(t *testing.T) {
+	for _, reason := range []string{"auth-manifest-invalid", "auth-artifact-layout-invalid", "auth-kubeconfig-invalid", "auth-vpn-profile-invalid", "auth-vpn-profile-trust-invalid", "auth-vpn-certificate-invalid", "auth-vpn-expiry-mismatch"} {
+		report := Report{Version: 1, ClusterUID: "uid", OperationID: "plan-a", ResolvedOptions: servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Provider: "vpc-gen2", Version: "4.22"}, ClusterName: "cluster"}, Recovery: validRecovery(), Auth: &servitorv1alpha1.AuthStatus{Availability: "unavailable", Reason: reason}}
+		data, err := json.Marshal(report)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := DecodeReport(data, "uid", "plan-a"); err != nil {
+			t.Fatalf("rejected publication predicate %q: %v", reason, err)
+		}
+	}
+}
+
+func TestDecodeReportCarriesOnlyBoundedCleanupStage(t *testing.T) {
+	status := servitorv1alpha1.AuthStatus{
+		Availability: "unavailable", Reason: "certificate-cleanup-pending", CleanupOutcome: "pending", CleanupReason: "service", CleanupStage: "authenticate", AttemptID: "attempt-1",
+		Certificate: &servitorv1alpha1.AuthCertificateReference{AllocationUID: "uid", AttemptID: "attempt-1"},
+	}
+	report := Report{Version: 1, ClusterUID: "uid", OperationID: "plan-a", ResolvedOptions: servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Provider: "vpc-gen2", Version: "4.22"}, ClusterName: "cluster"}, Recovery: validRecovery(), Auth: &status}
+	data, err := json.Marshal(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := DecodeReport(data, "uid", "plan-a")
+	if err != nil || decoded.Auth == nil || decoded.Auth.CleanupStage != "authenticate" {
+		t.Fatalf("cleanup stage = %#v, %v", decoded.Auth, err)
+	}
+	for _, test := range []struct {
+		name   string
+		mutate func(*servitorv1alpha1.AuthStatus)
+	}{
+		{name: "outcome", mutate: func(status *servitorv1alpha1.AuthStatus) { status.CleanupOutcome = "pending:private-value" }},
+		{name: "reason", mutate: func(status *servitorv1alpha1.AuthStatus) { status.CleanupReason = "service:private-value" }},
+		{name: "stage", mutate: func(status *servitorv1alpha1.AuthStatus) {
+			status.CleanupStage = "metadata-get:https://malicious.example.invalid/token"
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			unsafe := status
+			test.mutate(&unsafe)
+			report.Auth = &unsafe
+			data, err = json.Marshal(report)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := DecodeReport(data, "uid", "plan-a"); err == nil {
+				t.Fatalf("accepted unsafe cleanup %s", test.name)
+			}
+		})
+	}
+}
+
+func TestDecodeReportRetainsOnlyHistoricalPendingCertificateReferences(t *testing.T) {
+	status := servitorv1alpha1.AuthStatus{
+		Availability: "unavailable", Reason: "certificate-cleanup-pending", CleanupOutcome: "pending", CleanupReason: "transport", AttemptID: "auth-retry-current",
+		Certificate: &servitorv1alpha1.AuthCertificateReference{ID: "certificate-previous", AllocationUID: "uid", AttemptID: "apply-previous"},
+	}
+	report := Report{Version: 1, ClusterUID: "uid", OperationID: "plan-a", ResolvedOptions: servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Provider: "vpc-gen2", Version: "4.22"}, ClusterName: "cluster"}, Recovery: validRecovery(), Auth: &status}
+	data, err := json.Marshal(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DecodeReport(data, "uid", "plan-a"); err != nil {
+		t.Fatalf("rejected historical pending certificate: %v", err)
+	}
+	for _, test := range []struct {
+		name   string
+		mutate func(*servitorv1alpha1.AuthStatus)
+	}{
+		{name: "available", mutate: func(status *servitorv1alpha1.AuthStatus) {
+			status.Availability, status.Mode, status.Reason, status.CleanupOutcome, status.CleanupReason = "available", "vpn", "", "", ""
+			status.Expiry = time.Now().Add(time.Hour).Format(time.RFC3339)
+		}},
+		{name: "cleanup completed", mutate: func(status *servitorv1alpha1.AuthStatus) { status.CleanupOutcome, status.CleanupReason = "cleaned", "" }},
+		{name: "empty historical attempt", mutate: func(status *servitorv1alpha1.AuthStatus) { status.Certificate.AttemptID = "" }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := status
+			certificate := *status.Certificate
+			candidate.Certificate = &certificate
+			test.mutate(&candidate)
+			report.Auth = &candidate
+			data, err := json.Marshal(report)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := DecodeReport(data, "uid", "plan-a"); err == nil {
+				t.Fatalf("accepted invalid historical certificate status: %#v", candidate)
+			}
+		})
+	}
+}
+
+func TestDecodeReportRoundTripsConfiguredEndpoints(t *testing.T) {
+	recovery := validRecovery()
+	recovery.Endpoints = map[string]string{
+		"IAM": "https://iam.test.example.invalid/identity", "ContainerService": "https://containers.example.invalid/global", "GlobalTagging": "https://tagging.example.invalid", "ResourceManagement": "https://management.example.invalid", "ResourceController": "https://controller.example.invalid", "VPC": "https://vpc.us-south.example.invalid/v1",
+	}
+	data, err := json.Marshal(Report{Version: 1, ClusterUID: "uid", OperationID: "plan-a", ResolvedOptions: servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Provider: "vpc-gen2", Version: "4.22"}, ClusterName: "cluster"}, Recovery: recovery})
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := DecodeReport(data, "uid", "plan-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(decoded.Recovery.Endpoints, recovery.Endpoints) {
+		t.Fatalf("round-trip endpoints = %#v, want %#v", decoded.Recovery.Endpoints, recovery.Endpoints)
 	}
 }
 
@@ -134,6 +247,9 @@ func TestDecodeReportRejectsUnsafeRecoveryMetadata(t *testing.T) {
 		}},
 		{"unknown endpoint", func(recovery *servitorv1alpha1.RecoveryMetadata) {
 			recovery.Endpoints["Token"] = "https://token.example.invalid"
+		}},
+		{"empty optional endpoint", func(recovery *servitorv1alpha1.RecoveryMetadata) {
+			recovery.Endpoints["Satellite"] = ""
 		}},
 		{"credential-like value", func(recovery *servitorv1alpha1.RecoveryMetadata) {
 			recovery.Values.ResourceGroupName = "Bearer token=value"

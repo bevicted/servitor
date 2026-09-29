@@ -78,8 +78,9 @@ func TestApprovalResumesPartialPublisherResourcesWithoutInformerCache(t *testing
 	if stored.Status.Phase != servitorv1alpha1.PhaseApplying || !stored.Status.ApplyDispatched || stored.Status.Operation == nil || stored.Status.Operation.ID != operation {
 		t.Fatalf("approval did not persist Applying after partial publisher creation: %+v", stored.Status)
 	}
+	attemptName := pipeline.AuthAttemptResourceName(string(cluster.UID), initialAuthAttemptID(string(cluster.UID), operation, ""))
 	for _, object := range []client.Object{&rbacv1.Role{}, &rbacv1.RoleBinding{}} {
-		if err := base.Get(context.Background(), types.NamespacedName{Namespace: cluster.Namespace, Name: name}, object); err != nil {
+		if err := base.Get(context.Background(), types.NamespacedName{Namespace: cluster.Namespace, Name: attemptName}, object); err != nil {
 			t.Fatalf("approval did not resume %T creation: %v", object, err)
 		}
 	}
@@ -93,7 +94,7 @@ func TestGeneratedPublisherRolePermissionsAreHeldByController(t *testing.T) {
 	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", UID: "allocation-uid"}}
 	name := authResourceName(cluster)
 	client := fake.NewClientBuilder().WithScheme(scheme).Build()
-	if err := (&Reconciler{Client: client}).ensurePublisherRole(context.Background(), cluster, name, map[string]string{authUIDLabel: string(cluster.UID)}); err != nil {
+	if err := (&Reconciler{Client: client}).ensurePublisherRole(context.Background(), cluster, name, name, applyID(string(cluster.UID)), false, map[string]string{authUIDLabel: string(cluster.UID)}); err != nil {
 		t.Fatal(err)
 	}
 	publisher := &rbacv1.Role{}
@@ -142,7 +143,7 @@ func TestReplacementAllocationUIDCannotReusePublishedSecret(t *testing.T) {
 	replacement := old.DeepCopy()
 	replacement.UID = "new-uid"
 	for _, cluster := range []*servitorv1alpha1.ServitorCluster{old, replacement} {
-		if err := reconciler.ensureAuthPublicationResources(context.Background(), cluster, applyID(string(cluster.UID))); err != nil {
+		if err := reconciler.ensureAuthPublicationResources(context.Background(), cluster, &servitorv1alpha1.OperationReference{ID: applyID(string(cluster.UID)), Kind: "apply"}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -202,6 +203,92 @@ func containsString(values []string, expected string) bool {
 	return false
 }
 
+func TestPublisherRoleUsesOperationKindForRetryFenceRead(t *testing.T) {
+	scheme := runtime.NewScheme()
+	for _, add := range []func(*runtime.Scheme) error{corev1.AddToScheme, rbacv1.AddToScheme} {
+		if err := add(scheme); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "cluster", UID: "allocation"}, Status: servitorv1alpha1.ServitorClusterStatus{LifecycleSnapshot: &servitorv1alpha1.LifecycleSnapshot{AuthEligible: true}}}
+	client := fake.NewClientBuilder().WithScheme(scheme).Build()
+	reconciler := &Reconciler{Client: client}
+	applyAttempt := "auth-retry-looking-apply-attempt"
+	if err := reconciler.ensureAuthPublicationResources(context.Background(), cluster, &servitorv1alpha1.OperationReference{ID: "apply-operation", Kind: "apply", AuthAttemptID: applyAttempt}); err != nil {
+		t.Fatal(err)
+	}
+	if attemptAllows(t, client, cluster, applyAttempt, "servitorclusters", cluster.Name, "get") {
+		t.Fatal("apply attempt received retry fence read authority")
+	}
+	retryAttempt := "retry-attempt"
+	if err := reconciler.ensureAuthPublicationResources(context.Background(), cluster, &servitorv1alpha1.OperationReference{ID: "non-prefix-operation", Kind: "auth-retry", AuthAttemptID: retryAttempt}); err != nil {
+		t.Fatal(err)
+	}
+	if !attemptAllows(t, client, cluster, retryAttempt, "servitorclusters", cluster.Name, "get") || attemptAllows(t, client, cluster, retryAttempt, "servitorclusters", "other", "get") {
+		t.Fatal("retry attempt CR read scope is not exactly its allocation")
+	}
+}
+
+func TestAuthAttemptRBACRevokesStaleIdentityAndScopesCurrentIdentity(t *testing.T) {
+	scheme := runtime.NewScheme()
+	for _, add := range []func(*runtime.Scheme) error{corev1.AddToScheme, rbacv1.AddToScheme} {
+		if err := add(scheme); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "cluster", UID: "allocation"}, Status: servitorv1alpha1.ServitorClusterStatus{LifecycleSnapshot: &servitorv1alpha1.LifecycleSnapshot{AuthEligible: true}}}
+	client := fake.NewClientBuilder().WithScheme(scheme).Build()
+	reconciler := &Reconciler{Client: client}
+	stale, current := "retry-attempt-old", "retry-attempt-current"
+	if err := reconciler.ensureAuthPublicationResources(context.Background(), cluster, &servitorv1alpha1.OperationReference{ID: "auth-retry-old", Kind: "auth-retry", AuthAttemptID: stale}); err != nil {
+		t.Fatal(err)
+	}
+	if err := reconciler.ensureAuthPublicationResources(context.Background(), cluster, &servitorv1alpha1.OperationReference{ID: "auth-retry-current", Kind: "auth-retry", AuthAttemptID: current}); err != nil {
+		t.Fatal(err)
+	}
+	if err := reconciler.revokeAuthAttempt(context.Background(), cluster, stale); err != nil {
+		t.Fatal(err)
+	}
+	secret := authResourceName(cluster)
+	if attemptAllows(t, client, cluster, stale, "secrets", secret, "update") {
+		t.Fatal("stale identity retained Secret update authority after RoleBinding removal")
+	}
+	if !attemptAllows(t, client, cluster, current, "secrets", secret, "update") {
+		t.Fatal("current identity cannot update its current delivery Secret")
+	}
+	if attemptAllows(t, client, cluster, current, "secrets", "other", "update") {
+		t.Fatal("current identity can update another Secret")
+	}
+	if !attemptAllows(t, client, cluster, current, "servitorclusters", cluster.Name, "get") || attemptAllows(t, client, cluster, current, "servitorclusters", "other", "get") {
+		t.Fatal("current retry identity CR read scope is not resourceName-bound")
+	}
+}
+
+// attemptAllows models the exact RoleBinding subject, RoleRef, resourceName, and
+// verb evaluation used by Kubernetes RBAC. The fake client supplies the policy
+// objects while avoiding an unrelated API server dependency in this unit test.
+func attemptAllows(t *testing.T, client client.Client, cluster *servitorv1alpha1.ServitorCluster, operation, resource, name, verb string) bool {
+	t.Helper()
+	attempt := pipeline.AuthAttemptResourceName(string(cluster.UID), operation)
+	binding := &rbacv1.RoleBinding{}
+	if err := client.Get(context.Background(), types.NamespacedName{Namespace: cluster.Namespace, Name: attempt}, binding); err != nil {
+		return false
+	}
+	if len(binding.Subjects) != 1 || binding.Subjects[0].Kind != "ServiceAccount" || binding.Subjects[0].Name != attempt || binding.RoleRef.APIGroup != rbacv1.GroupName || binding.RoleRef.Kind != "Role" || binding.RoleRef.Name != attempt {
+		return false
+	}
+	role := &rbacv1.Role{}
+	if err := client.Get(context.Background(), types.NamespacedName{Namespace: cluster.Namespace, Name: attempt}, role); err != nil {
+		return false
+	}
+	for _, rule := range role.Rules {
+		if containsString(rule.Resources, resource) && containsString(rule.ResourceNames, name) && containsString(rule.Verbs, verb) {
+			return true
+		}
+	}
+	return false
+}
+
 func TestPublicAuthResourcesAreUIDBoundAndRevokedBeforePublisherRemoval(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := servitorv1alpha1.AddToScheme(scheme); err != nil {
@@ -213,11 +300,11 @@ func TestPublicAuthResourcesAreUIDBoundAndRevokedBeforePublisherRemoval(t *testi
 	if err := rbacv1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
 	}
-	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", UID: "new-allocation"}, Status: servitorv1alpha1.ServitorClusterStatus{LifecycleSnapshot: &servitorv1alpha1.LifecycleSnapshot{PublicAuthEligible: true}}}
+	operation := applyID("new-allocation")
+	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", UID: "new-allocation"}, Status: servitorv1alpha1.ServitorClusterStatus{LifecycleSnapshot: &servitorv1alpha1.LifecycleSnapshot{PublicAuthEligible: true}, Operation: &servitorv1alpha1.OperationReference{ID: operation}}}
 	client := fake.NewClientBuilder().WithScheme(scheme).Build()
 	reconciler := &Reconciler{Client: client}
-	operation := applyID(string(cluster.UID))
-	if err := reconciler.ensureAuthPublicationResources(context.Background(), cluster, operation); err != nil {
+	if err := reconciler.ensureAuthPublicationResources(context.Background(), cluster, &servitorv1alpha1.OperationReference{ID: operation, Kind: "apply"}); err != nil {
 		t.Fatal(err)
 	}
 	name := pipeline.AuthResourceName(string(cluster.UID))
@@ -228,11 +315,12 @@ func TestPublicAuthResourcesAreUIDBoundAndRevokedBeforePublisherRemoval(t *testi
 	if secret.Labels[authUIDLabel] != string(cluster.UID) || secret.Annotations[authOperationKey] != operation {
 		t.Fatalf("Secret ownership = %#v", secret.ObjectMeta)
 	}
+	attemptName := pipeline.AuthAttemptResourceName(string(cluster.UID), operation)
 	role := &rbacv1.Role{}
-	if err := client.Get(context.Background(), types.NamespacedName{Namespace: "ns", Name: name}, role); err != nil {
+	if err := client.Get(context.Background(), types.NamespacedName{Namespace: "ns", Name: attemptName}, role); err != nil {
 		t.Fatal(err)
 	}
-	if !publisherRoleMatches(role, name) || len(role.Rules[0].ResourceNames) != 1 || role.Rules[0].ResourceNames[0] != name {
+	if !publisherRoleMatches(role, name, cluster.Name, false) || len(role.Rules[0].ResourceNames) != 1 || role.Rules[0].ResourceNames[0] != name {
 		t.Fatalf("publisher Role is not Secret-name-scoped: %#v", role.Rules)
 	}
 	if err := reconciler.revokeAuthPublication(context.Background(), cluster); err != nil {
@@ -242,17 +330,17 @@ func TestPublicAuthResourcesAreUIDBoundAndRevokedBeforePublisherRemoval(t *testi
 		t.Fatalf("Secret survived publication revocation: %v", err)
 	}
 	binding := &rbacv1.RoleBinding{}
-	if err := client.Get(context.Background(), types.NamespacedName{Namespace: "ns", Name: name}, binding); !apierrors.IsNotFound(err) {
+	if err := client.Get(context.Background(), types.NamespacedName{Namespace: "ns", Name: attemptName}, binding); !apierrors.IsNotFound(err) {
 		t.Fatalf("RoleBinding survived publication revocation: %v", err)
 	}
 	if err := reconciler.removeAuthPublisher(context.Background(), cluster); err != nil {
 		t.Fatal(err)
 	}
-	if err := client.Get(context.Background(), types.NamespacedName{Namespace: "ns", Name: name}, role); !apierrors.IsNotFound(err) {
+	if err := client.Get(context.Background(), types.NamespacedName{Namespace: "ns", Name: attemptName}, role); !apierrors.IsNotFound(err) {
 		t.Fatalf("Role survived publisher cleanup: %v", err)
 	}
 	serviceAccount := &corev1.ServiceAccount{}
-	if err := client.Get(context.Background(), types.NamespacedName{Namespace: "ns", Name: name}, serviceAccount); !apierrors.IsNotFound(err) {
+	if err := client.Get(context.Background(), types.NamespacedName{Namespace: "ns", Name: attemptName}, serviceAccount); !apierrors.IsNotFound(err) {
 		t.Fatalf("ServiceAccount survived publisher cleanup: %v", err)
 	}
 }

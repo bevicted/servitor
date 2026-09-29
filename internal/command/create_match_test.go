@@ -12,13 +12,13 @@ var matchDefaults = CreateDefaults{Target: "target-a", Provider: "vpc-gen2"}
 
 var matchCatalog = inventory.Catalog{
 	Version: inventory.CatalogVersion, Target: "target-a", Providers: []string{"vpc-gen2", "classic", "satellite"},
-	Versions: []inventory.Version{{Name: "4.22_openshift", Platform: "openshift", Default: true, Supported: true}}, ResourceGroups: []string{"Platform Team", "shared"},
+	Versions:         []inventory.Version{{Name: "4.22_openshift", Platform: "openshift", Default: true, Supported: true}},
 	VPCLocations:     []inventory.Location{{Name: "us-south-1", Flavors: []string{"bx2.4x16", "shared"}}, {Name: "us-east-1", Flavors: []string{"cx2.2x8"}}},
 	ClassicLocations: []inventory.Location{{Name: "dal10", Flavors: []string{"b3c.4x16"}}}, SatelliteProfile: []inventory.Profile{{Region: "us-south", Name: "bx2-4x16"}},
 }
 
 func TestBareValuesResolveSelectorsBeforeOrderIndependentLocationMatching(t *testing.T) {
-	options, err := ParseCreateOptions("create bx2.4x16 Platform\\ Team vpc-gen2 us-south-1 target-a version=4.22")
+	options, err := ParseCreateOptions("create bx2.4x16 vpc-gen2 us-south-1 target-a version=4.22")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -30,7 +30,7 @@ func TestBareValuesResolveSelectorsBeforeOrderIndependentLocationMatching(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := map[string][]string{"--target": {"target-a"}, "--provider": {"vpc-gen2"}, "--version": {"4.22"}, "--resource-group": {"Platform Team"}, "--zone": {"us-south-1"}, "--flavor": {"bx2.4x16"}}
+	want := map[string][]string{"--target": {"target-a"}, "--provider": {"vpc-gen2"}, "--version": {"4.22"}, "--zone": {"us-south-1"}, "--flavor": {"bx2.4x16"}}
 	if got := options.Values(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("matched values = %#v, want %#v", got, want)
 	}
@@ -61,8 +61,19 @@ func TestEnvironmentTargetShorthandUsesConfiguredEquivalent(t *testing.T) {
 	}
 }
 
+func TestPrivateOnlySurvivesBareSelectorResolution(t *testing.T) {
+	options, err := ParseCreateOptions("create private-only target-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	options, _, err = ResolveBareSelectors(options, matchDefaults, map[string]inventory.TargetConfig{"target-a": {Providers: []string{"vpc-gen2"}}})
+	if err != nil || !options.PrivateOnly() {
+		t.Fatalf("resolved options = %#v, %v", options, err)
+	}
+}
+
 func TestAuthIsConsumedBeforeInventoryMatching(t *testing.T) {
-	options, err := ParseCreateOptions("create auth bx2.4x16 Platform\\ Team vpc-gen2 us-south-1 target-a version=4.22")
+	options, err := ParseCreateOptions("create auth bx2.4x16 vpc-gen2 us-south-1 target-a version=4.22")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,7 +88,7 @@ func TestAuthIsConsumedBeforeInventoryMatching(t *testing.T) {
 }
 
 func TestApproveMetadataSurvivesShorthandMatching(t *testing.T) {
-	options, err := ParseCreateOptions("create approve target-a vpc-gen2 bx2.4x16 Platform\\ Team us-south-1 version=4.22")
+	options, err := ParseCreateOptions("create approve target-a vpc-gen2 bx2.4x16 us-south-1 version=4.22")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,13 +154,13 @@ func TestBareSatelliteProfileMatchesSelectedRegion(t *testing.T) {
 	}
 }
 
-func TestBareReservedAliasesRequireExplicitKey(t *testing.T) {
+func TestBareReservedAliasesDoNotBecomeResourceGroupInput(t *testing.T) {
 	options, err := ParseCreateOptions("create roks")
 	if err != nil || one(options.values, "--version") != "default_openshift" || len(options.BareValues()) != 0 {
 		t.Fatalf("roks parsed as %#v, %v", options, err)
 	}
-	options, err = ParseCreateOptions("create resource-group=roks")
-	if err != nil || one(options.values, "--resource-group") != "roks" {
+	options, err = ParseCreateOptions("create target=roks")
+	if err != nil || one(options.values, "--target") != "roks" {
 		t.Fatalf("keyed reserved value parsed as %#v, %v", options, err)
 	}
 }

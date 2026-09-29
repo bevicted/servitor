@@ -116,8 +116,7 @@ func controllerConfig(operator config.Config) (controller.Config, error) {
 		Namespace: operator.Namespace,
 		Defaults: servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{
 			Version: operator.Defaults.Version, Target: operator.Defaults.Target, Provider: operator.Defaults.Provider,
-			ResourceGroup: operator.Defaults.ResourceGroup,
-		}},
+		}, ResourceGroup: operator.Defaults.ResourceGroup},
 		NetworkBindings: networkBindings,
 		Backend: servitorv1alpha1.BackendIdentity{
 			Version: 1, Bucket: operator.COS.Bucket, Region: operator.COS.Region, Endpoint: operator.COS.Endpoint,
@@ -152,7 +151,7 @@ type allocationClient struct {
 func (c allocationClient) AllocationReader() client.Reader { return c.reader }
 
 func commandDefaults(operator config.Config) command.CreateDefaults {
-	return command.CreateDefaults{Version: operator.Defaults.Version, Target: operator.Defaults.Target, Provider: operator.Defaults.Provider, ResourceGroup: operator.Defaults.ResourceGroup, OpenShiftFlavor: operator.Defaults.OpenShiftFlavor, KubernetesFlavor: operator.Defaults.KubernetesFlavor}
+	return command.CreateDefaults{Version: operator.Defaults.Version, Target: operator.Defaults.Target, Provider: operator.Defaults.Provider, OpenShiftFlavor: operator.Defaults.OpenShiftFlavor, KubernetesFlavor: operator.Defaults.KubernetesFlavor}
 }
 
 func newSlackBot(operator config.Config, kube client.Client, reader client.Reader, responder slackbot.Responder, permalinks slackbot.PermalinkLookup) slackbot.Bot {

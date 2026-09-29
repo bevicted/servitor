@@ -203,6 +203,20 @@ func TestLoadRejectsUnknownFieldsAndMultipleDocuments(t *testing.T) {
 	}
 }
 
+func TestLoadRejectsAuthOwnershipInNetworkPolicy(t *testing.T) {
+	directory := t.TempDir()
+	path := filepath.Join(directory, "config.yaml")
+	for _, field := range []string{"auth_allocation_uid", "auth_attempt_id"} {
+		contents := strings.Replace(validYAML(), "zone: us-south-1", "zone: us-south-1, "+field+": runtime-identity", 1)
+		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(path); err == nil || !strings.Contains(err.Error(), field) {
+			t.Fatalf("Load(%s) error = %v, want rejected ownership field", field, err)
+		}
+	}
+}
+
 func TestLoadUsesMountedWorkloadReferences(t *testing.T) {
 	directory := t.TempDir()
 	path := filepath.Join(directory, "config.yaml")

@@ -149,6 +149,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.
 // reconcileReady observes durable lease state. It intentionally uses requeues
 // rather than process-local timers, so expiry remains correct after restarts.
 func (r *Reconciler) reconcileReady(ctx context.Context, cluster *servitorv1alpha1.ServitorCluster) (ctrl.Result, error) {
+	if isReadyAdoptedApplyOperation(cluster) {
+		cluster.Status.Operation = nil
+		return ctrl.Result{}, r.Status().Update(ctx, cluster)
+	}
 	expiry := cluster.Status.LeaseExpiresAt
 	if expiry == nil {
 		return r.recordExtensionOutcome(ctx, cluster, servitorv1alpha1.ExtensionOutcomeNotReady, nil, nil)
@@ -171,10 +175,31 @@ func (r *Reconciler) reconcileReady(ctx context.Context, cluster *servitorv1alph
 		}
 		return r.recordExtensionOutcome(ctx, cluster, servitorv1alpha1.ExtensionOutcomeApplied, expiry, &metav1.Time{Time: newExpiry})
 	}
+	if cluster.Status.Operation != nil && cluster.Status.Operation.Kind == "auth-retry" {
+		return r.observeOperation(ctx, cluster)
+	}
+	if result, handled, err := r.reconcileAuthRetry(ctx, cluster); handled || err != nil {
+		return result, err
+	}
 	if result, handled, err := r.reconcileAuthDelivery(ctx, cluster); handled || err != nil {
 		return result, err
 	}
 	return ctrl.Result{RequeueAfter: expiry.Time.Sub(r.now())}, nil
+}
+
+// isReadyAdoptedApplyOperation identifies the terminal status shape left by
+// controllers that adopted an apply report but did not clear its operation.
+func isReadyAdoptedApplyOperation(cluster *servitorv1alpha1.ServitorCluster) bool {
+	operation := cluster.Status.Operation
+	ready := meta.FindStatusCondition(cluster.Status.Conditions, "Ready")
+	return cluster.Status.Phase == servitorv1alpha1.PhaseReady &&
+		cluster.Status.Ready != nil &&
+		cluster.Status.ResolvedOptions != nil &&
+		cluster.Status.Recovery != nil &&
+		ready != nil && ready.Status == metav1.ConditionTrue && ready.Reason == "ReportAdopted" &&
+		operation != nil && operation.Kind == "apply" && operation.Adopted &&
+		operation.ID == applyID(string(cluster.UID)) &&
+		operation.PipelineRunName == pipeline.DeterministicRunName(string(cluster.UID), operation.ID)
 }
 
 // extensionRecorded makes the persisted target an idempotency key. Retried
@@ -243,11 +268,13 @@ func (r *Reconciler) reconcileApproval(ctx context.Context, cluster *servitorv1a
 		if cluster.Status.ReviewGeneration == 0 || cluster.Generation <= cluster.Status.ReviewGeneration || cluster.Status.ReviewApproval == "approved" {
 			return ctrl.Result{RequeueAfter: deadline.Time.Sub(r.now())}, nil
 		}
-		operation := applyID(string(cluster.UID))
+		operationID := applyID(string(cluster.UID))
+		attempt := initialAuthAttemptID(string(cluster.UID), operationID, "")
+		operation := &servitorv1alpha1.OperationReference{ID: operationID, Kind: "apply", AuthAttemptID: attempt, PipelineRunName: pipeline.DeterministicRunName(string(cluster.UID), operationID), StartedAt: metav1.NewTime(r.now())}
 		if err := r.ensureAuthPublicationResources(ctx, cluster, operation); err != nil {
 			return ctrl.Result{}, err
 		}
-		cluster.Status.Operation = &servitorv1alpha1.OperationReference{ID: operation, Kind: "apply", PipelineRunName: pipeline.DeterministicRunName(string(cluster.UID), operation), StartedAt: metav1.NewTime(r.now())}
+		cluster.Status.Operation = operation
 		// Persist this before run creation: a lost create response must be treated as
 		// an apply that may have reached Terraform.
 		cluster.Status.ApplyDispatched = true
@@ -268,6 +295,9 @@ func (r *Reconciler) requestCleanup(ctx context.Context, cluster *servitorv1alph
 	cluster.Status.CleanupRequested = true
 	if request := cluster.Spec.Lifecycle.AuthRequestTimestamp; request != "" && (cluster.Status.AuthDelivery == nil || cluster.Status.AuthDelivery.RequestTimestamp != request || cluster.Status.AuthDelivery.Outcome == authDeliveryPending) {
 		cluster.Status.AuthDelivery = &servitorv1alpha1.AuthDeliveryStatus{RequestTimestamp: request, AttemptTimestamp: request, Outcome: authDeliveryCancelled}
+	}
+	if retry := cluster.Status.AuthRetry; retry != nil && retry.Outcome == "Pending" {
+		retry.Outcome = "Cancelled"
 	}
 	if reason == servitorv1alpha1.CleanupReasonApplyFailed {
 		cluster.Status.Diagnostic = "ApplyFailed"
@@ -293,7 +323,7 @@ func (r *Reconciler) reconcileCleanup(ctx context.Context, cluster *servitorv1al
 		return r.removeFinalizer(ctx, cluster)
 	}
 	if cluster.Status.Phase == servitorv1alpha1.PhaseUnresolved {
-		return ctrl.Result{}, nil
+		return r.startCleanupRecovery(ctx, cluster)
 	}
 	if err := r.revokeAuthPublication(ctx, cluster); err != nil {
 		return ctrl.Result{}, err
@@ -327,11 +357,17 @@ func (r *Reconciler) waitForCleanupOperation(ctx context.Context, cluster *servi
 			if operation.Kind == "destroy" {
 				reason = "DestroyRunMissing"
 			}
+			if cleanupRecoveryOperation(cluster) {
+				return r.failCleanupRecovery(ctx, cluster, reason)
+			}
 			return r.unresolved(ctx, cluster, reason, errors.New("persisted dispatched PipelineRun is missing"))
 		}
 		if operation.Kind == "destroy" {
 			created, buildErr := pipeline.NewDestroyRun(cluster, r.Config.TaskConfig)
 			if buildErr != nil {
+				if cleanupRecoveryOperation(cluster) {
+					return r.failCleanupRecovery(ctx, cluster, "InvalidCleanupRecovery")
+				}
 				return r.unresolved(ctx, cluster, "InvalidOperation", buildErr)
 			}
 			if createErr := r.Create(ctx, created); createErr != nil && !apierrors.IsAlreadyExists(createErr) {
@@ -348,7 +384,17 @@ func (r *Reconciler) waitForCleanupOperation(ctx context.Context, cluster *servi
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+	if operation.Kind == "auth-retry" && run.Spec.Status != tektonv1.PipelineRunSpecStatusCancelled {
+		run.Spec.Status = tektonv1.PipelineRunSpecStatusCancelled
+		if err := r.Update(ctx, run); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: cleanupProgressRequeue}, nil
+	}
 	if !pipeline.MatchingRun(run, string(cluster.UID), operation.ID) {
+		if cleanupRecoveryOperation(cluster) {
+			return r.failCleanupRecovery(ctx, cluster, "CleanupRecoveryIdentityMismatch")
+		}
 		return r.unresolved(ctx, cluster, "OperationIdentityMismatch", errors.New("existing PipelineRun does not match active operation"))
 	}
 	done, succeeded := pipeline.Succeeded(run)
@@ -401,10 +447,16 @@ func (r *Reconciler) handleDestroyReportError(ctx context.Context, cluster *serv
 	if pipeline.IsLogReadError(err) && !apierrors.IsNotFound(err) && !apierrors.IsBadRequest(err) {
 		return ctrl.Result{RequeueAfter: r.logRetry()}, nil
 	}
+	if cleanupRecoveryOperation(cluster) {
+		return r.failCleanupRecovery(ctx, cluster, "CleanupRecoveryReportMissing")
+	}
 	return r.unresolved(ctx, cluster, "DestroyReportMissing", err)
 }
 
 func (r *Reconciler) recordDestroyFailure(ctx context.Context, cluster *servitorv1alpha1.ServitorCluster) (ctrl.Result, error) {
+	if cleanupRecoveryOperation(cluster) {
+		return r.failCleanupRecovery(ctx, cluster, "CleanupRecoveryFailed")
+	}
 	cleanup := cluster.Status.Cleanup
 	cluster.Status.Operation = nil
 	cluster.Status.Diagnostic = "DestroyFailed"
@@ -432,11 +484,14 @@ func (r *Reconciler) completeCleanup(ctx context.Context, cluster *servitorv1alp
 		return ctrl.Result{}, err
 	}
 	now := metav1.NewTime(r.now())
+	if cleanupRecoveryOperation(cluster) {
+		cluster.Status.CleanupRecovery.State = servitorv1alpha1.CleanupRecoverySucceeded
+		cluster.Status.CleanupRecovery.CompletedAt = &now
+	}
 	cluster.Status.Operation = nil
 	cluster.Status.Cleanup.NextRetryAt = nil
 	cluster.Status.Cleanup.CompletedAt = &now
 	cluster.Status.Phase = servitorv1alpha1.PhaseCleanupComplete
-	cluster.Status.Diagnostic = ""
 	setCondition(cluster, "Ready", metav1.ConditionFalse, "CleanupComplete", "cleanup completed")
 	if err := r.Status().Update(ctx, cluster); err != nil {
 		return ctrl.Result{}, err
@@ -511,11 +566,18 @@ func (r *Reconciler) observeOperation(ctx context.Context, cluster *servitorv1al
 		}
 		var created *tektonv1.PipelineRun
 		var buildErr error
+		if (operation.Kind == "apply" || operation.Kind == "auth-retry") && authEligible(cluster) {
+			if err := r.ensureAuthPublicationResources(ctx, cluster, operation); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
 		switch operation.Kind {
 		case "plan":
 			created, buildErr = pipeline.NewPlanningRun(cluster, r.Config.TaskConfig)
 		case "apply":
 			created, buildErr = pipeline.NewApplyRun(cluster, r.Config.TaskConfig)
+		case "auth-retry":
+			created, buildErr = pipeline.NewAuthRetryRun(cluster, r.Config.TaskConfig)
 		default:
 			buildErr = errors.New("unsupported operation kind")
 		}
@@ -539,6 +601,22 @@ func (r *Reconciler) observeOperation(ctx context.Context, cluster *servitorv1al
 		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 	}
 	if !succeeded {
+		if operation.Kind == "plan" {
+			cluster.Status.Diagnostic = r.planFailureDiagnostic(ctx, cluster, run)
+		}
+		if operation.Kind == "auth-retry" {
+			return r.finishAuthRetry(ctx, cluster, servitorv1alpha1.AuthStatus{Availability: "unavailable", Reason: "auth-state-failure"})
+		}
+		if operation.Kind == "apply" && authEligible(cluster) {
+			certificate, err := r.recoverPendingAuthCertificateReference(ctx, cluster, operationAuthAttempt(operation))
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			trackAuthCertificateReference(cluster, certificate)
+			if err := r.revokeAuthAttempt(ctx, cluster, operationAuthAttempt(operation)); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
 		if operation.Kind == "apply" {
 			return r.requestCleanup(ctx, cluster, servitorv1alpha1.CleanupReasonApplyFailed)
 		}
@@ -548,6 +626,31 @@ func (r *Reconciler) observeOperation(ctx context.Context, cluster *servitorv1al
 		return ctrl.Result{}, nil
 	}
 	return r.adoptReport(ctx, cluster, run)
+}
+
+// planFailureDiagnostic retains only an allowlisted termination reason from the
+// execute step. It never copies TaskRun messages, logs, arguments, or values.
+func (r *Reconciler) planFailureDiagnostic(ctx context.Context, cluster *servitorv1alpha1.ServitorCluster, run *tektonv1.PipelineRun) string {
+	taskRunName := pipeline.ReportTaskRunName(run)
+	if taskRunName == "" {
+		return "PlanFailed"
+	}
+	taskRun := &tektonv1.TaskRun{}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: taskRunName}, taskRun); err != nil {
+		return "PlanExecuteFailed"
+	}
+	for _, step := range taskRun.Status.Steps {
+		if step.Name != "execute" || step.Terminated == nil {
+			continue
+		}
+		switch step.Terminated.Reason {
+		case "Error", "OOMKilled", "ContainerCannotRun", "StartError", "DeadlineExceeded":
+			return "PlanExecute" + step.Terminated.Reason
+		default:
+			return "PlanExecuteFailed"
+		}
+	}
+	return "PlanExecuteFailed"
 }
 
 func (r *Reconciler) adoptReport(ctx context.Context, cluster *servitorv1alpha1.ServitorCluster, run *tektonv1.PipelineRun) (ctrl.Result, error) {
@@ -588,6 +691,12 @@ func (r *Reconciler) adoptReport(ctx context.Context, cluster *servitorv1alpha1.
 		setCondition(cluster, "PlanningSucceeded", metav1.ConditionFalse, "PlanRejected", "selected option validation rejected the plan")
 		return r.requestCleanup(ctx, cluster, servitorv1alpha1.CleanupReasonPlanningFailed)
 	}
+	if cluster.Status.Operation.Kind == "auth-retry" {
+		if cluster.Status.ResolvedOptions == nil || !sameFrozenNetwork(cluster.Status.ResolvedOptions.Network, report.ResolvedOptions.Network) || !networkMatchesRecovery(cluster.Status.ResolvedOptions, report.Recovery.Values) || report.Auth == nil || !validAdoptedAuth(*report.Auth, *cluster.Status.ResolvedOptions, string(cluster.UID), r.now()) {
+			return r.unresolved(ctx, cluster, "InvalidAuthRetryReport", errors.New("auth retry report does not match frozen allocation"))
+		}
+		return r.finishAuthRetry(ctx, cluster, *report.Auth)
+	}
 	if cluster.Status.Operation.Kind == "plan" {
 		if cluster.Status.ResolvedOptions == nil || !sameFrozenNetwork(cluster.Status.ResolvedOptions.Network, report.ResolvedOptions.Network) || !networkMatchesRecovery(cluster.Status.ResolvedOptions, report.Recovery.Values) {
 			return r.unresolved(ctx, cluster, "InvalidReport", errors.New("planning report does not match the frozen network binding"))
@@ -601,6 +710,7 @@ func (r *Reconciler) adoptReport(ctx context.Context, cluster *servitorv1alpha1.
 		cluster.Status.ReviewGeneration = cluster.Generation
 		cluster.Status.ReviewApproval = cluster.Spec.Lifecycle.Approval
 		setCondition(cluster, "PlanningSucceeded", metav1.ConditionTrue, "ReportAdopted", "validated planning report adopted")
+		cluster.Status.Operation = nil
 	} else {
 		if cluster.Status.ResolvedOptions == nil {
 			return r.unresolved(ctx, cluster, "InvalidReport", errors.New("apply report has no frozen network binding"))
@@ -615,10 +725,22 @@ func (r *Reconciler) adoptReport(ctx context.Context, cluster *servitorv1alpha1.
 		if eligible != (report.Auth != nil) {
 			return r.unresolved(ctx, cluster, "InvalidReport", errors.New("auth report does not match the frozen eligibility policy"))
 		}
-		if report.Auth != nil && !validAdoptedAuth(*report.Auth, cluster.Status.ResolvedOptions.Network.AuthPolicy, r.now()) {
+		if report.Auth != nil && (!validAdoptedAuth(*report.Auth, *cluster.Status.ResolvedOptions, string(cluster.UID), r.now()) || report.Auth.AttemptID != operationAuthAttempt(cluster.Status.Operation)) {
 			return r.unresolved(ctx, cluster, "InvalidReport", errors.New("auth report does not match frozen policy"))
 		}
+		if eligible {
+			if report.Auth != nil && report.Auth.Availability == "unavailable" {
+				if err := r.revokeAuthPublication(ctx, cluster); err != nil {
+					return ctrl.Result{}, err
+				}
+			} else if err := r.revokeAuthAttempt(ctx, cluster, operationAuthAttempt(cluster.Status.Operation)); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
 		cluster.Status.Ready = &report.Ready
+		if report.Auth != nil {
+			trackAuthCertificateReference(cluster, report.Auth.Certificate)
+		}
 		cluster.Status.Auth = report.Auth
 		cluster.Status.Phase = servitorv1alpha1.PhaseReady
 		// This is the sole Ready transition. Never recompute this persisted
@@ -628,6 +750,7 @@ func (r *Reconciler) adoptReport(ctx context.Context, cluster *servitorv1alpha1.
 			cluster.Status.LeaseExpiresAt = &expiry
 		}
 		setCondition(cluster, "Ready", metav1.ConditionTrue, "ReportAdopted", "validated apply report adopted")
+		cluster.Status.Operation = nil
 	}
 	return ctrl.Result{}, r.Status().Update(ctx, cluster)
 }
@@ -641,6 +764,9 @@ func (r *Reconciler) snapshot(cluster *servitorv1alpha1.ServitorCluster) error {
 	overlay(&resolved.UserOptions, cluster.Spec.UserOptions)
 	if resolved.Provider == "satellite" {
 		return errors.New("Satellite provisioning is not supported")
+	}
+	if resolved.PrivateOnly && resolved.Provider != "vpc-gen2" {
+		return errors.New("private-only is supported only for VPC Gen 2")
 	}
 	platform, err := command.InferPlatform(resolved.Version)
 	if err != nil {
@@ -660,7 +786,6 @@ func (r *Reconciler) snapshot(cluster *servitorv1alpha1.ServitorCluster) error {
 		}
 		if network.AuthPolicy != nil {
 			policy := *network.AuthPolicy
-			policy.AllocationUID = string(cluster.UID)
 			if err := policy.Validate(); err != nil {
 				return fmt.Errorf("invalid frozen auth policy: %w", err)
 			}
@@ -668,6 +793,9 @@ func (r *Reconciler) snapshot(cluster *servitorv1alpha1.ServitorCluster) error {
 		}
 		if !validFrozenNetwork(network) {
 			return errors.New("no configured existing network binding for target")
+		}
+		if resolved.PrivateOnly && network.AuthPolicy == nil {
+			return errors.New("private-only requires configured VPN authentication policy")
 		}
 		if resolved.Zone != "" && resolved.Zone != network.Zone {
 			return errors.New("requested zone is not configured for the selected network binding")
@@ -727,14 +855,23 @@ func networkMatchesRecovery(options *servitorv1alpha1.ResolvedOptions, values se
 	if network.VPCRegion == "" {
 		network.VPCRegion = regionFromZone(network.Zone)
 	}
-	return validFrozenNetwork(network) && values.AccountID == network.AccountID && values.VPCRegion == network.VPCRegion && values.Zone == network.Zone && values.VPCID == network.VPCID && len(values.SubnetIDs) == 1 && values.SubnetIDs[0] == network.SubnetID && len(values.PublicGatewayIDs) == 1 && values.PublicGatewayIDs[0] == network.PublicGatewayID && reflect.DeepEqual(values.AuthPolicy, network.AuthPolicy)
+	return validFrozenNetwork(network) && values.ResourceGroupName == options.ResourceGroup && values.PrivateOnly == options.PrivateOnly && values.AccountID == network.AccountID && values.VPCRegion == network.VPCRegion && values.Zone == network.Zone && values.VPCID == network.VPCID && len(values.SubnetIDs) == 1 && values.SubnetIDs[0] == network.SubnetID && len(values.PublicGatewayIDs) == 1 && values.PublicGatewayIDs[0] == network.PublicGatewayID && reflect.DeepEqual(values.AuthPolicy, network.AuthPolicy)
 }
 
-func validAdoptedAuth(status servitorv1alpha1.AuthStatus, policy *servitorv1alpha1.FrozenAuthPolicy, now time.Time) bool {
+func validAdoptedAuth(status servitorv1alpha1.AuthStatus, options servitorv1alpha1.ResolvedOptions, allocationUID string, now time.Time) bool {
+	policy := options.Network.AuthPolicy
+	if !validAuthCertificateReference(status, allocationUID) || !validClearedAuthCertificateReferences(status.ClearedCertificateReferences, allocationUID) {
+		return false
+	}
 	switch status.Availability {
-	case "unavailable", "unsupported":
-		return status.Mode == "" && status.Expiry == ""
+	case "unavailable":
+		return status.Mode == "" && status.Expiry == "" && servitorv1alpha1.ValidAuthFailureReason(status.Reason) && validAdoptedAuthCleanup(status.CleanupOutcome, status.CleanupReason, status.CleanupStage)
+	case "unsupported":
+		return options.Provider == "satellite" && status.Mode == "" && status.Expiry == "" && status.Reason == "" && validAdoptedAuthCleanup(status.CleanupOutcome, status.CleanupReason, status.CleanupStage)
 	case "available":
+		if status.Reason != "" || !validAdoptedAuthCleanup(status.CleanupOutcome, status.CleanupReason, status.CleanupStage) || !availableAuthModeMatches(options, status.Mode) {
+			return false
+		}
 		switch status.Mode {
 		case "public":
 			return status.Expiry == ""
@@ -751,6 +888,107 @@ func validAdoptedAuth(status servitorv1alpha1.AuthStatus, policy *servitorv1alph
 		}
 	}
 	return false
+}
+
+// availableAuthModeMatches binds credential delivery to the endpoint policy
+// frozen in the allocation, never to a worker-reported mode.
+func availableAuthModeMatches(options servitorv1alpha1.ResolvedOptions, mode string) bool {
+	if options.Provider == "satellite" {
+		return false
+	}
+	if options.Provider == "vpc-gen2" && options.PrivateOnly {
+		return mode == "vpn"
+	}
+	return mode == "public"
+}
+
+func validAdoptedAuthCleanup(outcome, reason, stage string) bool {
+	if outcome == "" {
+		return reason == "" && stage == "" // retained statuses before cleanup observability
+	}
+	if !servitorv1alpha1.ValidAuthCleanupOutcome(outcome) || stage != "" && !servitorv1alpha1.ValidAuthCleanupStage(stage) {
+		return false
+	}
+	if outcome == "pending" {
+		return servitorv1alpha1.ValidAuthCleanupReason(reason)
+	}
+	return reason == "" && stage == ""
+}
+
+func validAuthCertificateReference(status servitorv1alpha1.AuthStatus, allocationUID string) bool {
+	certificate := status.Certificate
+	if certificate == nil {
+		return status.Reason != "certificate-cleanup-pending" && status.CleanupOutcome != "pending"
+	}
+	if allocationUID == "" || certificate.AllocationUID != allocationUID || len(certificate.AllocationUID) > 128 || certificate.AttemptID == "" || len(certificate.ID) > 256 || len(certificate.AttemptID) > 128 {
+		return false
+	}
+	if certificate.AttemptID != status.AttemptID && (status.Availability != "unavailable" || status.CleanupOutcome != "pending") {
+		return false
+	}
+	return certificate.ID != "" || status.Reason == "certificate-cleanup-pending" || status.CleanupOutcome == "pending"
+}
+
+func validClearedAuthCertificateReferences(references []servitorv1alpha1.AuthCertificateReference, allocationUID string) bool {
+	if len(references) > servitorv1alpha1.MaxAuthCertificateReferences {
+		return false
+	}
+	seen := make(map[servitorv1alpha1.AuthCertificateReference]struct{}, len(references))
+	for _, reference := range references {
+		if reference.AllocationUID != allocationUID || reference.AttemptID == "" || len(reference.ID) > 256 || len(reference.AttemptID) > 128 {
+			return false
+		}
+		if _, duplicate := seen[reference]; duplicate {
+			return false
+		}
+		seen[reference] = struct{}{}
+	}
+	return true
+}
+
+func trackAuthCertificateReference(cluster *servitorv1alpha1.ServitorCluster, certificate *servitorv1alpha1.AuthCertificateReference) {
+	deduplicateAuthCertificateReferences(cluster)
+	if certificate == nil {
+		return
+	}
+	for _, existing := range cluster.Status.AuthCertificateReferences {
+		if existing == *certificate {
+			return
+		}
+	}
+	if len(cluster.Status.AuthCertificateReferences) < servitorv1alpha1.MaxAuthCertificateReferences {
+		cluster.Status.AuthCertificateReferences = append(cluster.Status.AuthCertificateReferences, *certificate)
+	}
+}
+
+func deduplicateAuthCertificateReferences(cluster *servitorv1alpha1.ServitorCluster) {
+	seen := make(map[servitorv1alpha1.AuthCertificateReference]struct{}, len(cluster.Status.AuthCertificateReferences))
+	references := cluster.Status.AuthCertificateReferences[:0]
+	for _, reference := range cluster.Status.AuthCertificateReferences {
+		if _, duplicate := seen[reference]; duplicate {
+			continue
+		}
+		seen[reference] = struct{}{}
+		references = append(references, reference)
+	}
+	cluster.Status.AuthCertificateReferences = references
+}
+
+func clearAuthCertificateReferences(cluster *servitorv1alpha1.ServitorCluster, references []servitorv1alpha1.AuthCertificateReference) {
+	if len(references) == 0 {
+		return
+	}
+	resolved := make(map[servitorv1alpha1.AuthCertificateReference]struct{}, len(references))
+	for _, reference := range references {
+		resolved[reference] = struct{}{}
+	}
+	remaining := cluster.Status.AuthCertificateReferences[:0]
+	for _, reference := range cluster.Status.AuthCertificateReferences {
+		if _, cleaned := resolved[reference]; !cleaned {
+			remaining = append(remaining, reference)
+		}
+	}
+	cluster.Status.AuthCertificateReferences = remaining
 }
 
 func validFrozenNetwork(network servitorv1alpha1.FrozenNetwork) bool {
@@ -799,6 +1037,23 @@ func (r *Reconciler) reviewTimeout() time.Duration {
 }
 func planningID(uid string) string { return operationID(uid, "plan") }
 func applyID(uid string) string    { return operationID(uid, "apply") }
+
+// initialAuthAttemptID is the persisted auth ownership identity for an initial
+// apply or an auth retry. It hashes every identity component before applying a
+// fixed, DNS-safe prefix, keeping the CRD value safely bounded.
+func initialAuthAttemptID(allocationUID, operationID, requestID string) string {
+	digest := sha256.Sum256([]byte(allocationUID + "\x00" + operationID + "\x00" + requestID))
+	return "auth-attempt-" + hex.EncodeToString(digest[:16])
+}
+func operationAuthAttempt(operation *servitorv1alpha1.OperationReference) string {
+	if operation != nil && operation.AuthAttemptID != "" {
+		return operation.AuthAttemptID
+	}
+	if operation == nil {
+		return ""
+	}
+	return operation.ID // legacy operations used their operation identity as the attempt.
+}
 func destroyID(uid string, retry int) string {
 	return operationID(uid, fmt.Sprintf("destroy-%d", retry))
 }
@@ -828,8 +1083,8 @@ func overlay(dst *servitorv1alpha1.UserOptions, supplied servitorv1alpha1.UserOp
 	if supplied.Version != "" {
 		dst.Version = supplied.Version
 	}
-	if supplied.ResourceGroup != "" {
-		dst.ResourceGroup = supplied.ResourceGroup
+	if supplied.PrivateOnly {
+		dst.PrivateOnly = true
 	}
 	if supplied.Zone != "" {
 		dst.Zone = supplied.Zone

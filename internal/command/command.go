@@ -19,6 +19,9 @@ type Runner struct {
 	Stdout    io.Writer
 	Stderr    io.Writer
 	Log       io.Writer
+	// Env is the complete child environment. A nil Env inherits the parent
+	// environment; a non-nil empty Env clears it.
+	Env []string
 }
 
 // Result contains bounded command output.
@@ -54,7 +57,7 @@ func (r Runner) Run(ctx context.Context, name string, args ...string) (Result, e
 	}
 	defer closeFile(stderrReader)
 
-	process, err := os.StartProcess(executable, append([]string{name}, args...), &os.ProcAttr{Files: []*os.File{os.Stdin, stdoutWriter, stderrWriter}})
+	process, err := os.StartProcess(executable, append([]string{name}, args...), &os.ProcAttr{Env: r.Env, Files: []*os.File{os.Stdin, stdoutWriter, stderrWriter}})
 	if err != nil {
 		closeFile(stdoutWriter)
 		closeFile(stderrWriter)
