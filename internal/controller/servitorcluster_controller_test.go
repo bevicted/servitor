@@ -164,6 +164,52 @@ func TestReconcilePersistsOneOperationAndAdoptsMatchingReport(t *testing.T) {
 	}
 }
 
+func TestAdoptReportRejectsMismatchedResolvedHeadlampBeforeOverwritingFrozenOptions(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := servitorv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := tektonv1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	frozen := servitorv1alpha1.ResolvedOptions{
+		UserOptions:   servitorv1alpha1.UserOptions{Provider: "vpc-gen2", Version: "4.22", Headlamp: true},
+		ResourceGroup: "Default",
+		ClusterName:   "cluster",
+		Network:       frozenNetwork(),
+	}
+	cluster := &servitorv1alpha1.ServitorCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "cluster", Namespace: "ns", UID: "cluster-uid"},
+		Status: servitorv1alpha1.ServitorClusterStatus{
+			Phase:           servitorv1alpha1.PhasePlanning,
+			ResolvedOptions: &frozen,
+			Operation:       &servitorv1alpha1.OperationReference{ID: "plan-cluster", Kind: "plan", PipelineRunName: "run"},
+		},
+	}
+	run := &tektonv1.PipelineRun{ObjectMeta: metav1.ObjectMeta{Name: "run", Namespace: "ns"}, Status: tektonv1.PipelineRunStatus{PipelineRunStatusFields: tektonv1.PipelineRunStatusFields{ChildReferences: []tektonv1.ChildStatusReference{{TypeMeta: runtime.TypeMeta{Kind: "TaskRun"}, Name: "task", PipelineTaskName: "operation"}}}}}
+	task := &tektonv1.TaskRun{ObjectMeta: metav1.ObjectMeta{Name: "task", Namespace: "ns"}, Status: tektonv1.TaskRunStatus{TaskRunStatusFields: tektonv1.TaskRunStatusFields{PodName: "pod", Steps: []tektonv1.StepState{{Name: pipeline.ReportContainerName, Container: "step-report"}}}}}
+	reported := frozen
+	reported.Headlamp = false
+	recovery := validRecoveryMetadata()
+	recovery.Values.Headlamp = true
+	report, err := json.Marshal(pipeline.Report{Version: 1, ClusterUID: string(cluster.UID), OperationID: "plan-cluster", ResolvedOptions: reported, Recovery: recovery})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&servitorv1alpha1.ServitorCluster{}, &tektonv1.PipelineRun{}, &tektonv1.TaskRun{}).WithObjects(cluster, run, task).Build()
+	reconciler := &Reconciler{Client: client, Logs: reportLogs{data: report}}
+	if _, err := reconciler.adoptReport(context.Background(), cluster, run); err != nil {
+		t.Fatal(err)
+	}
+	stored := &servitorv1alpha1.ServitorCluster{}
+	if err := client.Get(context.Background(), types.NamespacedName{Namespace: "ns", Name: "cluster"}, stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status.Phase != servitorv1alpha1.PhaseUnresolved || stored.Status.Diagnostic != "InvalidReport" || stored.Status.ResolvedOptions == nil || !stored.Status.ResolvedOptions.Headlamp {
+		t.Fatalf("mismatched report overwrote frozen Headlamp selection: %+v", stored.Status)
+	}
+}
+
 func TestAuthReportAdoptionRequiresCompleteFrozenPolicyMetadata(t *testing.T) {
 	now := time.Date(2026, 9, 16, 0, 0, 0, 0, time.UTC)
 	policy := &servitorv1alpha1.FrozenAuthPolicy{VPNServerID: "vpn", SecretsManagerID: "secrets", SecretsManagerRegion: "eu-gb", SecretGroupID: "group", CertificateTemplate: "template", Issuer: "issuer", TTL: "2h"}

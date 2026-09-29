@@ -698,7 +698,7 @@ func (r *Reconciler) adoptReport(ctx context.Context, cluster *servitorv1alpha1.
 		return r.finishAuthRetry(ctx, cluster, *report.Auth)
 	}
 	if cluster.Status.Operation.Kind == "plan" {
-		if cluster.Status.ResolvedOptions == nil || !sameFrozenNetwork(cluster.Status.ResolvedOptions.Network, report.ResolvedOptions.Network) || !networkMatchesRecovery(cluster.Status.ResolvedOptions, report.Recovery.Values) {
+		if cluster.Status.ResolvedOptions == nil || cluster.Status.ResolvedOptions.Headlamp != report.ResolvedOptions.Headlamp || !sameFrozenNetwork(cluster.Status.ResolvedOptions.Network, report.ResolvedOptions.Network) || !networkMatchesRecovery(cluster.Status.ResolvedOptions, report.Recovery.Values) {
 			return r.unresolved(ctx, cluster, "InvalidReport", errors.New("planning report does not match the frozen network binding"))
 		}
 		cluster.Status.ResolvedOptions = &report.ResolvedOptions
