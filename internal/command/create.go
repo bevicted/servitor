@@ -17,7 +17,7 @@ type CreateDefaults struct {
 // CreateRequest is the validated, shell-free provisioning option vector.
 type CreateRequest struct {
 	Target, Platform, Version, Provider              string
-	PrivateOnly                                      bool
+	Headlamp, PrivateOnly                            bool
 	WorkerShape, WorkerCount                         string
 	Location, Zone, Datacenter                       string
 	SatelliteZones                                   []string
@@ -61,6 +61,7 @@ type ExplicitCreateOptions struct {
 	bare             []string
 	authRequested    bool
 	approveRequested bool
+	headlamp         bool
 	privateOnly      bool
 }
 
@@ -83,6 +84,9 @@ func (o ExplicitCreateOptions) AuthRequested() bool { return o.authRequested }
 
 // ApproveRequested reports whether create requested automatic approval after review delivery.
 func (o ExplicitCreateOptions) ApproveRequested() bool { return o.approveRequested }
+
+// HeadlampRequested reports whether create requested the managed Headlamp add-on.
+func (o ExplicitCreateOptions) HeadlampRequested() bool { return o.headlamp }
 
 // PrivateOnly reports whether create requested a private endpoint only.
 func (o ExplicitCreateOptions) PrivateOnly() bool { return o.privateOnly }
@@ -113,11 +117,12 @@ func ParseCreateOptions(text string) (ExplicitCreateOptions, error) {
 	var bare []string
 	authRequested := false
 	approveRequested := false
+	headlamp := false
 	privateOnly := false
 	for _, word := range words[1:] {
 		key, value, assigned := strings.Cut(word, "=")
 		if !assigned {
-			if word == "auth" || word == "approve" || word == "private-only" {
+			if word == "auth" || word == "approve" || word == "headlamp" || word == "private-only" {
 				if seen[word] {
 					return ExplicitCreateOptions{}, fmt.Errorf("%s may only be supplied once", word)
 				}
@@ -127,6 +132,8 @@ func ParseCreateOptions(text string) (ExplicitCreateOptions, error) {
 					authRequested = true
 				case "approve":
 					approveRequested = true
+				case "headlamp":
+					headlamp = true
 				case "private-only":
 					privateOnly = true
 				}
@@ -191,7 +198,7 @@ func ParseCreateOptions(text string) (ExplicitCreateOptions, error) {
 		seen[flag] = true
 		values[flag] = append(values[flag], value)
 	}
-	options := ExplicitCreateOptions{values: values, bare: bare, authRequested: authRequested, approveRequested: approveRequested, privateOnly: privateOnly}
+	options := ExplicitCreateOptions{values: values, bare: bare, authRequested: authRequested, approveRequested: approveRequested, headlamp: headlamp, privateOnly: privateOnly}
 	if _, err := options.WorkerCount(); err != nil {
 		return ExplicitCreateOptions{}, err
 	}
@@ -256,6 +263,7 @@ func ResolveCreateOptions(options ExplicitCreateOptions, defaults CreateDefaults
 		Platform:            platform,
 		Version:             version,
 		Provider:            one(values, "--provider"),
+		Headlamp:            options.headlamp,
 		PrivateOnly:         options.privateOnly,
 		WorkerShape:         first(one(values, "--flavor"), one(values, "--machine-type"), one(values, "--satellite-host-profile")),
 		WorkerCount:         one(values, "--worker-count"),

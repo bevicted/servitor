@@ -38,6 +38,7 @@ type UserOptions struct {
 	Target                         string   `json:"target,omitempty"`
 	Provider                       string   `json:"provider,omitempty"`
 	Version                        string   `json:"version,omitempty"`
+	Headlamp                       bool     `json:"headlamp,omitempty"`
 	PrivateOnly                    bool     `json:"privateOnly,omitempty"`
 	Zone                           string   `json:"zone,omitempty"`
 	Flavor                         string   `json:"flavor,omitempty"`
@@ -344,6 +345,9 @@ func (v RecoveryValues) validate() error {
 	if !validRecoveryTextSlice(v.SubnetIDs, 8, 128, true) || !validRecoveryTextSlice(v.PublicGatewayIDs, 8, 128, true) || !validRecoveryTextSlice(v.SatelliteZones, 3, 64, false) || !validRecoveryTextSlice(v.SatelliteWorkerInstanceIDs, 32, 128, true) {
 		return fmt.Errorf("recovery metadata has invalid value lists")
 	}
+	if v.Headlamp && (v.Platform != "kubernetes" || v.ClusterMode != "vpc" && v.ClusterMode != "classic") {
+		return fmt.Errorf("recovery metadata has invalid Headlamp values")
+	}
 	switch v.ClusterMode {
 	case "vpc":
 		if !recoveryZonePattern.MatchString(v.Zone) || strings.TrimSuffix(v.Zone, v.Zone[strings.LastIndex(v.Zone, "-"):]) != v.Region || v.VPCRegion != v.Region || v.AccountID == "" || !recoveryFlavorPattern.MatchString(v.Flavor) || v.SatelliteManagedFrom != "" || v.SatelliteLocationID != "" || len(v.SatelliteZones) != 0 || len(v.SatelliteWorkerInstanceIDs) != 0 {
@@ -417,6 +421,7 @@ type RecoveryValues struct {
 	Platform                       string            `json:"platform"`
 	KubeVersion                    string            `json:"kube_version"`
 	WorkerCount                    int               `json:"worker_count"`
+	Headlamp                       bool              `json:"headlamp,omitempty"`
 	PrivateOnly                    bool              `json:"private_only,omitempty"`
 	Zone                           string            `json:"zone,omitempty"`
 	Flavor                         string            `json:"flavor,omitempty"`

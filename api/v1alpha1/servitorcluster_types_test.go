@@ -328,6 +328,58 @@ func TestCRDPrunesRemovedPlatformAndStrictTypedValidationRejectsIt(t *testing.T)
 	}
 }
 
+func TestCRDPersistsHeadlampAtEveryLifecycleBoundary(t *testing.T) {
+	contents, err := os.ReadFile(filepath.Join("..", "..", "config", "crd", "bases", "servitor.bevicted.github.io_servitorclusters.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]any
+	if err := yaml.Unmarshal(contents, &document); err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var crd apiextensionsv1.CustomResourceDefinition
+	if err := json.Unmarshal(encoded, &crd); err != nil {
+		t.Fatal(err)
+	}
+	var schemaProps apiextensions.JSONSchemaProps
+	if err := apiextensionsv1.Convert_v1_JSONSchemaProps_To_apiextensions_JSONSchemaProps(crd.Spec.Versions[0].Schema.OpenAPIV3Schema, &schemaProps, nil); err != nil {
+		t.Fatal(err)
+	}
+	structural, err := structuralschema.NewStructural(&schemaProps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	object := map[string]any{
+		"apiVersion": "servitor.bevicted.github.io/v1alpha1", "kind": "ServitorCluster",
+		"metadata": map[string]any{"name": "headlamp"},
+		"spec": map[string]any{
+			"slack":       map[string]any{"ownerID": "U1", "channelID": "C1", "threadTimestamp": "1.2"},
+			"userOptions": map[string]any{"headlamp": true},
+			"lifecycle":   map[string]any{"initialLeaseSeconds": int64(3600), "retrySeconds": []any{int64(60)}},
+		},
+		"status": map[string]any{
+			"resolvedOptions": map[string]any{"headlamp": true},
+			"recovery":        map[string]any{"values": map[string]any{"headlamp": true}},
+		},
+	}
+	pruning.PruneWithOptions(object, structural, true, structuralschema.UnknownFieldPathOptions{})
+	var decoded ServitorCluster
+	if err := k8sruntime.DefaultUnstructuredConverter.FromUnstructuredWithValidation(object, &decoded, true); err != nil {
+		t.Fatal(err)
+	}
+	if !decoded.Spec.UserOptions.Headlamp || decoded.Status.ResolvedOptions == nil || !decoded.Status.ResolvedOptions.Headlamp || decoded.Status.Recovery == nil || !decoded.Status.Recovery.Values.Headlamp {
+		t.Fatalf("Headlamp fields were pruned: %+v", decoded)
+	}
+	data, err := json.Marshal(ServitorCluster{})
+	if err != nil || strings.Contains(string(data), "headlamp") {
+		t.Fatalf("false Headlamp did not use omitted-field semantics: %s, %v", data, err)
+	}
+}
+
 func TestCRDPersistsPrivateOnlyRecoveryAndRejectsRawResourceGroup(t *testing.T) {
 	contents, err := os.ReadFile(filepath.Join("..", "..", "config", "crd", "bases", "servitor.bevicted.github.io_servitorclusters.yaml"))
 	if err != nil {

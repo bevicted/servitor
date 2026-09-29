@@ -324,17 +324,22 @@ func reviewConfigRows(options *servitorv1alpha1.ResolvedOptions) [][]string {
 	if options.UserOptions.PrivateOnly {
 		endpointPolicy = "private only"
 	}
-	return [][]string{
+	rows := [][]string{
 		{"Name:", options.ClusterName},
 		{"Target:", options.Target},
 		{"Platform:", platformLabel(options.Platform) + " " + options.Version},
 		{"Provider:", providerLabel(options.Provider)},
 		{"Location:", location},
 		{"Resource group:", options.ResourceGroup},
-		{"Endpoints:", endpointPolicy},
-		{"Worker:", worker},
-		{"Network:", networkDescription(options)},
 	}
+	if options.Headlamp {
+		rows = append(rows, []string{"Headlamp:", "enabled"})
+	}
+	return append(rows,
+		[]string{"Endpoints:", endpointPolicy},
+		[]string{"Worker:", worker},
+		[]string{"Network:", networkDescription(options)},
+	)
 }
 
 func platformLabel(platform string) string {

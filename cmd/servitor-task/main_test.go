@@ -642,6 +642,24 @@ func TestResolvedOptionsFromValuesAdoptsAllProviderValues(t *testing.T) {
 	}
 }
 
+func TestHeadlampHandoffPreservesExplicitTrueAndFalse(t *testing.T) {
+	for _, selected := range []bool{false, true} {
+		options := servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Provider: "classic", Version: "1.31", Headlamp: selected}, Platform: "kubernetes"}
+		args := strings.Join(optionArgs(options), "\n")
+		if !strings.Contains(args, fmt.Sprintf("--headlamp=%t", selected)) {
+			t.Fatalf("Headlamp=%t arguments=%q", selected, args)
+		}
+		values := servitorv1alpha1.RecoveryValues{ClusterName: "classic-cluster", ResourceGroupName: "Default", Region: "us-south", ClusterMode: "classic", Platform: "kubernetes", KubeVersion: "1.31", WorkerCount: 3, Headlamp: selected, Datacenter: "dal10", MachineType: "bx2.4x16", PublicVLANID: "123", PrivateVLANID: "456"}
+		if _, err := resolvedOptionsFromValues(options, values); err != nil {
+			t.Fatalf("Headlamp=%t recovery rejected: %v", selected, err)
+		}
+		values.Headlamp = !selected
+		if _, err := resolvedOptionsFromValues(options, values); err == nil {
+			t.Fatalf("Headlamp=%t mismatched recovery was accepted", selected)
+		}
+	}
+}
+
 func TestOptionArgsOmitsVPCIDForClassic(t *testing.T) {
 	args := optionArgs(servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Provider: "classic", Version: "1.31", Datacenter: "dal10", MachineType: "bx2.4x16", PublicVLANID: "123", PrivateVLANID: "456"}, Platform: "kubernetes"})
 	for _, arg := range args {
@@ -660,7 +678,7 @@ func TestRunPlanPassesKubernetesPlatformToICT(t *testing.T) {
 	resultFile := filepath.Join(directory, "result.json")
 	planResultFile := filepath.Join(directory, "plan-result.json")
 	planShowFile := filepath.Join(directory, "plan-show.json")
-	values := frozenVPCValues(servitorv1alpha1.RecoveryValues{ClusterName: "cluster", ResourceGroupName: "Default", Region: "us-south", ClusterMode: "vpc", Platform: "kubernetes", KubeVersion: "1.31", WorkerCount: 2, Flavor: "bx2.4x16"})
+	values := frozenVPCValues(servitorv1alpha1.RecoveryValues{ClusterName: "cluster", ResourceGroupName: "Default", Region: "us-south", ClusterMode: "vpc", Platform: "kubernetes", KubeVersion: "1.31", WorkerCount: 2, Headlamp: true, Flavor: "bx2.4x16"})
 	recovery := servitorv1alpha1.RecoveryMetadata{
 		Version: 1, Target: "target", TFVarsSHA256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
 		Endpoints: map[string]string{
@@ -690,7 +708,7 @@ func TestRunPlanPassesKubernetesPlatformToICT(t *testing.T) {
 		t.Fatal(err)
 	}
 	planningConfig, apiKey := planningValidationFixture(t, directory)
-	options := frozenVPCOptions(servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Target: "target", Provider: "vpc-gen2", Version: "1.31"}, Platform: "kubernetes"})
+	options := frozenVPCOptions(servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Target: "target", Provider: "vpc-gen2", Version: "1.31", Headlamp: true}, Platform: "kubernetes"})
 	endpoints, err := frozenRecoveryEndpoints(planningConfig, options)
 	if err != nil {
 		t.Fatal(err)
@@ -707,7 +725,7 @@ func TestRunPlanPassesKubernetesPlatformToICT(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, wanted := range []string{"--provider\nvpc-gen2", "--platform\nkubernetes", "--version\n1.31"} {
+	for _, wanted := range []string{"--provider\nvpc-gen2", "--platform\nkubernetes", "--version\n1.31", "--headlamp=true"} {
 		if !strings.Contains(string(trace), wanted) {
 			t.Fatalf("ICT plan arguments = %q, want %q", trace, wanted)
 		}

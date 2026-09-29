@@ -773,6 +773,9 @@ func (r *Reconciler) snapshot(cluster *servitorv1alpha1.ServitorCluster) error {
 		return fmt.Errorf("infer platform: %w", err)
 	}
 	resolved.Platform = platform
+	if resolved.Headlamp && (platform != "kubernetes" || (resolved.Provider != "vpc-gen2" && resolved.Provider != "classic")) {
+		return errors.New("headlamp requires Kubernetes on VPC Gen 2 or Classic")
+	}
 	if resolved.Provider == "vpc-gen2" {
 		network, found := r.Config.NetworkBindings[resolved.Target]
 		if !found {
@@ -848,6 +851,9 @@ func regionFromZone(zone string) string {
 }
 
 func networkMatchesRecovery(options *servitorv1alpha1.ResolvedOptions, values servitorv1alpha1.RecoveryValues) bool {
+	if options == nil || options.Headlamp != values.Headlamp {
+		return false
+	}
 	if options.Provider != "vpc-gen2" {
 		return options.Network == (servitorv1alpha1.FrozenNetwork{})
 	}
@@ -1083,6 +1089,9 @@ func overlay(dst *servitorv1alpha1.UserOptions, supplied servitorv1alpha1.UserOp
 	if supplied.Version != "" {
 		dst.Version = supplied.Version
 	}
+	if supplied.Headlamp {
+		dst.Headlamp = true
+	}
 	if supplied.PrivateOnly {
 		dst.PrivateOnly = true
 	}
@@ -1152,6 +1161,7 @@ func NewPodLogReader(client kubernetes.Interface) pipeline.ReportLogReader {
 func (r *Reconciler) SetupWithManager(manager ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(manager).For(&servitorv1alpha1.ServitorCluster{}).Watches(&tektonv1.PipelineRun{}, handler.EnqueueRequestsFromMapFunc(r.mapPipelineRun)).Complete(r)
 }
+
 func (r *Reconciler) mapPipelineRun(ctx context.Context, object client.Object) []ctrl.Request {
 	run, ok := object.(*tektonv1.PipelineRun)
 	if !ok || run.Labels[pipeline.ClusterUIDLabel] == "" || (r.Config.Namespace != "" && run.Namespace != r.Config.Namespace) {

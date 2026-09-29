@@ -56,7 +56,7 @@ func ResolveBareSelectors(options ExplicitCreateOptions, defaults CreateDefaults
 	if !contains(targetConfig.Providers, provider) {
 		return ExplicitCreateOptions{}, inventory.TargetConfig{}, fmt.Errorf("provider is not configured for the selected target; use provider=value")
 	}
-	return ExplicitCreateOptions{values: values, bare: bare, authRequested: options.authRequested, approveRequested: options.approveRequested, privateOnly: options.privateOnly}, targetConfig, nil
+	return ExplicitCreateOptions{values: values, bare: bare, authRequested: options.authRequested, approveRequested: options.approveRequested, headlamp: options.headlamp, privateOnly: options.privateOnly}, targetConfig, nil
 }
 
 // MatchBareCreateOptions promotes uniquely recognized common catalog values.
@@ -109,7 +109,7 @@ func MatchBareCreateOptions(options ExplicitCreateOptions, defaults CreateDefaul
 		}
 		values[flag] = []string{value}
 	}
-	return ExplicitCreateOptions{values: values, authRequested: options.authRequested, approveRequested: options.approveRequested, privateOnly: options.privateOnly}, nil
+	return ExplicitCreateOptions{values: values, authRequested: options.authRequested, approveRequested: options.approveRequested, headlamp: options.headlamp, privateOnly: options.privateOnly}, nil
 }
 
 func matchingRoles(catalog inventory.Catalog, provider, zone, datacenter, satelliteRegion, value string) []string {

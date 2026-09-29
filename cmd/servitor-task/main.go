@@ -382,6 +382,9 @@ func runPlan(ctx context.Context, uid, operation string, options servitorv1alpha
 	if options.Provider == "satellite" {
 		return writeReport(reportFile, pipeline.Report{Version: 1, ClusterUID: uid, OperationID: operation, PlanRejection: &servitorv1alpha1.PlanRejection{ReasonCode: "provider_not_supported", OptionKey: "provider"}})
 	}
+	if err := validateHeadlamp(options); err != nil {
+		return err
+	}
 	options, rejection, err := validatePlanOptions(ctx, planningInventoryConfig, apiKey, options)
 	if err != nil {
 		return err
@@ -429,7 +432,7 @@ func runPlan(ctx context.Context, uid, operation string, options servitorv1alpha
 	if err != nil {
 		return fmt.Errorf("ICT produced invalid recovery values: %w", err)
 	}
-	if recoveryOptions.Version != options.Version || recoveryOptions.Platform != options.Platform {
+	if recoveryOptions.Version != options.Version || recoveryOptions.Platform != options.Platform || recoveryOptions.Headlamp != options.Headlamp {
 		return errors.New("ICT recovery values are inconsistent with planning result")
 	}
 	if err := validateRecoveredNetwork(options, result.Recovery.Values); err != nil {
@@ -630,6 +633,9 @@ func runApplyWithAttempt(ctx context.Context, uid, operation string, options ser
 	}
 	if options.Provider == "satellite" {
 		return errors.New("Satellite provisioning is not supported")
+	}
+	if err := validateHeadlamp(options); err != nil {
+		return err
 	}
 	recovery, contextFile, err := frozenContext(operation, backendFile, recoveryFile, resultFile)
 	if err != nil {
@@ -1046,9 +1052,15 @@ func fenceAuthRetryAfterIssuance(ctx context.Context, ictPath, operation, contex
 }
 
 func runDestroy(ctx context.Context, uid, operation string, options servitorv1alpha1.ResolvedOptions, backendFile, recoveryFile, resultFile, reportFile, ictPath string, references ...[]servitorv1alpha1.AuthCertificateReference) error {
+	if err := validateHeadlamp(options); err != nil {
+		return err
+	}
 	recovery, contextFile, err := frozenContext(operation, backendFile, recoveryFile, resultFile)
 	if err != nil {
 		return err
+	}
+	if recovery.Values.Headlamp != options.Headlamp {
+		return errors.New("frozen recovery Headlamp selection does not match the request")
 	}
 	if recovery.Values.AuthPolicy != nil {
 		authContextFile, err := authContext(operation, recovery, resultFile)
@@ -1218,6 +1230,9 @@ func validateFrozenNetwork(options servitorv1alpha1.ResolvedOptions) error {
 }
 
 func validateRecoveredNetwork(options servitorv1alpha1.ResolvedOptions, values servitorv1alpha1.RecoveryValues) error {
+	if options.Headlamp != values.Headlamp {
+		return errors.New("ICT Headlamp selection does not match the frozen request")
+	}
 	if options.Provider != "vpc-gen2" {
 		return nil
 	}
@@ -1273,10 +1288,14 @@ func resolvedOptionsFromValues(options servitorv1alpha1.ResolvedOptions, values 
 	if options.PrivateOnly != values.PrivateOnly {
 		return servitorv1alpha1.ResolvedOptions{}, errors.New("ICT recovery private-only policy does not match frozen request")
 	}
+	if options.Headlamp != values.Headlamp {
+		return servitorv1alpha1.ResolvedOptions{}, errors.New("ICT recovery Headlamp selection does not match frozen request")
+	}
 	options.UserOptions = servitorv1alpha1.UserOptions{
 		Target:                         options.Target,
 		Provider:                       provider,
 		Version:                        values.KubeVersion,
+		Headlamp:                       values.Headlamp,
 		PrivateOnly:                    values.PrivateOnly,
 		Zone:                           values.Zone,
 		Flavor:                         values.Flavor,
@@ -1300,6 +1319,13 @@ func resolvedOptionsFromValues(options servitorv1alpha1.ResolvedOptions, values 
 	return options, nil
 }
 
+func validateHeadlamp(options servitorv1alpha1.ResolvedOptions) error {
+	if options.Headlamp && (options.Platform != "kubernetes" || options.Provider != "vpc-gen2" && options.Provider != "classic") {
+		return errors.New("headlamp requires Kubernetes on VPC Gen 2 or Classic")
+	}
+	return nil
+}
+
 func optionArgs(options servitorv1alpha1.ResolvedOptions) []string {
 	o := options.UserOptions
 	args := []string{}
@@ -1313,6 +1339,7 @@ func optionArgs(options servitorv1alpha1.ResolvedOptions) []string {
 	add("--platform", options.Platform)
 	add("--version", o.Version)
 	add("--resource-group", options.ResourceGroup)
+	args = append(args, "--headlamp="+strconv.FormatBool(o.Headlamp))
 	if o.PrivateOnly {
 		args = append(args, "--private-only")
 	}

@@ -290,6 +290,21 @@ func (b Bot) create(ctx context.Context, message Message, text string, respond f
 		respond(rejectedText("Satellite provisioning is not supported."))
 		return true
 	}
+	if userOptions.Headlamp {
+		version := userOptions.Version
+		if version == "" {
+			version = b.Defaults.Version
+		}
+		platform, err := command.InferPlatform(version)
+		if err != nil {
+			respond(rejectedText("Headlamp requires a Kubernetes version. Use `@servitor create kubernetes headlamp`."))
+			return true
+		}
+		if platform != "kubernetes" {
+			respond(rejectedText("Headlamp requires Kubernetes. Use `@servitor create kubernetes headlamp`."))
+			return true
+		}
+	}
 	authRequested := options.AuthRequested()
 	autoApprove := options.ApproveRequested()
 	allocations, err := b.ownerAllocations(ctx, message.User)
@@ -1018,7 +1033,7 @@ func userOptions(options command.ExplicitCreateOptions) (servitorv1alpha1.UserOp
 	if err != nil {
 		return servitorv1alpha1.UserOptions{}, err
 	}
-	return servitorv1alpha1.UserOptions{Target: one("--target"), Provider: one("--provider"), Version: one("--version"), PrivateOnly: options.PrivateOnly(), Zone: one("--zone"), Flavor: one("--flavor"), Datacenter: one("--datacenter"), MachineType: one("--machine-type"), PublicVLANID: one("--public-vlan-id"), PrivateVLANID: one("--private-vlan-id"), SatelliteZones: append([]string(nil), values["--satellite-zone"]...), SatelliteManagedFrom: one("--satellite-managed-from"), SatelliteLocationID: one("--satellite-location-id"), SatelliteHostImage: one("--satellite-host-image"), SatelliteHostProfile: one("--satellite-host-profile"), SatelliteSSHKeyID: one("--satellite-ssh-key-id"), SatelliteWorkerInstanceIDs: append([]string(nil), values["--satellite-worker-instance-id"]...), SatelliteWorkerOperatingSystem: one("--satellite-worker-operating-system"), WorkerCount: workerCount}, nil
+	return servitorv1alpha1.UserOptions{Target: one("--target"), Provider: one("--provider"), Version: one("--version"), Headlamp: options.HeadlampRequested(), PrivateOnly: options.PrivateOnly(), Zone: one("--zone"), Flavor: one("--flavor"), Datacenter: one("--datacenter"), MachineType: one("--machine-type"), PublicVLANID: one("--public-vlan-id"), PrivateVLANID: one("--private-vlan-id"), SatelliteZones: append([]string(nil), values["--satellite-zone"]...), SatelliteManagedFrom: one("--satellite-managed-from"), SatelliteLocationID: one("--satellite-location-id"), SatelliteHostImage: one("--satellite-host-image"), SatelliteHostProfile: one("--satellite-host-profile"), SatelliteSSHKeyID: one("--satellite-ssh-key-id"), SatelliteWorkerInstanceIDs: append([]string(nil), values["--satellite-worker-instance-id"]...), SatelliteWorkerOperatingSystem: one("--satellite-worker-operating-system"), WorkerCount: workerCount}, nil
 }
 func seconds(values []time.Duration) []int64 {
 	result := make([]int64, len(values))
@@ -1190,7 +1205,7 @@ func helpOverview(maintainer bool, maxAllocationsPerUser int) []string {
 	return []string{text + "```"}
 }
 func createHelp(defaults command.CreateDefaults, maxAllocationsPerUser int) []string {
-	return []string{fmt.Sprintf("Create a cluster from the configured channel root:\n```\n@servitor create [key=value ...]\n\nExamples\n  @servitor create version=roks\n  @servitor create version=iks worker-count=3 auth=true\n\nCommon\n  target=<target>          environment; default: %s\n  provider=<provider>      vpc-gen2 | classic; default: %s\n  version=<version>        roks (OpenShift) | iks (Kubernetes) | numeric stream\n                          default: %s\n  worker-count=<1-100>      workers\n  auth=true                DM authentication when ready, if available; default: false\n  approve=true             auto-approve after the plan is delivered; default: false\n\nVPC Gen 2\n  zone=<zone>\n  flavor=<flavor>\n  private-only=true        omit the public endpoint; default: false\n\nClassic\n  datacenter=<datacenter>\n  machine-type=<type>\n  public-vlan-id=<id>\n  private-vlan-id=<id>\n```\nUp to %d active allocations per user.\nWithout `approve=true`, reply `yes` or `no` in the plan thread before its deadline.\nAll accepted forms: `help create-options` (DM).", safeHelpCell(defaults.Target), safeHelpCell(defaults.Provider), safeHelpCell(defaults.Version), maxAllocationsPerUser)}
+	return []string{fmt.Sprintf("Create a cluster from the configured channel root:\n```\n@servitor create [key=value ...]\n\nExamples\n  @servitor create version=roks\n  @servitor create kubernetes headlamp\n  @servitor create version=iks worker-count=3 auth=true\n\nCommon\n  target=<target>          environment; default: %s\n  provider=<provider>      vpc-gen2 | classic; default: %s\n  version=<version>        roks (OpenShift) | iks (Kubernetes) | numeric stream\n                          default: %s\n  worker-count=<1-100>      workers\n  auth=true                DM authentication when ready, if available; default: false\n  approve=true             auto-approve after the plan is delivered; default: false\n  headlamp                 install the managed add-on; Kubernetes only\n\nVPC Gen 2\n  zone=<zone>\n  flavor=<flavor>\n  private-only=true        omit the public endpoint; default: false\n\nClassic\n  datacenter=<datacenter>\n  machine-type=<type>\n  public-vlan-id=<id>\n  private-vlan-id=<id>\n```\nUp to %d active allocations per user.\nWithout `approve=true`, reply `yes` or `no` in the plan thread before its deadline.\nAll accepted forms: `help create-options` (DM).", safeHelpCell(defaults.Target), safeHelpCell(defaults.Provider), safeHelpCell(defaults.Version), maxAllocationsPerUser)}
 }
 func createOptionsHelp() []string {
 	return []string{"```\nKeyed form                    Bare form\n  target=<target>               <target>\n  provider=<provider>           <provider>\n  version=<version>             <version>\n  worker-count=<1-100>           -\n  auth=true | auth=false        auth\n  approve=true | approve=false  approve\n  private-only=true             private-only\n  private-only=false            -\n  zone=<zone>                   <zone>\n  flavor=<flavor>               <flavor>\n  datacenter=<datacenter>       <datacenter>\n  machine-type=<type>           <type>\n  public-vlan-id=<id>           -\n  private-vlan-id=<id>          -\n\nTargets\n  <configured-target>\n  prestage | pretest\n  stage | test\n\nProviders\n  vpc-gen2 | classic\n\nVersions\n  roks | openshift | default_openshift\n  iks | kubernetes | k8s | default_kubernetes\n  <numeric-version>\n  <numeric-version>_openshift\n\nVersion refinement\n  <alias> <compatible-numeric-version>\n```"}

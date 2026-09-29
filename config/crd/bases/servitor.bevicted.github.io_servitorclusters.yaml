@@ -79,6 +79,7 @@ spec:
                         maxLength: 32,
                         pattern: '(^[0-9]+\.[0-9]+(\.[0-9]+)?(_openshift)?$)|(^default_(openshift|kubernetes)$)',
                       }
+                    headlamp: { type: boolean }
                     privateOnly: { type: boolean }
                     resourceGroup:
                       {
@@ -208,6 +209,7 @@ spec:
                         pattern: '(^[0-9]+\.[0-9]+(\.[0-9]+)?(_openshift)?$)|(^default_(openshift|kubernetes)$)',
                       }
                     resourceGroup: { type: string, maxLength: 128 }
+                    headlamp: { type: boolean }
                     privateOnly: { type: boolean }
                     zone: { type: string, maxLength: 64 }
                     flavor: { type: string, maxLength: 64 }
@@ -481,6 +483,7 @@ spec:
                         kube_version: { type: string, maxLength: 32 }
                         worker_count:
                           { type: integer, minimum: 1, maximum: 100 }
+                        headlamp: { type: boolean }
                         private_only: { type: boolean }
                         zone: { type: string, maxLength: 64 }
                         flavor: { type: string, maxLength: 64 }

@@ -179,6 +179,7 @@ func TestRuntimeContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	installControllerRBAC(t, ctx, admin)
+	verifyHeadlampRuntimePersistence(t, ctx, adminConfig, runtimeContractNamespace)
 	verifyAutoApproveTransitionContract(t, ctx, admin)
 	autoKey, autoResponses := seedAutoApproveContract(t, ctx, admin)
 	manualKey := seedManualApproveFalseContract(t, ctx, admin, autoResponses)
@@ -395,6 +396,57 @@ func TestRuntimeContract(t *testing.T) {
 		}
 		return nil
 	})
+}
+
+func verifyHeadlampRuntimePersistence(t *testing.T, ctx context.Context, config *rest.Config, namespace string) {
+	t.Helper()
+	clusters, err := dynamic.NewForConfig(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resources := clusters.Resource(schema.GroupVersionResource{Group: "servitor.bevicted.github.io", Version: "v1alpha1", Resource: "servitorclusters"}).Namespace(namespace)
+	cluster := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "servitor.bevicted.github.io/v1alpha1", "kind": "ServitorCluster",
+		"metadata": map[string]any{"name": "headlamp-round-trip"},
+		"spec": map[string]any{
+			"slack":       map[string]any{"ownerID": "UHEADLAMP", "channelID": "CCHANNEL", "threadTimestamp": "1.2"},
+			"userOptions": map[string]any{"headlamp": true, "version": "1.31"},
+			"lifecycle":   map[string]any{"initialLeaseSeconds": int64(3600), "retrySeconds": []any{int64(60)}},
+		},
+	}}
+	stored, err := resources.Create(ctx, cluster, metav1.CreateOptions{FieldValidation: metav1.FieldValidationStrict})
+	if err != nil {
+		t.Fatal(err)
+	}
+	status := map[string]any{
+		"resolvedOptions": map[string]any{"headlamp": true},
+		"recovery":        map[string]any{"values": map[string]any{"headlamp": true}},
+	}
+	if err := unstructured.SetNestedMap(stored.Object, status, "status"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resources.UpdateStatus(ctx, stored, metav1.UpdateOptions{FieldValidation: metav1.FieldValidationStrict}); err != nil {
+		t.Fatal(err)
+	}
+	stored, err = resources.Get(ctx, stored.GetName(), metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, fields := range [][]string{{"spec", "userOptions", "headlamp"}, {"status", "resolvedOptions", "headlamp"}, {"status", "recovery", "values", "headlamp"}} {
+		value, found, err := unstructured.NestedBool(stored.Object, fields...)
+		if err != nil || !found || !value {
+			t.Fatalf("Headlamp %v persisted as value=%t found=%t err=%v", fields, value, found, err)
+		}
+	}
+	if err := unstructured.SetNestedField(stored.Object, false, "spec", "userOptions", "headlamp"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resources.Update(ctx, stored, metav1.UpdateOptions{}); !apierrors.IsInvalid(err) {
+		t.Fatalf("Headlamp immutable update error = %v, want invalid", err)
+	}
+	if err := resources.Delete(ctx, "headlamp-round-trip", metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func verifyAutoApproveTransitionContract(t *testing.T, ctx context.Context, kube client.Client) {

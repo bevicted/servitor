@@ -61,6 +61,21 @@ func TestEnvironmentTargetShorthandUsesConfiguredEquivalent(t *testing.T) {
 	}
 }
 
+func TestHeadlampSurvivesBothInventoryReconstructionPaths(t *testing.T) {
+	options, err := ParseCreateOptions("create headlamp auth approve target-a vpc-gen2 bx2.4x16 us-south-1 kubernetes")
+	if err != nil {
+		t.Fatal(err)
+	}
+	options, _, err = ResolveBareSelectors(options, matchDefaults, map[string]inventory.TargetConfig{"target-a": {Providers: []string{"vpc-gen2", "classic", "satellite"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	options, err = MatchBareCreateOptions(options, matchDefaults, matchCatalog)
+	if err != nil || !options.HeadlampRequested() || !options.AuthRequested() || !options.ApproveRequested() {
+		t.Fatalf("matched options = %#v, err=%v", options, err)
+	}
+}
+
 func TestPrivateOnlySurvivesBareSelectorResolution(t *testing.T) {
 	options, err := ParseCreateOptions("create private-only target-a")
 	if err != nil {
@@ -162,5 +177,9 @@ func TestBareReservedAliasesDoNotBecomeResourceGroupInput(t *testing.T) {
 	options, err = ParseCreateOptions("create target=roks")
 	if err != nil || one(options.values, "--target") != "roks" {
 		t.Fatalf("keyed reserved value parsed as %#v, %v", options, err)
+	}
+	options, err = ParseCreateOptions("create target=headlamp")
+	if err != nil || one(options.values, "--target") != "headlamp" || options.HeadlampRequested() {
+		t.Fatalf("keyed Headlamp target parsed as %#v, %v", options, err)
 	}
 }

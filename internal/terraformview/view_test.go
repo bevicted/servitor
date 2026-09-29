@@ -33,6 +33,17 @@ func TestParsePlanExposesOnlyResourceMetadata(t *testing.T) {
 	}
 }
 
+func TestTerraformViewAcceptsHeadlampAddOnIdentityOnly(t *testing.T) {
+	plan, err := ParsePlan([]byte(`{"format_version":"1.2","resource_changes":[{"address":"ibm_container_addons.headlamp[0]","mode":"managed","type":"ibm_container_addons","name":"headlamp","change":{"actions":["create"],"after":{"id":"addon-id","name":"headlamp","cluster":"private"},"after_sensitive":{"cluster":false}}}]}`))
+	if err != nil || len(plan.Resources) != 1 || plan.Resources[0].Role() != "Add-on" || plan.Resources[0].ID != "addon-id" || plan.Resources[0].DisplayName != "headlamp" {
+		t.Fatalf("Headlamp plan = %#v, %v", plan, err)
+	}
+	state, err := ParseState([]byte(`{"format_version":"1.2","values":{"root_module":{"resources":[{"address":"ibm_container_addons.headlamp[0]","mode":"managed","type":"ibm_container_addons","name":"headlamp","values":{"id":"addon-id","name":"headlamp","cluster":"private"}}]}}}`))
+	if err != nil || len(state.Resources) != 1 || state.Resources[0].Role() != "Add-on" || state.Resources[0].DisplayName != "headlamp" {
+		t.Fatalf("Headlamp state = %#v, %v", state, err)
+	}
+}
+
 func TestParsePlanIgnoresUnreportedSensitiveMetadata(t *testing.T) {
 	plan, err := ParsePlan([]byte(`{"format_version":"1.2","resource_changes":[{"address":"ibm_container_vpc_cluster.cluster","mode":"managed","type":"ibm_container_vpc_cluster","name":"cluster","change":{"actions":["create"],"after":{"name":"cluster","token":"secret"},"after_sensitive":{"token":true}}}]}`))
 	if err != nil {

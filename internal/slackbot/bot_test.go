@@ -319,6 +319,38 @@ func TestCreateRejectsSatelliteBeforePlanning(t *testing.T) {
 	assertRejected(t, matched, responses, "satellite auth approve")
 }
 
+func TestCreateHeadlampRequiresKubernetesAndPersistsFixedSelection(t *testing.T) {
+	for _, test := range []struct {
+		name, text string
+		accepted   bool
+	}{
+		{name: "explicit Kubernetes", text: "kubernetes headlamp", accepted: true},
+		{name: "Kubernetes numeric stream with auth approval", text: "headlamp auth approve version=1.31", accepted: true},
+		{name: "OpenShift default", text: "headlamp"},
+		{name: "OpenShift alias", text: "roks headlamp"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			bot, responses := botForTest(t)
+			bot.Defaults = command.CreateDefaults{Version: "4.22", Provider: "vpc-gen2"}
+			event := Envelope{ID: test.name, Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "<@BOT> create " + test.text, Timestamp: "1710000000.000100"}}
+			if err := bot.Handle(context.Background(), event); err != nil {
+				t.Fatal(err)
+			}
+			cluster := &servitorv1alpha1.ServitorCluster{}
+			err := bot.Client.Get(context.Background(), types.NamespacedName{Namespace: bot.Namespace, Name: allocationClusterName("C1", event.Message.Timestamp)}, cluster)
+			if test.accepted {
+				if err != nil || !cluster.Spec.UserOptions.Headlamp || len(responses.responses) == 0 || responses.responses[0].Text != "Planning..." {
+					t.Fatalf("Headlamp create cluster=%+v responses=%+v err=%v", cluster, responses.responses, err)
+				}
+				return
+			}
+			if !apierrors.IsNotFound(err) || len(responses.responses) != 1 || !containsText(responses.responses[0].Text, "Headlamp requires Kubernetes") {
+				t.Fatalf("Headlamp rejection cluster=%+v responses=%+v err=%v", cluster, responses.responses, err)
+			}
+		})
+	}
+}
+
 func TestCreateAutoApprovePersistsImmutableIntentAndEarlyYesDoesNotMutate(t *testing.T) {
 	bot, responses := botForTest(t)
 	event := Envelope{ID: "auto-create", Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "<@BOT> create approve version=4.22", Timestamp: "1710000000.000100"}}
@@ -1150,13 +1182,13 @@ func TestCreateRejectsPlatformAndHelpDoesNotAdvertiseIt(t *testing.T) {
 }
 
 func TestCreateHelpDistinguishesDefaultsAliasesStreamsAndProvider(t *testing.T) {
-	const want = "Create a cluster from the configured channel root:\n```\n@servitor create [key=value ...]\n\nExamples\n  @servitor create version=roks\n  @servitor create version=iks worker-count=3 auth=true\n\nCommon\n  target=<target>          environment; default: target-a\n  provider=<provider>      vpc-gen2 | classic; default: vpc-gen2\n  version=<version>        roks (OpenShift) | iks (Kubernetes) | numeric stream\n                          default: 4.17\n  worker-count=<1-100>      workers\n  auth=true                DM authentication when ready, if available; default: false\n  approve=true             auto-approve after the plan is delivered; default: false\n\nVPC Gen 2\n  zone=<zone>\n  flavor=<flavor>\n  private-only=true        omit the public endpoint; default: false\n\nClassic\n  datacenter=<datacenter>\n  machine-type=<type>\n  public-vlan-id=<id>\n  private-vlan-id=<id>\n```\nUp to 7 active allocations per user.\nWithout `approve=true`, reply `yes` or `no` in the plan thread before its deadline.\nAll accepted forms: `help create-options` (DM)."
+	const want = "Create a cluster from the configured channel root:\n```\n@servitor create [key=value ...]\n\nExamples\n  @servitor create version=roks\n  @servitor create kubernetes headlamp\n  @servitor create version=iks worker-count=3 auth=true\n\nCommon\n  target=<target>          environment; default: target-a\n  provider=<provider>      vpc-gen2 | classic; default: vpc-gen2\n  version=<version>        roks (OpenShift) | iks (Kubernetes) | numeric stream\n                          default: 4.17\n  worker-count=<1-100>      workers\n  auth=true                DM authentication when ready, if available; default: false\n  approve=true             auto-approve after the plan is delivered; default: false\n  headlamp                 install the managed add-on; Kubernetes only\n\nVPC Gen 2\n  zone=<zone>\n  flavor=<flavor>\n  private-only=true        omit the public endpoint; default: false\n\nClassic\n  datacenter=<datacenter>\n  machine-type=<type>\n  public-vlan-id=<id>\n  private-vlan-id=<id>\n```\nUp to 7 active allocations per user.\nWithout `approve=true`, reply `yes` or `no` in the plan thread before its deadline.\nAll accepted forms: `help create-options` (DM)."
 
 	pages := createHelp(command.CreateDefaults{Target: "target-a", Provider: "vpc-gen2", Version: "4.17"}, 7)
 	if len(pages) != 1 || pages[0] != want {
 		t.Fatalf("create help = %#v, want %#v", pages, want)
 	}
-	for _, forbidden := range []string{"openshift", "default_openshift", "kubernetes", "k8s", "default_kubernetes", "target=synthetic-target", "prestage", "pretest", "Satellite", "certificate", "auth=false", "approve=false", "private-only=false", "platform=", "resource-group=", "config=", "--"} {
+	for _, forbidden := range []string{"openshift", "default_openshift", "k8s", "default_kubernetes", "target=synthetic-target", "prestage", "pretest", "Satellite", "certificate", "auth=false", "approve=false", "private-only=false", "headlamp=", "platform=", "resource-group=", "config=", "--"} {
 		if containsText(want, forbidden) {
 			t.Fatalf("create help advertises unsupported form %q: %s", forbidden, want)
 		}

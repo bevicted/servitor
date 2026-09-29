@@ -129,6 +129,7 @@ func collect(out *[]Resource, m module) error {
 var resourceRoles = map[string]string{
 	"ibm_resource_group":                      "Resource Group",
 	"ibm_container_cluster":                   "Cluster",
+	"ibm_container_addons":                    "Add-on",
 	"ibm_container_vpc_cluster":               "Cluster",
 	"ibm_is_vpc":                              "VPC",
 	"ibm_is_subnet":                           "Subnet",

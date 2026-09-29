@@ -96,6 +96,34 @@ func TestParseCreateOptionsNormalizesAssignments(t *testing.T) {
 	}
 }
 
+func TestParseCreateOptionsReservesHeadlampBeforeInventoryMatching(t *testing.T) {
+	for _, text := range []string{
+		"create headlamp",
+		"create headlamp auth approve kubernetes",
+		"create headlamp version=1.31",
+	} {
+		t.Run(text, func(t *testing.T) {
+			options, err := ParseCreateOptions(text)
+			if err != nil || !options.HeadlampRequested() || slices.Contains(options.BareValues(), "headlamp") {
+				t.Fatalf("ParseCreateOptions(%q) = %#v, %v", text, options, err)
+			}
+		})
+	}
+	for _, text := range []string{"create headlamp headlamp", "create headlamp headlamp auth", "create headlamp=true"} {
+		t.Run(text, func(t *testing.T) {
+			if _, err := ParseCreateOptions(text); err == nil {
+				t.Fatalf("ParseCreateOptions(%q) unexpectedly succeeded", text)
+			}
+		})
+	}
+	for _, text := range []string{"create target=headlamp", "create provider=headlamp"} {
+		options, err := ParseCreateOptions(text)
+		if err != nil || options.HeadlampRequested() {
+			t.Fatalf("explicit headlamp value parsed as %#v, %v", options, err)
+		}
+	}
+}
+
 func TestParseCreateOptionsTreatsAuthAsServitorOnlyDeliveryIntent(t *testing.T) {
 	for _, text := range []string{"create auth version=4.22", "create auth=true version=4.22", "create auth=false version=4.22"} {
 		t.Run(text, func(t *testing.T) {

@@ -263,6 +263,59 @@ func TestReconcileRejectsNewSatelliteBeforeOperationDispatch(t *testing.T) {
 	}
 }
 
+func TestReconcileRejectsUnsupportedHeadlampProviderBeforeOperationDispatch(t *testing.T) {
+	scheme := cleanupScheme(t)
+	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "unsupported-headlamp", Namespace: "ns", UID: "unsupported-headlamp-uid"}, Spec: servitorv1alpha1.ServitorClusterSpec{
+		Slack:       servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "1.2"},
+		UserOptions: servitorv1alpha1.UserOptions{Version: "1.31", Headlamp: true},
+		Lifecycle:   servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 3600, RetrySeconds: []int64{60}, AutoApprove: true},
+	}}
+	client := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&servitorv1alpha1.ServitorCluster{}).WithObjects(cluster).Build()
+	reconciler := &Reconciler{Client: client, Config: Config{Namespace: "ns", Defaults: servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Provider: "unsupported", Version: "4.22"}}}}
+	request := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "ns", Name: "unsupported-headlamp"}}
+	for range 2 {
+		if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stored := &servitorv1alpha1.ServitorCluster{}
+	if err := client.Get(context.Background(), request.NamespacedName, stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status.Phase != servitorv1alpha1.PhaseUnresolved || stored.Status.Diagnostic != "InvalidResolvedOptions" || stored.Status.Operation != nil || stored.Status.ResolvedOptions != nil {
+		t.Fatalf("unsupported Headlamp provider admission state = %+v", stored.Status)
+	}
+	var runs tektonv1.PipelineRunList
+	if err := client.List(context.Background(), &runs); err != nil || len(runs.Items) != 0 {
+		t.Fatalf("unsupported Headlamp provider dispatched runs=%+v, err=%v", runs.Items, err)
+	}
+}
+
+func TestSnapshotRejectsHeadlampOutsideKubernetes(t *testing.T) {
+	for _, test := range []struct {
+		name, provider, version string
+		valid                   bool
+	}{
+		{name: "Kubernetes VPC", provider: "vpc-gen2", version: "1.31", valid: true},
+		{name: "Kubernetes Classic", provider: "classic", version: "1.31", valid: true},
+		{name: "OpenShift", provider: "vpc-gen2", version: "4.22"},
+		{name: "Satellite", provider: "satellite", version: "1.31"},
+		{name: "Unsupported provider", provider: "unsupported", version: "1.31"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cluster := &servitorv1alpha1.ServitorCluster{Spec: servitorv1alpha1.ServitorClusterSpec{UserOptions: servitorv1alpha1.UserOptions{Provider: test.provider, Version: test.version, Headlamp: true}}}
+			reconciler := Reconciler{Config: Config{Defaults: servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Provider: "vpc-gen2", Version: "4.22"}}, NetworkBindings: map[string]servitorv1alpha1.FrozenNetwork{"": frozenNetwork()}}}
+			err := reconciler.snapshot(cluster)
+			if (err == nil) != test.valid {
+				t.Fatalf("snapshot error = %v, want valid=%t", err, test.valid)
+			}
+			if test.valid && (cluster.Status.ResolvedOptions == nil || !cluster.Status.ResolvedOptions.Headlamp) {
+				t.Fatalf("snapshot lost Headlamp: %+v", cluster.Status.ResolvedOptions)
+			}
+		})
+	}
+}
+
 func TestSnapshotDerivesPlatformAndWorkerDefaultsFromVersion(t *testing.T) {
 	for _, test := range []struct {
 		version, platform, flavor string
@@ -591,7 +644,7 @@ func TestReconcileFailedApplyRequestsCleanupWithoutRetry(t *testing.T) {
 	if err := tektonv1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
 	}
-	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "cluster", Namespace: "ns", UID: "uid", Finalizers: []string{servitorv1alpha1.CleanupFinalizer}}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "1.2"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 3600, RetrySeconds: []int64{60}}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseApplying, ResolvedOptions: &servitorv1alpha1.ResolvedOptions{}, LifecycleSnapshot: &servitorv1alpha1.LifecycleSnapshot{InitialLeaseSeconds: 3600, RetrySeconds: []int64{60}}, Operation: &servitorv1alpha1.OperationReference{ID: "apply-a", Kind: "apply", PipelineRunName: "run"}}}
+	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "cluster", Namespace: "ns", UID: "uid", Finalizers: []string{servitorv1alpha1.CleanupFinalizer}}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "1.2"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 3600, RetrySeconds: []int64{60}}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseApplying, ResolvedOptions: &servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Provider: "vpc-gen2", Version: "1.31", Headlamp: true}, Platform: "kubernetes"}, LifecycleSnapshot: &servitorv1alpha1.LifecycleSnapshot{InitialLeaseSeconds: 3600, RetrySeconds: []int64{60}}, Operation: &servitorv1alpha1.OperationReference{ID: "apply-a", Kind: "apply", PipelineRunName: "run"}}}
 	run := &tektonv1.PipelineRun{ObjectMeta: metav1.ObjectMeta{Name: "run", Namespace: "ns", Labels: map[string]string{pipeline.ClusterUIDLabel: "uid", pipeline.OperationLabel: "apply-a"}}, Status: tektonv1.PipelineRunStatus{Status: duckv1.Status{Conditions: duckv1.Conditions{{Type: apis.ConditionSucceeded, Status: corev1.ConditionFalse}}}}}
 	client := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&servitorv1alpha1.ServitorCluster{}, &tektonv1.PipelineRun{}).WithObjects(cluster, run).Build()
 	reconciler := &Reconciler{Client: client, Config: Config{Namespace: "ns"}}
