@@ -115,7 +115,11 @@ Pushes to `main` also publish `linux/amd64` images to:
 - `ghcr.io/bevicted/servitor-operator`
 - `ghcr.io/bevicted/servitor-task`
 
-The workflow adds `latest` and `sha-<commit>` tags. Tags can move, so deploy the digests reported by the successful workflow. The task image uses the exact ICT commit in [`build/ict-revision`](build/ict-revision).
+The workflow adds `latest` (development) and `sha-<commit>` (source traceability) tags. Both can move after a rebuild, so deploy the digests reported by the successful workflow. The task image uses the exact ICT commit in [`build/ict-revision`](build/ict-revision).
+
+Publication builds from clean committed Servitor and pinned ICT sources, not a developer checkout. Update `build/ict-revision` only to a compatible, exact 40-character commit SHA available from `github.com/bevicted/ict`; an unavailable pin stops publication without falling back to a branch.
+
+The GitHub Actions token needs package write access for both GHCR packages. Before enabling public access, review the published image contents, then configure each package's visibility and repository access in GitHub package settings. Cross-package pushes are not atomic: a registry failure can leave one image published, so only a successful workflow run confirms an image pair.
 
 ### 2. Configure the overlay
 
