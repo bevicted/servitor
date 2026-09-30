@@ -1,122 +1,192 @@
 # Servitor
 
-Servitor is a namespaced Kubernetes operator with a leader-elected Slack Socket Mode front end. It creates one `ServitorCluster` custom resource (CR) per initiating Slack lifecycle thread and reconciles temporary IBM Cloud clusters through Tekton PipelineRuns and ICT. There is no host-local Servitor runtime, workspace authority, lifecycle file, or migration path.
+Servitor provisions temporary IBM Cloud clusters from Slack.
 
-## Ownership and lifecycle
+It runs as a namespaced Kubernetes operator. Each Slack lifecycle thread maps to a `ServitorCluster` custom resource, and the operator uses Tekton and [ICT](https://github.com/bevicted/ict) to plan, create, and destroy the cluster. Terraform state is stored in IBM Cloud Object Storage (COS).
 
-Slack validates authorized requests and writes only `spec.userOptions` and `spec.lifecycle` intent. The controller is the only writer of CR status. It snapshots configured defaults with the explicit safe user options once in `status.resolvedOptions`, including generated names and the pinned execution image. Changed deployment defaults never alter an existing allocation.
+## How it works
 
-The CR owns the observed lifecycle:
+1. A user requests a cluster in the configured Slack channel.
+2. Servitor freezes the request and operator defaults, then runs an ICT plan.
+3. Servitor posts a sanitized summary to the lifecycle thread.
+4. The owner approves the request, or uses `approve=true` when creating it.
+5. Servitor runs a fresh apply and manages the cluster until its lease expires or the owner requests cleanup.
 
-- `spec.lifecycle` holds review approval, requested extension expiry, cleanup intent, and the immutable lease/retry snapshot.
-- The controller records phase, review and lease deadlines, resolved options, non-secret recovery metadata, backend identity, operation identity, summaries, retry state, and diagnostic reason in `status`.
-- Planning creates a disposable PipelineRun. The review is approval of the frozen configuration, not an exact saved Terraform plan. Approval starts a fresh ICT apply with `--auto-approve`; cloud drift can change Terraform actions between review and apply.
-- Terraform state is stored only in the configured IBM Cloud Object Storage (COS) S3 backend. Planning metadata and Terraform plans are ephemeral task-local files. No PVC, artifact store, saved-plan handoff, or custom COS client is used.
-- `done`, lease expiry, failed apply, rejected or expired review, and CR deletion use the cleanup finalizer. Apply and destroy never overlap. Failed destroy retries from persisted absolute deadlines; exhausted cleanup remains `Unresolved` with recovery context and finalizer retained.
+Approval applies the frozen configuration, not a saved Terraform plan. Cloud drift can therefore change the actions between review and apply.
 
-Controller restart recovery is supported: persisted operations, status snapshots, and deadlines are observed rather than recreated. Tekton worker-loss recovery and management-cluster disaster recovery are not supported.
+Servitor supports:
 
-## Deploy
+- OpenShift and Kubernetes clusters on IBM Cloud
+- VPC Gen 2 and Classic infrastructure
+- Multiple allocations per user, with a configurable limit
+- Optional Headlamp installation for Kubernetes clusters
+- Public kubeconfig or private VPN authentication bundles
+- Automatic lease expiry, cleanup retries, and controller restart recovery
+- Private inventory discovery for valid targets, locations, and worker shapes
 
-Build immutable operator and task images with tags, then use their registry digests to replace the digest placeholders in the deployment overlay. `docker build --tag` accepts a tag, not a digest reference.
+New Satellite allocations are not supported.
+
+## Slack commands
+
+| Context | Command | Purpose |
+| --- | --- | --- |
+| DM | `help [command]` | Show help |
+| DM | `list` | List your allocations |
+| DM | `refresh inventory` | Refresh inventory; maintainers only |
+| Configured channel | `@servitor create [options]` | Create an allocation |
+| Configured channel | `@servitor list` | List your allocations |
+| Configured channel | `@servitor done` | Clean up all your allocations in the channel |
+| Lifecycle thread | `yes` / `no` | Approve or reject the request |
+| Lifecycle thread | `extend [N[h]]` | Extend the lease |
+| Lifecycle thread | `auth` | Send the stored auth bundle by DM |
+| Lifecycle thread | `auth retry` | Retry unavailable private VPC auth acquisition |
+| Lifecycle thread | `done` | Clean up this allocation |
+
+Only the allocation owner can approve, extend, request credentials, or clean up an allocation from its lifecycle thread. `destroy` is an alias for `done`.
+
+### Create examples
+
+```text
+@servitor create version=roks
+@servitor create kubernetes headlamp
+@servitor create version=iks worker-count=3 auth=true
+@servitor create vpc-gen2 us-south-1 bx2.4x16 approve
+```
+
+Common options:
+
+| Option | Values |
+| --- | --- |
+| `target` | Configured ICT target |
+| `provider` | `vpc-gen2` or `classic` |
+| `version` | Numeric stream, `roks`, `openshift`, `iks`, `kubernetes`, or `k8s` |
+| `worker-count` | `1` to `100` |
+| `auth` | Request auth delivery when ready |
+| `approve` | Approve automatically after the summary is delivered |
+| `headlamp` | Install the managed Headlamp add-on; Kubernetes only |
+| `private-only` | Create only a private endpoint; VPC Gen 2 only |
+| `zone`, `flavor` | VPC Gen 2 placement and worker shape |
+| `datacenter`, `machine-type` | Classic placement and worker shape |
+| `public-vlan-id`, `private-vlan-id` | Optional Classic VLAN IDs |
+
+Boolean options accept either a bare name, such as `auth`, or `name=true|false`. Inventory-backed values can also be supplied in bare form when the match is unambiguous. Use `help create` and `help create-options` in Slack for the current grammar and configured defaults.
+
+Cluster names, resource groups, network IDs, and platform selection are controlled or derived by Servitor; users cannot override them directly.
+
+## Authentication delivery
+
+Auth delivery is opt-in with `auth` or `auth=true` at creation time, or by sending `auth` in the lifecycle thread.
+
+- Public allocations receive `kubeconfig.yaml`.
+- Private-only allocations receive `kubeconfig.yaml` and `client.ovpn` together.
+- Credentials are sent only to the owner's DM, never to the lifecycle channel.
+- Cleanup removes the allocation's stored auth bundle.
+
+`auth` resends an existing bundle; it does not reacquire credentials. `auth retry` is limited to an unexpired, Ready, private VPC allocation whose auth bundle is unavailable. It retries auth acquisition without reapplying the cluster.
+
+## Deployment
+
+### Requirements
+
+- A Kubernetes or OpenShift namespace with Tekton Pipelines installed
+- A Slack app using Socket Mode
+- IBM Cloud credentials and a COS bucket for Terraform state
+- An ICT target configuration
+- An image registry for the operator and task images
+
+### 1. Build images
 
 ```sh
 make operator-image OPERATOR_IMAGE=registry.example/servitor-operator:dev
 make task-image TASK_IMAGE=registry.example/servitor-task:dev
-kubectl kustomize config/default
 ```
 
-Deploy `registry.example/servitor-operator@sha256:...` and `registry.example/servitor-task@sha256:...` after the registry reports their digests.
+`make task-image` uses the ICT checkout at `../ict` by default. Override it with `ICT_SOURCE=/path/to/ict`.
 
-### GitHub Container Registry publication
-
-A successful push to `main` in `bevicted/servitor` runs the test gate and then publishes `linux/amd64` images to `ghcr.io/bevicted/servitor-operator` and `ghcr.io/bevicted/servitor-task`. Each image receives `latest` and `sha-<full-servitor-commit>` tags. `latest` is a development build. SHA tags provide source traceability but are mutable because rebuilding can use changed base-image tags or dependency downloads. Deploy digest-qualified references reported by the successful workflow instead.
-
-Publication constructs a clean build context from committed Servitor and pinned ICT source, not a developer checkout. The task image's exact ICT revision is in `build/ict-revision`. Update that file only to a compatible, exact 40-character commit SHA which is available from `github.com/bevicted/ict`; an unavailable pin stops publication rather than falling back to a branch. The workflow builds, smoke-tests, and inspects both final images before authenticating or pushing.
-
-The repository's GitHub Actions token needs package write access for both GHCR packages. Before initial public access, review the actual published image contents and then configure each package's visibility and repository access in GitHub package settings. Cross-package pushes are not atomic: a registry failure can leave one image published, so only a successful workflow run confirms an image pair.
-
-Copy `config.example.yaml` to the ConfigMap input used by `config/default`. It contains only non-secret deployment settings: namespace, Slack channel ID and per-user allocation cap, safe defaults, lifecycle and private inventory refresh policy, ICT target ConfigMap, COS S3 identity, task image digest, and Secret names. `slack.max_allocations_per_user` defaults to 3 when omitted or zero and is read only at operator startup; restart the operator after changing it. Lowering the cap leaves existing allocations usable and blocks only new creates until the owner's active count is below the cap. `config/default/operator-references.env` supplies resource names. Do not put Slack, IBM Cloud, or COS HMAC values in configuration, CRs, status, CLI arguments, reports, or source control.
-
-The manager reads its mounted configuration from `/etc/servitor/config/config.yaml`; `-config PATH` or `SERVITOR_CONFIG` can select another mounted path. The controller receives the Slack Secret only. Tekton execution receives COS HMAC and IBM credentials from namespace Secrets; the report step receives neither. The task service account has no CR or status write permissions.
-
-## Allocation auth bundle publication
-
-Servitor stores an endpoint-appropriate auth bundle for an eligible non-Satellite allocation: one public admin `kubeconfig.yaml`, or a private-only VPN bundle containing `kubeconfig.yaml` and `client.ovpn`. Eligibility and policy are frozen with the allocation, so later configuration changes cannot redirect acquisition, publication, or cleanup. Before apply, the controller creates a UID-bound Secret and a dedicated publisher ServiceAccount, Role, and RoleBinding. That Role is limited to `get`, `update`, and `patch` on its one Secret; it cannot create, list, or access another Secret.
-
-Task pods disable automatic ServiceAccount token mounting. The IBM/COS credential-bearing execute step writes the optional auth bundle only to a memory-backed task volume. The credential-free publish step alone receives a short-lived projected Kubernetes token and atomically updates the allocation Secret after validating the complete endpoint-appropriate artifact set. The report step receives neither the auth volume nor a Kubernetes token. Publication failures and missing or malformed artifacts are recorded only as safe availability metadata and do not prevent a successful infrastructure apply from reaching Ready. Auth Terraform state is local to a dedicated memory-backed task mount; auth-only work never reads or initializes the main COS backend.
-
-Delivery is opt-in. At create time, bare `auth`, `auth=true`, and `auth=false` are accepted; the default is no delivery. An eligible public or VPN opt-in queues the same owner-DM delivery as an owner-thread `auth` request. Private-only allocations acquire and store the complete VPN bundle privately even without an opt-in. New Satellite allocations are rejected before provisioning. Cleanup removes the publisher binding and Secret before waiting for in-flight work, then removes the publisher Role and ServiceAccount, preventing a late publisher from recreating data. Before main Terraform destroy, it invokes ICT `auth-cleanup` to reconcile allocation-owned certificates; an uncertain cleanup fences destroy.
-
-## Owner auth-bundle delivery
-
-Only the persisted owner can send exact `auth` or exact `auth retry` in the initiating lifecycle thread. `auth` is delivery-only. `auth retry` is available only to an unexpired Ready private VPC allocation whose stored auth status is unavailable; it creates one independent, monotonic auth-only operation against frozen cluster identity and policy. It never reapplies Terraform infrastructure and is never automatic. Eligible requests made before Ready are queued as one latest request. Once Ready, Servitor consumes the request in controller-owned status before opening the owner's DM and sharing the exact stored public `kubeconfig.yaml`, or the complete VPN `kubeconfig.yaml` and `client.ovpn`, in one Slack external-upload completion. VPN DM text reports the actual certificate expiry and that lease extensions do not renew it. Delivery never uses the lifecycle channel, and ordinary thread messages contain neither credentials nor download links.
-
-A consumed request is never automatically retried: an upload failure, uncertain Slack outcome, receipt eviction, reconciliation, or restart does not replay it. Send a newer `auth` request to resend the unchanged stored bundle. Missing, partial, or expired files remain unavailable; `auth` never invokes ICT, acquires credentials, renews them, or changes Ready. Cleanup and lease expiry cancel pending requests before a Secret read. Slack cannot transactionally recall an upload already accepted before cleanup.
-
-## Private inventory export
-
-`servitor-inventory` is a private internal Tekton Pipeline for the configured target's common create options. The leader starts discovery when a target has no snapshot, then refreshes each target hourly by default. It persists target run identity, deadlines, last-good catalog, and configuration revision in namespaced ConfigMaps, so a replacement leader adopts a stored run instead of creating a duplicate. Target changes or removal immediately invalidate matching data; stale results for an earlier revision are ignored.
-
-The refresh policy defaults to `refresh_interval: 1h` and `maximum_age: 24h`. A failed, malformed, stale-revision, or oversized report retains the last-good catalog and schedules a bounded retry. Snapshot consumers report missing, expired, or unusable data rather than treating it as current. Refreshes are independent per target; they do not create allocations or make partial target failures global success.
-
-The execute step reads the mounted non-secret ICT target configuration and IBM credential, then emits a separately validated inventory report from a credential-free report step. It does not use COS, Terraform, ICT provisioning, Kubernetes writes, or allocation operation labels. The catalog includes configured provider names, version/default metadata, resource groups, VPC zones and flavors, Classic datacenters and machine types, and default-region VPC profiles. The mounted target config uses ICT v1 directly: target names, `providers`, `default_region`, and lower-snake-case `endpoints` keys. Service bases are preserved, including `/global` and `/v1` prefixes. Inventory uses IAM `identity/token` and `identity/userinfo`, Resource Management `v2/resource_groups`, Container Service version/zone/flavor routes, and VPC `instance/profiles` pinned to API version `2026-08-04`. All discovery failures, malformed responses, pagination errors, and reports exceeding 512 KiB fail without publishing a partial catalog.
-
-Apply the rendered resources in the target namespace. They include the CRD, controller Role, empty-permission task Role, controller Deployment, ConfigMaps, Tekton Task/Pipeline, and a sample CR. The controller reads the selected report container's private Pod log after a PipelineRun completes, validates its bounded structured result, atomically publishes a complete target snapshot, and removes terminal discovery runs without deleting allocation runs.
-
-## Slack interface
-
-Enable Socket Mode with the `connections:write` app scope. Grant the bot `chat:write`, `files:write`, `im:write`, and the message-history scopes/events needed for the configured channel and DMs, then reinstall the app after changing scopes. Keep `SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` in the referenced Kubernetes Secret.
+Push both images, obtain their registry digests, and use digest-qualified references in the deployment overlay:
 
 ```text
-DM
-  help [command]
-  list
-  refresh inventory  (configured maintainers only)
-
-Configured channel
-  @servitor help [command]
-  @servitor create [safe options]
-  @servitor done  (request cleanup for all of your allocations in this channel)
-  @servitor list
-
-Lifecycle thread
-  yes | no
-  done  (release this allocation)
-  extend [N[h]]
-  auth
-  auth retry
+registry.example/servitor-operator@sha256:...
+registry.example/servitor-task@sha256:...
 ```
 
-`create` supports new VPC Gen 2 and Classic allocations; Satellite provisioning is not supported for new allocations. The resource group is resolved only from operator configuration and is not a request option. It writes explicit safe options to `spec.userOptions`; omitted version uses the configured Servitor default. Each initiating channel/thread pair has a deterministic allocation identity. A repeated create in that same thread retains its allocation state, lease, and options and links to that lifecycle thread when Slack can resolve it. A new thread can create an independent allocation until the configured per-user active allocation cap is reached. Channel-only commands sent by DM redirect using the configured channel's Slack markup. Provisioning options use `key=value`; `private-only`, `private-only=true`, and `private-only=false` are VPC Gen 2 options. The default, `private-only=false`, requests both public and private endpoints; `private-only=true` requests a private endpoint only. Private-only allocations use the VPN auth bundle, so using that bundle requires the configured VPN access. Creation also accepts bare `auth`, `auth=true`, and `auth=false` as eligible auth-bundle delivery options, defaulting to no delivery. Creation also accepts bare `approve`, `approve=true`, and `approve=false`; omission and false retain manual review. Bare `headlamp` installs IBM Cloud's managed Headlamp add-on only for Kubernetes VPC Gen 2 or Classic allocations; with the OpenShift default, use `@servitor create kubernetes headlamp`. It uses the normal provider waiting behavior and an apply failure follows ordinary cleanup; Servitor does not independently verify add-on health. An automatic request posts the same sanitized configuration and plan summary, then records approval only after every summary reply is confirmed delivered before the persisted review deadline. Failed, uncertain, or missing delivery receipts do not approve; the existing deadline cleanup applies. An owner `yes` before automatic approval is recorded cannot bypass delivery, while `no` and `done` retain their existing behavior. An eligible opt-in queues one owner-DM delivery after Ready. Private-only allocations continue creating and publish their complete VPN bundle to the allocation Secret independently of delivery opt-in; requests share both stored VPN files together. Satellite creates are rejected before allocation, regardless of auth or automatic-approval flags. A current private common-option inventory also recognizes unique bare target, provider, location, and worker-shape values, for example `@servitor create target=synthetic-target vpc-gen2 us-south-1 bx2.4x16`. Matching is case-sensitive in the selected target, provider, and location context. Environment target shorthand treats `prestage` and `pretest` as equivalent, treats `test` and `stage` as equivalent, and recognizes `dev`; Servitor stores the configured target name. Unknown or colliding shorthand is rejected without creating a CR; correct it with a key such as `flavor=value`. Worker counts and IDs remain keyed, and documentation never lists runtime catalogs. Use the cloud-default aliases `default_openshift`, `openshift`, or `roks` for OpenShift, and `default_kubernetes`, `kubernetes`, `k8s`, or `iks` for Kubernetes. A compatible numeric stream may refine a bare alias, for example `@servitor create roks 4.17`; the planning task resolves a bare alias from the cloud default marker. A resource named like a reserved alias requires a key. `provider=value` selects VPC Gen 2 or Classic infrastructure, while numeric streams derive platform: `4.*` selects OpenShift and `1.*` selects Kubernetes. `resource-group` is not a supported create option; its value comes only from the operator configuration. Explicit keys identify an uncommon input but do not bypass configured-target/provider restrictions or planning validation: the planning task checks the current configured target and provider plus its fresh common-option catalog before ICT plans, and ICT remains authoritative for uncatalogued keyed inputs. `platform` is not a supported create option. Cluster names are generated internally, so `name` is not a supported create option. Only the owner in the initiating thread can approve, reject, extend, request public `auth`, or request cleanup for that allocation. Automatic approval still approves frozen configuration rather than executing a saved Terraform plan, and Slack delivery is not exactly once. `@servitor done` in the configured channel instead requests cleanup for all of the caller's allocations in that channel. Review instructions render the persisted UTC approval deadline; reply with exact `yes` or `no` before that deadline. Expired review decisions are not recorded. `destroy` remains a silent alias for `done`.
+Pushes to `main` also publish `linux/amd64` images to:
 
-`list` returns `Your allocations:` and a `cluster`, `state`, `location`, and `expires` table containing only the caller's allocations, including cleanup-complete allocations until their existing notification grace ends. When the caller has no allocations, it returns the same header-only table. Cleanup in progress and cleanup complete are distinct states. Lease deadlines are persisted UTC timestamps with remaining time; an expired lease is labeled `expired` and an allocation without a deadline is labeled `never`.
+- `ghcr.io/bevicted/servitor-operator`
+- `ghcr.io/bevicted/servitor-task`
 
-Ready messages show how to extend or release one allocation: reply with `extend [N[h]]` or `done` in its lifecycle thread. Use `@servitor done` in the configured channel to request cleanup for all of your allocations there.
+The workflow adds `latest` and `sha-<commit>` tags. Tags can move, so deploy the digests reported by the successful workflow. The task image uses the exact ICT commit in [`build/ict-revision`](build/ict-revision).
 
-Optional `slack.maintainer_ids` holds exact Slack user IDs. Only those users can send the exact `refresh inventory` command in a DM; it starts or joins the normal private target refreshes and later receives a safe success, partial-failure, or failure summary. Empty `maintainer_ids` disables the command. The command never reveals target inventories or changes allocations. There are no maintainer `status`, `pause`, `unpause`, or `stop` commands.
+### 2. Configure the overlay
 
-Cleanup notices use the persisted initiating reason before completion, including when a notifier first observes a terminal phase. Scheduled destroy retries show their persisted retry number and UTC deadline. Slack delivery is not exactly once: a delivery claim prevents concurrent command/notifier duplicates and is released on a failed reply, but a crash during that non-transactional sequence can still duplicate or suppress a notice. Arbitrary Slack or controller outages can also outlast the observable cleanup grace.
+Start with [`config.example.yaml`](config.example.yaml), then update these files or replace them in your own Kustomize overlay:
 
-## Operations and diagnostics
+| File | Contents |
+| --- | --- |
+| [`config/default/operator-config.yaml`](config/default/operator-config.yaml) | Namespace, Slack channel, defaults, lifecycle policy, network bindings, COS backend, and task image |
+| [`config/default/ict-config.yaml`](config/default/ict-config.yaml) | Non-secret ICT targets |
+| [`config/default/operator-references.env`](config/default/operator-references.env) | ConfigMap and Secret names |
+| [`config/default/kustomization.yaml`](config/default/kustomization.yaml) | Operator image digest and rendered resources |
 
-Use opaque Kubernetes references when investigating a lifecycle: the namespaced `ServitorCluster` name/UID, `status.operation.id`, `status.operation.pipelineRunName`, the matching TaskRun, and the report container's private Pod log. Inspect private cluster logs with authorized cluster access. Do not expose or copy credentials, raw Terraform plans or state, task report internals, workspace paths, or host filesystem paths into Slack, CR status, tickets, or source control.
+Create the referenced Secrets separately:
 
-Excluded behavior is intentional: no local compatibility or allocation migration, no local filesystem/process supervision, no PVC or artifact store, no Tekton worker-loss recovery, no management-cluster disaster recovery, no exactly-once Slack guarantee, and no maintainer admission, status, pause, unpause, or stop commands.
+- Slack Secret: `SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN`
+- IBM Cloud credential Secret for ICT
+- COS HMAC credential Secret for the Terraform S3 backend
 
-## Sample CR
+Do not put credentials in configuration, custom resources, CLI arguments, reports, or source control.
 
-`config/samples/servitor_v1alpha1_servitorcluster.yaml` shows the schema. Create requests normally originate from Slack, but an authorized automation client can create a CR with immutable Slack identity, explicit `spec.userOptions`, and the required `spec.lifecycle` lease/retry snapshot. The controller adds the cleanup finalizer and writes all status fields.
+The default Kustomization includes the sample CR in [`config/samples`](config/samples). Remove it from a production overlay unless you intend to create that resource.
 
-## Development verification
+Preview and apply the finished overlay:
 
 ```sh
-gofmt -d $(find api cmd internal -name '*.go')
-make test
-go test -race ./...
 kubectl kustomize config/default
+kubectl apply -k config/default
 ```
 
-`make test` runs the unit suite and the RBAC-enforced controller runtime contract in `internal/controller/runtime_integration_test.go`. The integration test starts a local Kubernetes API server and etcd, then exercises the production scheme, cached and direct clients, publication, delivery, and cleanup using `config/rbac/role.yaml`. Its pinned envtest binaries are downloaded into `bin/` on the first run. Use `make test-unit` or `make test-integration` to run either suite separately.
+### 3. Configure Slack
 
-Live OpenShift, Tekton, COS, and Slack checks require the designated cluster namespace, COS key prefix, and credentials. Do not treat missing or pruned task logs as proof that a cloud operation did not run.
+Enable Socket Mode and grant the app:
+
+- `connections:write`
+- `chat:write`
+- `files:write`
+- `im:write`
+- The message-history scopes and events required for the configured channel and DMs
+
+Reinstall the app after changing scopes.
+
+## State, security, and recovery
+
+- Slack writes authorized intent to the CR spec. The controller is the only status writer.
+- Operator defaults, generated names, policy, and image references are frozen per allocation.
+- Terraform state lives only in the configured COS S3 backend. Plans and planning metadata are ephemeral.
+- Apply and destroy never run at the same time.
+- Cleanup uses a finalizer. Failed destroys retry from persisted deadlines; exhausted cleanup remains visible as `Unresolved`.
+- The controller can adopt persisted work after a restart.
+- Task credentials are isolated from reporting and Slack delivery steps.
+- Slack delivery is best effort, not exactly once.
+
+Servitor does not recover from lost Tekton workers or a lost management cluster. Keep normal backups and operational controls for the Kubernetes cluster and COS backend.
+
+For diagnostics, start with the `ServitorCluster` name and UID, `status.operation.id`, `status.operation.pipelineRunName`, its TaskRun, and the report container log. Never copy credentials, Terraform plans, Terraform state, or private task output into Slack or tickets.
+
+## Development
+
+```sh
+make build
+make test
+# Optional additional race check:
+go test -race ./...
+```
+
+`make test` runs unit tests and the RBAC-enforced controller integration test. Its envtest binaries are downloaded into `bin/` on first use.
+
+Useful targets:
+
+- `make test-unit`
+- `make test-integration`
+- `make manifests`
+- `make operator-image`
+- `make task-image`
