@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -40,7 +42,160 @@ func (r *headlampResponder) Reply(_ context.Context, response slackbot.Response)
 	return nil
 }
 
-func TestHeadlampAllocationUsesFrozenLifecycleForReviewApplyAndDestroy(t *testing.T) {
+type retryingConfigurationResponder struct {
+	fail          bool
+	failed        chan struct{}
+	delivered     chan struct{}
+	failedOnce    sync.Once
+	deliveredOnce sync.Once
+	mu            sync.Mutex
+	responses     []slackbot.Response
+}
+
+func (r *retryingConfigurationResponder) Reply(_ context.Context, response slackbot.Response) error {
+	if strings.Contains(response.Text, "Cluster configuration") {
+		if r.fail {
+			r.failedOnce.Do(func() { close(r.failed) })
+			return errors.New("Slack unavailable")
+		}
+		r.deliveredOnce.Do(func() { close(r.delivered) })
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.responses = append(r.responses, response)
+	return nil
+}
+
+func (r *retryingConfigurationResponder) configurationCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	count := 0
+	for _, response := range r.responses {
+		if strings.Contains(response.Text, "Cluster configuration") {
+			count++
+		}
+	}
+	return count
+}
+
+func TestRecoveredConfigurationDeliveryFailureDoesNotBlockAutomaticApply(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC)
+	scheme := runtime.NewScheme()
+	for _, add := range []func(*runtime.Scheme) error{corev1.AddToScheme, servitorv1alpha1.AddToScheme, tektonv1.AddToScheme} {
+		if err := add(scheme); err != nil {
+			t.Fatal(err)
+		}
+	}
+	network := servitorv1alpha1.FrozenNetwork{BindingID: "existing", AccountID: "account", VPCRegion: "us-south", VPCID: "vpc", SubnetID: "subnet", PublicGatewayID: "gateway", Zone: "us-south-1"}
+	options := servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Target: "target", Provider: "vpc-gen2", Version: "4.22"}, ResourceGroup: "Default", Platform: "openshift", ClusterName: "recovered-cluster", Region: "us-south", Network: network}
+	recovery := servitorv1alpha1.RecoveryMetadata{Version: 1, Target: "target", TFVarsSHA256: strings.Repeat("a", 64), Endpoints: map[string]string{"IAM": "https://iam.example.invalid", "ContainerService": "https://containers.example.invalid", "GlobalTagging": "https://tagging.example.invalid", "ResourceManagement": "https://management.example.invalid", "ResourceController": "https://controller.example.invalid", "VPC": "https://vpc.example.invalid"}, Values: servitorv1alpha1.RecoveryValues{ClusterName: "recovered-cluster", ResourceGroupName: "Default", Region: "us-south", ClusterMode: "vpc", Platform: "openshift", KubeVersion: "4.22_openshift", WorkerCount: 2, Zone: "us-south-1", Flavor: "bx2.4x16", AccountID: "account", VPCRegion: "us-south", VPCID: "vpc", SubnetIDs: []string{"subnet"}, PublicGatewayIDs: []string{"gateway"}}}
+	cluster := &servitorv1alpha1.ServitorCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "allocation", Namespace: "ns", UID: "allocation-uid", Finalizers: []string{servitorv1alpha1.CleanupFinalizer}},
+		Spec: servitorv1alpha1.ServitorClusterSpec{
+			Slack:     servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"},
+			Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 3600, RetrySeconds: []int64{60}},
+		},
+		Status: servitorv1alpha1.ServitorClusterStatus{
+			Phase:             servitorv1alpha1.PhasePending,
+			ResolvedOptions:   &options,
+			Recovery:          &recovery,
+			LifecycleSnapshot: &servitorv1alpha1.LifecycleSnapshot{InitialLeaseSeconds: 3600, RetrySeconds: []int64{60}},
+			Backend:           &servitorv1alpha1.BackendIdentity{Version: 1, Bucket: "bucket", Key: "servitor/allocation-uid.tfstate", Region: "us-south", Endpoint: "https://s3.us-south.example.invalid"},
+			ExecutionImage:    "registry.example/ict@sha256:deadbeef",
+		},
+	}
+	kube := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&servitorv1alpha1.ServitorCluster{}, &tektonv1.PipelineRun{}, &tektonv1.TaskRun{}).WithRuntimeObjects(cluster).Build()
+	responses := &retryingConfigurationResponder{fail: true, failed: make(chan struct{}), delivered: make(chan struct{})}
+	firstReceipts := state.NewEventStore(kube, "ns")
+	firstNotifier := &slackbot.StatusNotifier{Client: kube, Namespace: "ns", Responder: responses, Receipts: firstReceipts, Interval: time.Hour}
+	firstCtx, stopFirst := context.WithCancel(ctx)
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- firstNotifier.Start(firstCtx) }()
+	select {
+	case <-responses.failed:
+	case <-time.After(time.Second):
+		stopFirst()
+		t.Fatal("notifier did not attempt the recovered configuration")
+	}
+	reconciler := &controller.Reconciler{Client: kube, DirectReader: kube, Scheme: scheme, Config: controller.Config{Namespace: "ns"}, Now: func() time.Time { return now }}
+	request := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "ns", Name: "allocation"}}
+	if _, err := reconciler.Reconcile(ctx, request); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconciler.Reconcile(ctx, request); err != nil {
+		t.Fatal(err)
+	}
+	stored := &servitorv1alpha1.ServitorCluster{}
+	if err := kube.Get(ctx, request.NamespacedName, stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status.Phase != servitorv1alpha1.PhaseApplying || stored.Status.Operation == nil || stored.Status.Operation.Kind != "apply" || !stored.Status.ApplyDispatched {
+		t.Fatalf("failed Slack delivery blocked apply dispatch: %+v", stored.Status)
+	}
+	apply := *stored.Status.Operation
+	run := &tektonv1.PipelineRun{}
+	if err := kube.Get(ctx, types.NamespacedName{Namespace: "ns", Name: apply.PipelineRunName}, run); err != nil {
+		t.Fatal(err)
+	}
+	run.Status.Status.Conditions = duckv1.Conditions{{Type: apis.ConditionSucceeded, Status: corev1.ConditionTrue}}
+	run.Status.ChildReferences = []tektonv1.ChildStatusReference{{TypeMeta: runtime.TypeMeta{Kind: "TaskRun"}, Name: "apply-task", PipelineTaskName: "operation"}}
+	if err := kube.Status().Update(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	task := &tektonv1.TaskRun{ObjectMeta: metav1.ObjectMeta{Name: "apply-task", Namespace: "ns"}, Status: tektonv1.TaskRunStatus{TaskRunStatusFields: tektonv1.TaskRunStatusFields{PodName: "apply-pod", Steps: []tektonv1.StepState{{Name: pipeline.ReportContainerName, Container: "step-report"}}}}}
+	if err := kube.Create(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	report, err := json.Marshal(pipeline.Report{Version: 1, ClusterUID: string(stored.UID), OperationID: apply.ID, ResolvedOptions: *stored.Status.ResolvedOptions, Recovery: *stored.Status.Recovery, Ready: servitorv1alpha1.ReadySummary{Resources: []servitorv1alpha1.SummaryResource{{Role: "Cluster", Name: "recovered-cluster", ID: "cluster-id"}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reconciler.Logs = headlampReportLogs{data: report}
+	if _, err := reconciler.Reconcile(ctx, request); err != nil {
+		t.Fatal(err)
+	}
+	if err := kube.Get(ctx, request.NamespacedName, stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status.Phase != servitorv1alpha1.PhaseReady || stored.Spec.Lifecycle.Approval != "" || stored.Status.Review != nil || stored.Status.ReviewDeadline != nil || stored.Status.ReviewApproval != "" {
+		t.Fatalf("apply did not reach Ready without approval state: %+v", stored.Status)
+	}
+	stopFirst()
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
+
+	configurationReceipt := "phase:allocation-uid:configuration:0"
+	claimed, err := firstReceipts.Claim(ctx, configurationReceipt)
+	if err != nil || !claimed {
+		t.Fatalf("failed delivery did not release configuration receipt: claimed=%t err=%v", claimed, err)
+	}
+	if err := firstReceipts.Release(ctx, configurationReceipt); err != nil {
+		t.Fatal(err)
+	}
+
+	responses.fail = false
+	restarted := &slackbot.StatusNotifier{Client: kube, Namespace: "ns", Responder: responses, Receipts: state.NewEventStore(kube, "ns"), Interval: time.Hour}
+	retryCtx, stopRetry := context.WithCancel(ctx)
+	retryDone := make(chan error, 1)
+	go func() { retryDone <- restarted.Start(retryCtx) }()
+	select {
+	case <-responses.delivered:
+	case <-time.After(time.Second):
+		stopRetry()
+		t.Fatal("restarted notifier did not retry the recovered configuration")
+	}
+	stopRetry()
+	if err := <-retryDone; err != nil {
+		t.Fatal(err)
+	}
+	if got := responses.configurationCount(); got != 1 {
+		t.Fatalf("configuration tables after Ready retry = %d, want 1", got)
+	}
+}
+
+func TestHeadlampAllocationUsesFrozenLifecycleForAutomaticApplyAndDestroy(t *testing.T) {
 	ctx := context.Background()
 	scheme := runtime.NewScheme()
 	for _, add := range []func(*runtime.Scheme) error{corev1.AddToScheme, servitorv1alpha1.AddToScheme, tektonv1.AddToScheme} {
@@ -59,7 +214,7 @@ func TestHeadlampAllocationUsesFrozenLifecycleForReviewApplyAndDestroy(t *testin
 	if err := bot.Handle(ctx, slackbot.Envelope{ID: "headlamp-create", Message: message}); err != nil {
 		t.Fatal(err)
 	}
-	if len(responses.responses) != 1 || responses.responses[0].Text != "Planning..." {
+	if len(responses.responses) != 1 || responses.responses[0].Text != "Provisioning..." {
 		t.Fatalf("create responses = %+v", responses.responses)
 	}
 	key := types.NamespacedName{Namespace: "ns", Name: "slack-8af2c7b3adfde728cff2e8e9"}
@@ -88,18 +243,8 @@ func TestHeadlampAllocationUsesFrozenLifecycleForReviewApplyAndDestroy(t *testin
 		t.Fatalf("frozen plan state = %+v, %v", cluster.Status, err)
 	}
 	adoptHeadlampReport(t, ctx, kube, reconciler, request, cluster, "plan", servitorv1alpha1.ReviewSummary{Resources: []servitorv1alpha1.SummaryResource{{Role: "Add-on", Name: "headlamp", Actions: []string{"create"}}}})
-	if err := kube.Get(ctx, key, cluster); err != nil || cluster.Status.Phase != servitorv1alpha1.PhaseAwaitingApproval || cluster.Status.ResolvedOptions == nil || !cluster.Status.ResolvedOptions.Headlamp {
-		t.Fatalf("Headlamp review state = %+v, %v", cluster.Status, err)
-	}
-	if err := bot.Handle(ctx, slackbot.Envelope{ID: "headlamp-approve", Message: slackbot.Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "yes", Timestamp: "1710000001.000100", ThreadTimestamp: message.Timestamp}}); err != nil {
-		t.Fatal(err)
-	}
-	if err := kube.Get(ctx, key, cluster); err != nil || cluster.Spec.Lifecycle.Approval != "approved" {
-		t.Fatalf("Headlamp approval = %+v, %v", cluster.Spec.Lifecycle, err)
-	}
-	cluster.Generation++
-	if err := kube.Update(ctx, cluster); err != nil {
-		t.Fatal(err)
+	if err := kube.Get(ctx, key, cluster); err != nil || cluster.Status.Phase != servitorv1alpha1.PhasePending || cluster.Status.Recovery == nil || cluster.Status.ResolvedOptions == nil || !cluster.Status.ResolvedOptions.Headlamp {
+		t.Fatalf("Headlamp recovery state = %+v, %v", cluster.Status, err)
 	}
 	for range 3 {
 		if _, err := reconciler.Reconcile(ctx, request); err != nil {

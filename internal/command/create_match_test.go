@@ -62,7 +62,7 @@ func TestEnvironmentTargetShorthandUsesConfiguredEquivalent(t *testing.T) {
 }
 
 func TestServitorExecutionFlagsSurviveBothInventoryReconstructionPaths(t *testing.T) {
-	options, err := ParseCreateOptions("create headlamp auth approve dry-run target-a vpc-gen2 bx2.4x16 us-south-1 kubernetes")
+	options, err := ParseCreateOptions("create headlamp auth dry-run target-a vpc-gen2 bx2.4x16 us-south-1 kubernetes")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,7 +71,7 @@ func TestServitorExecutionFlagsSurviveBothInventoryReconstructionPaths(t *testin
 		t.Fatal(err)
 	}
 	options, err = MatchBareCreateOptions(options, matchDefaults, matchCatalog)
-	if err != nil || !options.HeadlampRequested() || !options.AuthRequested() || !options.ApproveRequested() || !options.DryRunRequested() {
+	if err != nil || !options.HeadlampRequested() || !options.AuthRequested() || !options.DryRunRequested() {
 		t.Fatalf("matched options = %#v, err=%v", options, err)
 	}
 }
@@ -102,18 +102,9 @@ func TestAuthIsConsumedBeforeInventoryMatching(t *testing.T) {
 	}
 }
 
-func TestApproveMetadataSurvivesShorthandMatching(t *testing.T) {
-	options, err := ParseCreateOptions("create approve target-a vpc-gen2 bx2.4x16 us-south-1 version=4.22")
-	if err != nil {
-		t.Fatal(err)
-	}
-	options, _, err = ResolveBareSelectors(options, matchDefaults, map[string]inventory.TargetConfig{"target-a": {Providers: []string{"vpc-gen2", "classic", "satellite"}}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	options, err = MatchBareCreateOptions(options, matchDefaults, matchCatalog)
-	if err != nil || !options.ApproveRequested() || len(options.BareValues()) != 0 {
-		t.Fatalf("matched options = %#v, approve=%t, err=%v", options, options.ApproveRequested(), err)
+func TestApproveIsRejectedBeforeShorthandMatching(t *testing.T) {
+	if _, err := ParseCreateOptions("create approve target-a vpc-gen2"); err == nil || !strings.Contains(err.Error(), "approve is no longer supported") {
+		t.Fatalf("obsolete approve was accepted or treated as shorthand: %v", err)
 	}
 }
 

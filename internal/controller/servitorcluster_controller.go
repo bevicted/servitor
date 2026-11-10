@@ -127,9 +127,6 @@ func (r *Reconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.
 	if !matchesLifecycleSnapshot(cluster.Spec.Lifecycle, *cluster.Status.LifecycleSnapshot) {
 		return r.unresolved(ctx, cluster, "LifecyclePolicyChanged", errors.New("immutable lifecycle policy changed"))
 	}
-	if cluster.Status.Phase == servitorv1alpha1.PhaseAwaitingApproval {
-		return r.reconcileApproval(ctx, cluster)
-	}
 	if cluster.Status.Phase == servitorv1alpha1.PhaseReady {
 		return r.reconcileReady(ctx, cluster)
 	}
@@ -137,9 +134,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.
 		return ctrl.Result{}, nil
 	}
 	if cluster.Status.Operation == nil {
-		now := metav1.NewTime(r.now())
+		if cluster.Status.Recovery != nil {
+			return r.dispatchApply(ctx, cluster)
+		}
 		operation := planningID(string(cluster.UID))
-		cluster.Status.Operation = &servitorv1alpha1.OperationReference{ID: operation, Kind: "plan", PipelineRunName: pipeline.DeterministicRunName(string(cluster.UID), operation), StartedAt: now}
+		cluster.Status.Operation = &servitorv1alpha1.OperationReference{ID: operation, Kind: "plan", PipelineRunName: pipeline.DeterministicRunName(string(cluster.UID), operation), StartedAt: metav1.NewTime(r.now())}
 		cluster.Status.Phase = servitorv1alpha1.PhasePlanning
 		return ctrl.Result{}, r.Status().Update(ctx, cluster)
 	}
@@ -249,39 +248,22 @@ func (r *Reconciler) setExtensionOutcome(cluster *servitorv1alpha1.ServitorClust
 	return true
 }
 
-func (r *Reconciler) reconcileApproval(ctx context.Context, cluster *servitorv1alpha1.ServitorCluster) (ctrl.Result, error) {
-	deadline := cluster.Status.ReviewDeadline
-	if deadline == nil || !r.now().Before(deadline.Time) {
-		return r.requestCleanup(ctx, cluster, servitorv1alpha1.CleanupReasonReviewExpired)
+func (r *Reconciler) dispatchApply(ctx context.Context, cluster *servitorv1alpha1.ServitorCluster) (ctrl.Result, error) {
+	if cluster.Status.Recovery == nil {
+		return r.unresolved(ctx, cluster, "RecoveryMissing", errors.New("apply requires adopted recovery metadata"))
 	}
-	switch cluster.Spec.Lifecycle.Approval {
-	case "rejected":
-		return r.requestCleanup(ctx, cluster, servitorv1alpha1.CleanupReasonRejected)
-	case "":
-		if cluster.Status.ReviewApproval == "approved" {
-			cluster.Status.ReviewGeneration = cluster.Generation
-			cluster.Status.ReviewApproval = ""
-			return ctrl.Result{RequeueAfter: deadline.Time.Sub(r.now())}, r.Status().Update(ctx, cluster)
-		}
-		return ctrl.Result{RequeueAfter: deadline.Time.Sub(r.now())}, nil
-	case "approved":
-		if cluster.Status.ReviewGeneration == 0 || cluster.Generation <= cluster.Status.ReviewGeneration || cluster.Status.ReviewApproval == "approved" {
-			return ctrl.Result{RequeueAfter: deadline.Time.Sub(r.now())}, nil
-		}
-		operationID := applyID(string(cluster.UID))
-		attempt := initialAuthAttemptID(string(cluster.UID), operationID, "")
-		operation := &servitorv1alpha1.OperationReference{ID: operationID, Kind: "apply", AuthAttemptID: attempt, PipelineRunName: pipeline.DeterministicRunName(string(cluster.UID), operationID), StartedAt: metav1.NewTime(r.now())}
-		if err := r.ensureAuthPublicationResources(ctx, cluster, operation); err != nil {
-			return ctrl.Result{}, err
-		}
-		cluster.Status.Operation = operation
-		// Persist this before run creation: a lost create response must be treated as
-		// an apply that may have reached Terraform.
-		cluster.Status.ApplyDispatched = true
-		cluster.Status.Phase = servitorv1alpha1.PhaseApplying
-		return ctrl.Result{}, r.Status().Update(ctx, cluster)
+	operationID := applyID(string(cluster.UID))
+	attempt := initialAuthAttemptID(string(cluster.UID), operationID, "")
+	operation := &servitorv1alpha1.OperationReference{ID: operationID, Kind: "apply", AuthAttemptID: attempt, PipelineRunName: pipeline.DeterministicRunName(string(cluster.UID), operationID), StartedAt: metav1.NewTime(r.now())}
+	if err := r.ensureAuthPublicationResources(ctx, cluster, operation); err != nil {
+		return ctrl.Result{}, err
 	}
-	return ctrl.Result{RequeueAfter: deadline.Time.Sub(r.now())}, nil
+	cluster.Status.Operation = operation
+	// Persist this before run creation: a lost create response must be treated as
+	// an apply that may have reached Terraform.
+	cluster.Status.ApplyDispatched = true
+	cluster.Status.Phase = servitorv1alpha1.PhaseApplying
+	return ctrl.Result{}, r.Status().Update(ctx, cluster)
 }
 
 func (r *Reconciler) requestCleanup(ctx context.Context, cluster *servitorv1alpha1.ServitorCluster, reason servitorv1alpha1.CleanupReason) (ctrl.Result, error) {
@@ -703,12 +685,7 @@ func (r *Reconciler) adoptReport(ctx context.Context, cluster *servitorv1alpha1.
 		}
 		cluster.Status.ResolvedOptions = &report.ResolvedOptions
 		cluster.Status.Recovery = &report.Recovery
-		cluster.Status.Review = &report.Review
-		cluster.Status.Phase = servitorv1alpha1.PhaseAwaitingApproval
-		deadline := metav1.NewTime(r.now().Add(r.reviewTimeout()))
-		cluster.Status.ReviewDeadline = &deadline
-		cluster.Status.ReviewGeneration = cluster.Generation
-		cluster.Status.ReviewApproval = cluster.Spec.Lifecycle.Approval
+		cluster.Status.Phase = servitorv1alpha1.PhasePending
 		setCondition(cluster, "PlanningSucceeded", metav1.ConditionTrue, "ReportAdopted", "validated planning report adopted")
 		cluster.Status.Operation = nil
 	} else {
@@ -981,12 +958,6 @@ func (r *Reconciler) logRetry() time.Duration {
 		return r.LogRetry
 	}
 	return 10 * time.Second
-}
-func (r *Reconciler) reviewTimeout() time.Duration {
-	if r.Config.ReviewTimeout > 0 {
-		return r.Config.ReviewTimeout
-	}
-	return 5 * time.Minute
 }
 func planningID(uid string) string { return operationID(uid, "plan") }
 func applyID(uid string) string    { return operationID(uid, "apply") }

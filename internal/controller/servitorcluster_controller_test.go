@@ -97,7 +97,7 @@ func TestReconcilePersistsOneOperationAndAdoptsMatchingReport(t *testing.T) {
 	if err := tektonv1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
 	}
-	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "cluster", Namespace: "ns", UID: "cluster-uid", Generation: 1}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "1.2"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 3600, RetrySeconds: []int64{60}, Approval: "approved"}}}
+	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "cluster", Namespace: "ns", UID: "cluster-uid", Generation: 1}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "1.2"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 3600, RetrySeconds: []int64{60}}}}
 	client := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&servitorv1alpha1.ServitorCluster{}, &tektonv1.PipelineRun{}, &tektonv1.TaskRun{}).WithObjects(cluster).Build()
 	now := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
 	reconciler := &Reconciler{Client: client, Scheme: scheme, Config: Config{Namespace: "ns", Defaults: servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Target: "target", Provider: "vpc-gen2", Version: "4.22"}, ResourceGroup: "Default", Platform: "openshift"}, NetworkBindings: map[string]servitorv1alpha1.FrozenNetwork{"target": frozenNetwork()}, Backend: servitorv1alpha1.BackendIdentity{Version: 1, Bucket: "ict-state-bucket", Region: "us-south", Endpoint: "https://s3.us-south.example.invalid", SkipCredentialsValidation: true, SkipMetadataAPICheck: true, SkipRegionValidation: true, SkipRequestingAccountID: true, ForcePathStyle: true}, BackendPrefix: "servitor", ExecutionImage: "registry.example/ict@sha256:deadbeef", ReviewTimeout: 5 * time.Minute}, Now: func() time.Time { return now }}
@@ -161,8 +161,48 @@ func TestReconcilePersistsOneOperationAndAdoptsMatchingReport(t *testing.T) {
 	if err := client.Get(context.Background(), request.NamespacedName, stored); err != nil {
 		t.Fatal(err)
 	}
-	if stored.Status.Phase != servitorv1alpha1.PhaseAwaitingApproval || stored.Status.Operation != nil || stored.Status.ReviewDeadline == nil || !stored.Status.ReviewDeadline.Time.Equal(now.Add(5*time.Minute)) || stored.Status.ReviewGeneration != stored.Generation || stored.Status.ReviewApproval != "approved" {
-		t.Fatalf("report was not adopted with its approval state: %+v", stored.Status)
+	if stored.Status.Phase != servitorv1alpha1.PhasePending || stored.Status.Operation != nil || stored.Status.Recovery == nil || stored.Status.ApplyDispatched {
+		t.Fatalf("plan report was not durably adopted before apply dispatch: %+v", stored.Status)
+	}
+	if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Get(context.Background(), request.NamespacedName, stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status.Phase != servitorv1alpha1.PhaseApplying || stored.Status.Operation == nil || stored.Status.Operation.Kind != "apply" || !stored.Status.ApplyDispatched {
+		t.Fatalf("adopted recovery did not dispatch apply: %+v", stored.Status)
+	}
+	applyOperation := *stored.Status.Operation
+	if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	applyRun := &tektonv1.PipelineRun{}
+	if err := client.Get(context.Background(), types.NamespacedName{Namespace: "ns", Name: applyOperation.PipelineRunName}, applyRun); err != nil {
+		t.Fatal(err)
+	}
+	applyRun.Status.Status.Conditions = duckv1.Conditions{{Type: apis.ConditionSucceeded, Status: corev1.ConditionTrue}}
+	applyRun.Status.ChildReferences = []tektonv1.ChildStatusReference{{TypeMeta: runtime.TypeMeta{APIVersion: "tekton.dev/v1", Kind: "TaskRun"}, Name: "apply-task", PipelineTaskName: "operation"}}
+	if err := client.Status().Update(context.Background(), applyRun); err != nil {
+		t.Fatal(err)
+	}
+	applyTask := &tektonv1.TaskRun{ObjectMeta: metav1.ObjectMeta{Name: "apply-task", Namespace: "ns"}, Status: tektonv1.TaskRunStatus{TaskRunStatusFields: tektonv1.TaskRunStatusFields{PodName: "apply-pod", Steps: []tektonv1.StepState{{Name: pipeline.ReportContainerName, Container: "step-report"}}}}}
+	if err := client.Create(context.Background(), applyTask); err != nil {
+		t.Fatal(err)
+	}
+	applyReport, err := json.Marshal(pipeline.Report{Version: 1, ClusterUID: string(stored.UID), OperationID: applyOperation.ID, ResolvedOptions: *stored.Status.ResolvedOptions, Recovery: *stored.Status.Recovery, Ready: servitorv1alpha1.ReadySummary{Resources: []servitorv1alpha1.SummaryResource{{Role: "Cluster", Name: "cluster", ID: "cluster-id"}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reconciler.Logs = reportLogs{data: applyReport}
+	if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Get(context.Background(), request.NamespacedName, stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status.Phase != servitorv1alpha1.PhaseReady || stored.Status.Operation != nil || stored.Status.Ready == nil || stored.Spec.Lifecycle.Approval != "" || stored.Status.Review != nil || stored.Status.ReviewDeadline != nil || stored.Status.ReviewApproval != "" {
+		t.Fatalf("automatic apply did not reach Ready without approval state: %+v", stored.Status)
 	}
 }
 
@@ -478,6 +518,7 @@ func TestReconcileRejectsChangedLifecyclePolicy(t *testing.T) {
 }
 
 func TestReconcileApprovedApplyUsesFrozenInputsAndAdoptsReadyReport(t *testing.T) {
+	t.Skip("approval-driven apply is obsolete")
 	scheme := runtime.NewScheme()
 	if err := servitorv1alpha1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
@@ -590,6 +631,7 @@ func TestReconcileApprovedApplyUsesFrozenInputsAndAdoptsReadyReport(t *testing.T
 }
 
 func TestReconcileApprovalSetBeforeReviewRequiresNewApproval(t *testing.T) {
+	t.Skip("approval state is obsolete")
 	scheme := runtime.NewScheme()
 	if err := servitorv1alpha1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
@@ -652,6 +694,7 @@ func TestReconcileApprovalSetBeforeReviewRequiresNewApproval(t *testing.T) {
 }
 
 func TestReconcileApprovalRejectsLateAndRejectedDecisions(t *testing.T) {
+	t.Skip("approval state is obsolete")
 	for _, test := range []struct {
 		name     string
 		approval string
@@ -683,6 +726,7 @@ func TestReconcileApprovalRejectsLateAndRejectedDecisions(t *testing.T) {
 }
 
 func TestReviewExpiryCleanupProgressesWithoutExternalEvents(t *testing.T) {
+	t.Skip("review expiry is obsolete")
 	now := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
 	cluster := cleanupCluster(now)
 	deadline := metav1.NewTime(now)
@@ -914,14 +958,6 @@ func TestCleanupSourcesPersistTypedReason(t *testing.T) {
 		reason servitorv1alpha1.CleanupReason
 		setup  func(*servitorv1alpha1.ServitorCluster, *tektonv1.PipelineRun)
 	}{
-		{"rejected review", servitorv1alpha1.CleanupReasonRejected, func(cluster *servitorv1alpha1.ServitorCluster, _ *tektonv1.PipelineRun) {
-			deadline := metav1.NewTime(now.Add(time.Minute))
-			cluster.Status.Phase, cluster.Status.ReviewDeadline, cluster.Spec.Lifecycle.Approval = servitorv1alpha1.PhaseAwaitingApproval, &deadline, "rejected"
-		}},
-		{"expired review", servitorv1alpha1.CleanupReasonReviewExpired, func(cluster *servitorv1alpha1.ServitorCluster, _ *tektonv1.PipelineRun) {
-			expired := metav1.NewTime(now)
-			cluster.Status.Phase, cluster.Status.ReviewDeadline = servitorv1alpha1.PhaseAwaitingApproval, &expired
-		}},
 		{"planning failure", servitorv1alpha1.CleanupReasonPlanningFailed, func(cluster *servitorv1alpha1.ServitorCluster, run *tektonv1.PipelineRun) {
 			cluster.Status.Phase = servitorv1alpha1.PhasePlanning
 			cluster.Status.Operation = operationReference("plan", "plan-run")

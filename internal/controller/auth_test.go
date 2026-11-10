@@ -32,7 +32,7 @@ func (c publisherCacheUnavailableClient) Get(ctx context.Context, key client.Obj
 	}
 }
 
-func TestApprovalResumesPartialPublisherResourcesWithoutInformerCache(t *testing.T) {
+func TestApplyDispatchResumesPartialPublisherResourcesWithoutInformerCache(t *testing.T) {
 	scheme := runtime.NewScheme()
 	for _, add := range []func(*runtime.Scheme) error{servitorv1alpha1.AddToScheme, corev1.AddToScheme, rbacv1.AddToScheme} {
 		if err := add(scheme); err != nil {
@@ -40,7 +40,6 @@ func TestApprovalResumesPartialPublisherResourcesWithoutInformerCache(t *testing
 		}
 	}
 	now := time.Date(2026, 9, 14, 0, 0, 0, 0, time.UTC)
-	deadline := metav1.NewTime(now.Add(time.Minute))
 	cluster := &servitorv1alpha1.ServitorCluster{
 		ObjectMeta: metav1.ObjectMeta{Name: "cluster", Namespace: "ns", UID: "allocation-uid", Generation: 2},
 		Spec: servitorv1alpha1.ServitorClusterSpec{
@@ -48,11 +47,10 @@ func TestApprovalResumesPartialPublisherResourcesWithoutInformerCache(t *testing
 			Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 3600, RetrySeconds: []int64{60}},
 		},
 		Status: servitorv1alpha1.ServitorClusterStatus{
-			Phase:             servitorv1alpha1.PhaseAwaitingApproval,
+			Phase:             servitorv1alpha1.PhasePending,
 			ResolvedOptions:   &servitorv1alpha1.ResolvedOptions{},
+			Recovery:          validRecoveryPointer(),
 			LifecycleSnapshot: &servitorv1alpha1.LifecycleSnapshot{InitialLeaseSeconds: 3600, RetrySeconds: []int64{60}, PublicAuthEligible: true},
-			ReviewDeadline:    &deadline,
-			ReviewGeneration:  1,
 		},
 	}
 	name := authResourceName(cluster)
@@ -64,11 +62,9 @@ func TestApprovalResumesPartialPublisherResourcesWithoutInformerCache(t *testing
 	if err := base.Get(context.Background(), types.NamespacedName{Namespace: cluster.Namespace, Name: cluster.Name}, approved); err != nil {
 		t.Fatal(err)
 	}
-	approved.Spec.Lifecycle.Approval = "approved"
-	approved.Generation = approved.Status.ReviewGeneration + 1
 	cached := publisherCacheUnavailableClient{Client: base}
 	reconciler := &Reconciler{Client: cached, DirectReader: base, Config: Config{Namespace: "ns"}, Now: func() time.Time { return now }}
-	if _, err := reconciler.reconcileApproval(context.Background(), approved); err != nil {
+	if _, err := reconciler.dispatchApply(context.Background(), approved); err != nil {
 		t.Fatal(err)
 	}
 	stored := &servitorv1alpha1.ServitorCluster{}
@@ -76,12 +72,12 @@ func TestApprovalResumesPartialPublisherResourcesWithoutInformerCache(t *testing
 		t.Fatal(err)
 	}
 	if stored.Status.Phase != servitorv1alpha1.PhaseApplying || !stored.Status.ApplyDispatched || stored.Status.Operation == nil || stored.Status.Operation.ID != operation {
-		t.Fatalf("approval did not persist Applying after partial publisher creation: %+v", stored.Status)
+		t.Fatalf("apply dispatch did not persist Applying after partial publisher creation: %+v", stored.Status)
 	}
 	attemptName := pipeline.AuthAttemptResourceName(string(cluster.UID), initialAuthAttemptID(string(cluster.UID), operation, ""))
 	for _, object := range []client.Object{&rbacv1.Role{}, &rbacv1.RoleBinding{}} {
 		if err := base.Get(context.Background(), types.NamespacedName{Namespace: cluster.Namespace, Name: attemptName}, object); err != nil {
-			t.Fatalf("approval did not resume %T creation: %v", object, err)
+			t.Fatalf("apply dispatch did not resume %T creation: %v", object, err)
 		}
 	}
 }

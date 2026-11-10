@@ -57,13 +57,12 @@ var numericVersion = regexp.MustCompile(`^[0-9]+\.[0-9]+(?:\.[0-9]+)?(?:_openshi
 
 // ExplicitCreateOptions contains only user-supplied, safe options. It never includes defaults.
 type ExplicitCreateOptions struct {
-	values           map[string][]string
-	bare             []string
-	authRequested    bool
-	approveRequested bool
-	dryRunRequested  bool
-	headlamp         bool
-	privateOnly      bool
+	values          map[string][]string
+	bare            []string
+	authRequested   bool
+	dryRunRequested bool
+	headlamp        bool
+	privateOnly     bool
 }
 
 // Values returns a copy of the explicitly supplied safe flag values.
@@ -82,9 +81,6 @@ func (o ExplicitCreateOptions) BareValues() []string {
 
 // AuthRequested reports whether create requested auth-bundle delivery.
 func (o ExplicitCreateOptions) AuthRequested() bool { return o.authRequested }
-
-// ApproveRequested reports whether create requested automatic approval after review delivery.
-func (o ExplicitCreateOptions) ApproveRequested() bool { return o.approveRequested }
 
 // DryRunRequested reports whether create requested a configuration preview.
 func (o ExplicitCreateOptions) DryRunRequested() bool { return o.dryRunRequested }
@@ -120,14 +116,16 @@ func ParseCreateOptions(text string) (ExplicitCreateOptions, error) {
 	seen, values := map[string]bool{}, map[string][]string{}
 	var bare []string
 	authRequested := false
-	approveRequested := false
 	dryRunRequested := false
 	headlamp := false
 	privateOnly := false
 	for _, word := range words[1:] {
 		key, value, assigned := strings.Cut(word, "=")
 		if !assigned {
-			if word == "auth" || word == "approve" || word == "dry-run" || word == "headlamp" || word == "private-only" {
+			if word == "approve" {
+				return ExplicitCreateOptions{}, fmt.Errorf("approve is no longer supported")
+			}
+			if word == "auth" || word == "dry-run" || word == "headlamp" || word == "private-only" {
 				if seen[word] {
 					return ExplicitCreateOptions{}, fmt.Errorf("%s may only be supplied once", word)
 				}
@@ -135,8 +133,6 @@ func ParseCreateOptions(text string) (ExplicitCreateOptions, error) {
 				switch word {
 				case "auth":
 					authRequested = true
-				case "approve":
-					approveRequested = true
 				case "dry-run":
 					dryRunRequested = true
 				case "headlamp":
@@ -161,7 +157,10 @@ func ParseCreateOptions(text string) (ExplicitCreateOptions, error) {
 		if strings.HasPrefix(key, "-") {
 			return ExplicitCreateOptions{}, fmt.Errorf("create options must use key=value without leading dashes")
 		}
-		if key == "auth" || key == "approve" || key == "dry-run" || key == "private-only" {
+		if key == "approve" {
+			return ExplicitCreateOptions{}, fmt.Errorf("approve is no longer supported")
+		}
+		if key == "auth" || key == "dry-run" || key == "private-only" {
 			if seen[key] {
 				return ExplicitCreateOptions{}, fmt.Errorf("%s may only be supplied once", key)
 			}
@@ -172,8 +171,6 @@ func ParseCreateOptions(text string) (ExplicitCreateOptions, error) {
 			switch key {
 			case "auth":
 				authRequested = value == "true"
-			case "approve":
-				approveRequested = value == "true"
 			case "dry-run":
 				dryRunRequested = value == "true"
 			case "private-only":
@@ -207,7 +204,7 @@ func ParseCreateOptions(text string) (ExplicitCreateOptions, error) {
 		seen[flag] = true
 		values[flag] = append(values[flag], value)
 	}
-	options := ExplicitCreateOptions{values: values, bare: bare, authRequested: authRequested, approveRequested: approveRequested, dryRunRequested: dryRunRequested, headlamp: headlamp, privateOnly: privateOnly}
+	options := ExplicitCreateOptions{values: values, bare: bare, authRequested: authRequested, dryRunRequested: dryRunRequested, headlamp: headlamp, privateOnly: privateOnly}
 	if _, err := options.WorkerCount(); err != nil {
 		return ExplicitCreateOptions{}, err
 	}

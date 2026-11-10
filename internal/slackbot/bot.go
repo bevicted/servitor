@@ -120,8 +120,6 @@ func (b Bot) Handle(ctx context.Context, envelope Envelope) error {
 	reply := func(text string) { b.respond(ctx, message.Channel, thread, text) }
 	if message.ThreadTimestamp != "" {
 		switch message.Text {
-		case "yes", "no":
-			b.confirm(ctx, message, thread)
 		case "done":
 			b.cleanup(ctx, message, thread, true)
 		case "destroy":
@@ -320,7 +318,6 @@ func (b Bot) create(ctx context.Context, message Message, text string, respond f
 		}
 	}
 	authRequested := options.AuthRequested()
-	autoApprove := options.ApproveRequested()
 	allocations, err := b.ownerAllocations(ctx, message.User)
 	if err != nil {
 		b.logf("list allocations for admission: %v", err)
@@ -334,7 +331,7 @@ func (b Bot) create(ctx context.Context, message Message, text string, respond f
 	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: b.Namespace}, Spec: servitorv1alpha1.ServitorClusterSpec{
 		Slack:       servitorv1alpha1.SlackIdentity{OwnerID: message.User, ChannelID: message.Channel, ThreadTimestamp: message.Timestamp},
 		UserOptions: userOptions,
-		Lifecycle:   servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: int64(b.lease() / time.Second), RetrySeconds: seconds(b.RetryIntervals), AutoApprove: autoApprove},
+		Lifecycle:   servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: int64(b.lease() / time.Second), RetrySeconds: seconds(b.RetryIntervals)},
 	}}
 	authEligible := b.authDeliveryEligible(cluster)
 	if authRequested && authEligible {
@@ -345,12 +342,12 @@ func (b Bot) create(ctx context.Context, message Message, text string, respond f
 		cluster.Spec.Lifecycle.AuthRequestTimestamp = message.Timestamp
 	}
 	// Delivery precedes CR creation. A controller can therefore never begin
-	// planning an allocation the user was not told was accepted.
+	// provisioning an allocation the user was not told was accepted.
 	if b.Responder == nil {
 		b.logf("deliver create acceptance: responder is not configured")
 		return false
 	}
-	if err := b.Responder.Reply(ctx, Response{Channel: message.Channel, ThreadTimestamp: message.Timestamp, Text: "Planning..."}); err != nil {
+	if err := b.Responder.Reply(ctx, Response{Channel: message.Channel, ThreadTimestamp: message.Timestamp, Text: "Provisioning..."}); err != nil {
 		b.logf("deliver create acceptance: %v", err)
 		return false
 	}
@@ -369,76 +366,6 @@ func (b Bot) create(ctx context.Context, message Message, text string, respond f
 		respond("Authentication delivery is unavailable for this allocation.")
 	}
 	return true
-}
-
-type reviewDecisionOutcome string
-
-const (
-	reviewDecisionRecorded  reviewDecisionOutcome = "recorded"
-	reviewDecisionExpired   reviewDecisionOutcome = "expired"
-	reviewDecisionInvalid   reviewDecisionOutcome = "invalid"
-	reviewDecisionStale     reviewDecisionOutcome = "stale"
-	reviewDecisionAutomatic reviewDecisionOutcome = "automatic"
-)
-
-func (b Bot) confirm(ctx context.Context, message Message, thread string) {
-	cluster, err := b.ownerCluster(ctx, message, thread)
-	if err != nil || !ownsThread(cluster, message, thread, true) {
-		return
-	}
-	approval := "approved"
-	if message.Text == "no" {
-		approval = "rejected"
-	}
-	outcome, err := b.recordReviewDecision(ctx, cluster.Name, message, thread, approval)
-	if err != nil {
-		b.logf("record review decision: %v", err)
-		return
-	}
-	switch outcome {
-	case reviewDecisionRecorded:
-		if approval == "rejected" {
-			b.respondCleanupCause(ctx, message.Channel, thread, cluster, servitorv1alpha1.CleanupReasonRejected, "Plan rejected.\nCleaning up...")
-			return
-		}
-		b.respond(ctx, message.Channel, thread, "Plan approved, creating...\nThis may take 30m-90m.")
-	case reviewDecisionExpired:
-		b.respond(ctx, message.Channel, thread, "The review deadline has passed. No decision was recorded; cleanup will begin.")
-	case reviewDecisionInvalid:
-		b.respond(ctx, message.Channel, thread, "This plan is no longer awaiting review. No decision was recorded.")
-	case reviewDecisionStale:
-		b.respond(ctx, message.Channel, thread, "A review decision has already been recorded. No decision was recorded.")
-	case reviewDecisionAutomatic:
-		b.respond(ctx, message.Channel, thread, "This request will be approved automatically after the plan summary is delivered.")
-	}
-}
-
-func (b Bot) recordReviewDecision(ctx context.Context, name string, message Message, thread, approval string) (reviewDecisionOutcome, error) {
-	outcome := reviewDecisionInvalid
-	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		current := &servitorv1alpha1.ServitorCluster{}
-		if err := b.allocationReader().Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: name}, current); err != nil {
-			return err
-		}
-		switch {
-		case !ownsThread(current, message, thread, true), current.Status.Phase != servitorv1alpha1.PhaseAwaitingApproval, current.Status.ReviewDeadline == nil:
-			outcome = reviewDecisionInvalid
-			return nil
-		case !b.now().Before(current.Status.ReviewDeadline.Time):
-			outcome = reviewDecisionExpired
-			return nil
-		case current.Spec.Lifecycle.Approval != "":
-			outcome = reviewDecisionStale
-			return nil
-		case approval == "approved" && current.Spec.Lifecycle.AutoApprove:
-			outcome = reviewDecisionAutomatic
-			return nil
-		}
-		current.Spec.Lifecycle.Approval = approval
-		outcome = reviewDecisionRecorded
-		return b.Client.Update(ctx, current)
-	})
-	return outcome, err
 }
 
 func (b Bot) cleanup(ctx context.Context, message Message, thread string, acknowledge bool) {
@@ -789,12 +716,8 @@ func extensionUnavailableText(cluster *servitorv1alpha1.ServitorCluster, now tim
 		return "Cleanup is in progress. The lease cannot be extended."
 	}
 	switch cluster.Status.Phase {
-	case servitorv1alpha1.PhasePending, servitorv1alpha1.PhasePlanning:
-		return "Planning is in progress. Extend is available when your cluster is ready."
-	case servitorv1alpha1.PhaseAwaitingApproval:
-		return "This plan is awaiting review. Reply yes or no in this thread."
-	case servitorv1alpha1.PhaseApplying:
-		return "Your cluster is being created. Extend is available when your cluster is ready."
+	case servitorv1alpha1.PhasePending, servitorv1alpha1.PhasePlanning, servitorv1alpha1.PhaseAwaitingApproval, servitorv1alpha1.PhaseApplying:
+		return "Provisioning is in progress. Extend is available when your cluster is ready."
 	case servitorv1alpha1.PhaseCleanupComplete:
 		return "Cleanup is complete. Use @servitor create to start a new allocation."
 	case servitorv1alpha1.PhaseUnresolved:
@@ -1124,7 +1047,7 @@ func (b Bot) respondHelp(text string, respond func(string), maintainer bool) {
 	case "done":
 		messages = []string{"`done` in a lifecycle thread releases that allocation. `@servitor done` in the configured channel requests cleanup for all of your allocations in that channel. It is unavailable after cleanup completes; repeated requests report cleanup in progress."}
 	case "extend":
-		messages = []string{"`extend [N[h]]` extends your ready lease by the configured duration or by 1 through 24 whole hours. Use it only in your lifecycle thread. It is available only while the lease is ready, not during planning, cleanup, or after expiry."}
+		messages = []string{"`extend [N[h]]` extends your ready lease by the configured duration or by 1 through 24 whole hours. Use it only in your lifecycle thread. It is available only while the lease is ready, not during provisioning, cleanup, or after expiry."}
 	case "auth":
 		messages = []string{"`auth` sends the complete stored authentication bundle to the allocation owner's DM. Use exact `auth` only in the initiating lifecycle thread. Requests made before Ready are queued; a failed or interrupted delivery is not retried automatically, so send a newer `auth` request to resend the stored files. A VPN bundle includes its actual certificate expiry; extending the lease does not renew it. Satellite authentication is unavailable."}
 	case "list":
@@ -1212,17 +1135,17 @@ func (b Bot) unknownText() string {
 }
 func rejectedText(reason string) string { return "Command rejected.\n\n" + reason }
 func helpOverview(maintainer bool, maxAllocationsPerUser int) []string {
-	text := fmt.Sprintf("Servitor provisions up to %d temporary IBM Cloud clusters per Slack user, one per initiating lifecycle thread.\n\nCommands\n```\nDM\n  help [command]          print help\n  list                    list clusters\n\nConfigured channel\n  @servitor help [command]  print help\n  @servitor create [safe options]  provision a new cluster\n  @servitor done            request cleanup for all your allocations in this channel\n  @servitor list            list clusters\n\nLifecycle thread\n  yes                       approve the cluster plan\n  no                        reject the cluster plan\n  done                      release this allocation\n  extend [N[h]]             extend your lease\n  auth                      send stored authentication bundle to your DM\n", maxAllocationsPerUser)
+	text := fmt.Sprintf("Servitor provisions up to %d temporary IBM Cloud clusters per Slack user, one per initiating lifecycle thread.\n\nCommands\n```\nDM\n  help [command]          print help\n  list                    list clusters\n\nConfigured channel\n  @servitor help [command]  print help\n  @servitor create [safe options]  provision a new cluster\n  @servitor done            request cleanup for all your allocations in this channel\n  @servitor list            list clusters\n\nLifecycle thread\n  done                      release this allocation\n  extend [N[h]]             extend your lease\n  auth                      send stored authentication bundle to your DM\n", maxAllocationsPerUser)
 	if maintainer {
 		text += "\nMaintainer DM\n  refresh inventory         refresh private inventory\n"
 	}
 	return []string{text + "```"}
 }
 func createHelp(defaults command.CreateDefaults, maxAllocationsPerUser int) []string {
-	return []string{fmt.Sprintf("Create a cluster from the configured channel root:\n```\n@servitor create [key=value ...]\n\nExamples\n  @servitor create version=roks\n  @servitor create kubernetes headlamp\n  @servitor create version=iks worker-count=3 auth=true\n  @servitor create dry-run kubernetes headlamp\n\nCommon\n  target=<target>          environment; default: %s\n  provider=<provider>      vpc-gen2 | classic; default: %s\n  version=<version>        roks (OpenShift) | iks (Kubernetes) | numeric stream\n                          default: %s\n  worker-count=<1-100>      workers\n  auth=true                DM authentication when ready, if available; default: false\n  dry-run                  configuration preview only; default: false\n  approve=true             auto-approve after the plan is delivered; default: false\n  headlamp                 install the managed add-on; Kubernetes only\n\nVPC Gen 2\n  zone=<zone>\n  flavor=<flavor>\n  private-only=true        omit the public endpoint; default: false\n\nClassic\n  datacenter=<datacenter>\n  machine-type=<type>\n  public-vlan-id=<id>\n  private-vlan-id=<id>\n```\nUp to %d active allocations per user.\n`dry-run` or `dry-run=true` previews configuration only: it does not provision or reserve capacity. It shows `generated on create` and `resolved during provisioning` when values are not locally known. `dry-run=false` provisions normally; a later create is a separate request whose defaults may change.\nWithout `approve=true`, reply `yes` or `no` in the plan thread before its deadline.\nAll accepted forms: `help create-options` (DM).", safeHelpCell(defaults.Target), safeHelpCell(defaults.Provider), safeHelpCell(defaults.Version), maxAllocationsPerUser)}
+	return []string{fmt.Sprintf("Create a cluster from the configured channel root:\n```\n@servitor create [key=value ...]\n\nExamples\n  @servitor create version=roks\n  @servitor create kubernetes headlamp\n  @servitor create version=iks worker-count=3 auth=true\n  @servitor create dry-run kubernetes headlamp\n\nCommon\n  target=<target>          environment; default: %s\n  provider=<provider>      vpc-gen2 | classic; default: %s\n  version=<version>        roks (OpenShift) | iks (Kubernetes) | numeric stream\n                          default: %s\n  worker-count=<1-100>      workers\n  auth=true                DM authentication when ready, if available; default: false\n  dry-run                  configuration preview only; default: false\n  headlamp                 install the managed add-on; Kubernetes only\n\nVPC Gen 2\n  zone=<zone>\n  flavor=<flavor>\n  private-only=true        omit the public endpoint; default: false\n\nClassic\n  datacenter=<datacenter>\n  machine-type=<type>\n  public-vlan-id=<id>\n  private-vlan-id=<id>\n```\nUp to %d active allocations per user.\n`dry-run` or `dry-run=true` previews configuration only: it does not provision or reserve capacity. It shows `generated on create` and `resolved during provisioning` when values are not locally known. `dry-run=false` provisions normally; a later create is a separate request whose defaults may change.\nAccepted requests provision automatically.\nAll accepted forms: `help create-options` (DM).", safeHelpCell(defaults.Target), safeHelpCell(defaults.Provider), safeHelpCell(defaults.Version), maxAllocationsPerUser)}
 }
 func createOptionsHelp() []string {
-	return []string{"```\nKeyed form                    Bare form\n  target=<target>               <target>\n  provider=<provider>           <provider>\n  version=<version>             <version>\n  worker-count=<1-100>           -\n  auth=true | auth=false        auth\n  dry-run=true | dry-run=false  dry-run\n  approve=true | approve=false  approve\n  private-only=true             private-only\n  private-only=false            -\n  zone=<zone>                   <zone>\n  flavor=<flavor>               <flavor>\n  datacenter=<datacenter>       <datacenter>\n  machine-type=<type>           <type>\n  public-vlan-id=<id>           -\n  private-vlan-id=<id>          -\n\nTargets\n  <configured-target>\n  prestage | pretest\n  stage | test\n\nProviders\n  vpc-gen2 | classic\n\nVersions\n  roks | openshift | default_openshift\n  iks | kubernetes | k8s | default_kubernetes\n  <numeric-version>\n  <numeric-version>_openshift\n\nVersion refinement\n  <alias> <compatible-numeric-version>\n```"}
+	return []string{"```\nKeyed form                    Bare form\n  target=<target>               <target>\n  provider=<provider>           <provider>\n  version=<version>             <version>\n  worker-count=<1-100>           -\n  auth=true | auth=false        auth\n  dry-run=true | dry-run=false  dry-run\n  private-only=true             private-only\n  private-only=false            -\n  zone=<zone>                   <zone>\n  flavor=<flavor>               <flavor>\n  datacenter=<datacenter>       <datacenter>\n  machine-type=<type>           <type>\n  public-vlan-id=<id>           -\n  private-vlan-id=<id>          -\n\nTargets\n  <configured-target>\n  prestage | pretest\n  stage | test\n\nProviders\n  vpc-gen2 | classic\n\nVersions\n  roks | openshift | default_openshift\n  iks | kubernetes | k8s | default_kubernetes\n  <numeric-version>\n  <numeric-version>_openshift\n\nVersion refinement\n  <alias> <compatible-numeric-version>\n```"}
 }
 
 func safeHelpCell(value string) string {

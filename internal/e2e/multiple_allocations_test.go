@@ -15,7 +15,6 @@ import (
 	"github.com/bevicted/servitor/internal/state"
 	tektonv1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1"
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -133,16 +132,7 @@ func TestMultipleThreadAllocationsAdmissionAndCleanup(t *testing.T) {
 		t.Fatalf("thread allocations share backend keys: %v", backendKeys)
 	}
 
-	first := &servitorv1alpha1.ServitorCluster{}
-	if err := kube.Get(ctx, types.NamespacedName{Namespace: "ns", Name: byThread[threads[0]].Name}, first); err != nil {
-		t.Fatal(err)
-	}
-	first.Status.Phase = servitorv1alpha1.PhaseAwaitingApproval
-	first.Status.ReviewDeadline = &metav1.Time{Time: now.Add(time.Hour)}
-	if err := kube.Status().Update(ctx, first); err != nil {
-		t.Fatal(err)
-	}
-	if err := bot.Handle(ctx, slackbot.Envelope{ID: "approve-first", Message: slackbot.Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "yes", Timestamp: "1710000010.000100", ThreadTimestamp: threads[0]}}); err != nil {
+	if err := bot.Handle(ctx, slackbot.Envelope{ID: "ignored-yes", Message: slackbot.Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "yes", Timestamp: "1710000010.000100", ThreadTimestamp: threads[0]}}); err != nil {
 		t.Fatal(err)
 	}
 	for _, thread := range threads {
@@ -150,8 +140,8 @@ func TestMultipleThreadAllocationsAdmissionAndCleanup(t *testing.T) {
 		if err := kube.Get(ctx, types.NamespacedName{Namespace: "ns", Name: byThread[thread].Name}, stored); err != nil {
 			t.Fatal(err)
 		}
-		if (thread == threads[0]) != (stored.Spec.Lifecycle.Approval == "approved") {
-			t.Fatalf("approval isolation for %s = %q", thread, stored.Spec.Lifecycle.Approval)
+		if stored.Spec.Lifecycle.Approval != "" || stored.Spec.Lifecycle.CleanupRequested {
+			t.Fatalf("yes mutated allocation %s: %+v", thread, stored.Spec.Lifecycle)
 		}
 	}
 
@@ -185,7 +175,7 @@ func TestMultipleThreadAllocationsAdmissionAndCleanup(t *testing.T) {
 		t.Fatal("channel cleanup changed another owner's allocation")
 	}
 	create("capacity-regained", "U1", "1710000005.000100")
-	if got := responses.values[len(responses.values)-1].Text; got != "Planning..." {
+	if got := responses.values[len(responses.values)-1].Text; got != "Provisioning..." {
 		t.Fatalf("post-cleanup create = %q", got)
 	}
 }

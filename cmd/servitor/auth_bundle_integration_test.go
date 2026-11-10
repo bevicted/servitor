@@ -126,7 +126,7 @@ func runConnectedAuthBundleFlow(t *testing.T, task string, endpoints connectedEn
 	}
 	stored := connectedCluster(t, kube, request)
 	frozen := *stored.Status.ResolvedOptions
-	// Planning normally supplies the final cluster name before approval.
+	// Planning supplies the final cluster name before automatic apply dispatch.
 	frozen.ClusterName = "allocation"
 	stored.Status.ResolvedOptions = &frozen
 	if frozen.Network.AuthPolicy == nil {
@@ -140,17 +140,9 @@ func runConnectedAuthBundleFlow(t *testing.T, task string, endpoints connectedEn
 		t.Fatal("configuration change rewrote the frozen policy")
 	}
 	stored.Status.Recovery = connectedRecovery(frozen)
-	stored.Status.Phase = servitorv1alpha1.PhaseAwaitingApproval
-	stored.Status.Operation = &servitorv1alpha1.OperationReference{ID: "plan-allocation", Kind: "plan", Adopted: true}
-	stored.Status.ReviewDeadline = &metav1.Time{Time: now.Add(time.Hour)}
-	stored.Status.ReviewGeneration = stored.Generation
+	stored.Status.Phase = servitorv1alpha1.PhasePending
+	stored.Status.Operation = nil
 	if err := kube.Status().Update(context.Background(), stored); err != nil {
-		t.Fatal(err)
-	}
-	stored = connectedCluster(t, kube, request)
-	stored.Spec.Lifecycle.Approval = "approved"
-	stored.Generation++
-	if err := kube.Update(context.Background(), stored); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
@@ -158,7 +150,7 @@ func runConnectedAuthBundleFlow(t *testing.T, task string, endpoints connectedEn
 	}
 	stored = connectedCluster(t, kube, request)
 	if stored.Status.Operation == nil || stored.Status.Operation.Kind != "apply" {
-		t.Fatalf("approval did not start apply: %+v", stored.Status.Operation)
+		t.Fatalf("recovery adoption did not start apply: %+v", stored.Status.Operation)
 	}
 	if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
 		t.Fatal(err)

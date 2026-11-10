@@ -8,11 +8,10 @@ It runs as a namespaced Kubernetes operator. Each Slack lifecycle thread maps to
 
 1. A user requests a cluster in the configured Slack channel.
 2. Servitor freezes the request and operator defaults, then runs an ICT plan.
-3. Servitor posts a sanitized summary to the lifecycle thread.
-4. The owner approves the request, or uses `approve=true` when creating it.
-5. Servitor runs a fresh apply and manages the cluster until its lease expires or the owner requests cleanup.
+3. Servitor persists the validated recovery metadata and posts an informational configuration table to the lifecycle thread.
+4. Servitor runs a fresh apply automatically and manages the cluster until its lease expires or the owner requests cleanup.
 
-Approval applies the frozen configuration, not a saved Terraform plan. Cloud drift can therefore change the actions between review and apply.
+Apply uses the frozen configuration, not a saved Terraform plan. Cloud drift can therefore change the actions between plan and apply.
 
 Servitor supports:
 
@@ -36,13 +35,12 @@ New Satellite allocations are not supported.
 | Configured channel | `@servitor create [options]` | Create an allocation |
 | Configured channel | `@servitor list` | List your allocations |
 | Configured channel | `@servitor done` | Clean up all your allocations in the channel |
-| Lifecycle thread | `yes` / `no` | Approve or reject the request |
 | Lifecycle thread | `extend [N[h]]` | Extend the lease |
 | Lifecycle thread | `auth` | Send the stored auth bundle by DM |
 | Lifecycle thread | `auth retry` | Retry unavailable private VPC auth acquisition |
 | Lifecycle thread | `done` | Clean up this allocation |
 
-Only the allocation owner can approve, extend, request credentials, or clean up an allocation from its lifecycle thread. `destroy` is an alias for `done`.
+Only the allocation owner can extend, request credentials, or clean up an allocation from its lifecycle thread. `destroy` is an alias for `done`.
 
 ### Create examples
 
@@ -52,7 +50,7 @@ Only the allocation owner can approve, extend, request credentials, or clean up 
 @servitor create version=iks worker-count=3 auth=true
 @servitor create dry-run kubernetes headlamp
 @servitor create dry-run=true version=iks
-@servitor create dry-run=false vpc-gen2 us-south-1 bx2.4x16 approve
+@servitor create dry-run=false vpc-gen2 us-south-1 bx2.4x16
 ```
 
 Common options:
@@ -65,14 +63,13 @@ Common options:
 | `worker-count` | `1` to `100` |
 | `auth` | Request auth delivery when ready |
 | `dry-run` | Preview the locally resolved configuration only; no provisioning or capacity reservation |
-| `approve` | Approve automatically after the summary is delivered |
 | `headlamp` | Install the managed Headlamp add-on; Kubernetes only |
 | `private-only` | Create only a private endpoint; VPC Gen 2 only |
 | `zone`, `flavor` | VPC Gen 2 placement and worker shape |
 | `datacenter`, `machine-type` | Classic placement and worker shape |
 | `public-vlan-id`, `private-vlan-id` | Optional Classic VLAN IDs |
 
-Boolean options accept either a bare name, such as `auth`, or `name=true|false`. `dry-run` and `dry-run=true` return a configuration preview without creating an allocation, PipelineRun, or auth-delivery intent; `dry-run=false` follows the normal create flow. Preview uses locally known values only: the name is `generated on create` and ICT-derived values can be `resolved during provisioning`. It does not reserve capacity or guarantee cloud availability. A later normal create is a separate request whose defaults may change. Inventory-backed values can also be supplied in bare form when the match is unambiguous. Use `help create` and `help create-options` in Slack for the current grammar and configured defaults.
+Boolean options accept either a bare name, such as `auth`, or `name=true|false`. `dry-run` and `dry-run=true` return a configuration preview without creating an allocation, PipelineRun, or auth-delivery intent; `dry-run=false` follows the normal create flow, which provisions automatically. Preview uses locally known values only: the name is `generated on create` and ICT-derived values can be `resolved during provisioning`. It does not reserve capacity or guarantee cloud availability. A later normal create is a separate request whose defaults may change. Inventory-backed values can also be supplied in bare form when the match is unambiguous. Use `help create` and `help create-options` in Slack for the current grammar and configured defaults.
 
 Cluster names, resource groups, network IDs, and platform selection are controlled or derived by Servitor; users cannot override them directly.
 

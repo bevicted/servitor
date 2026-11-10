@@ -99,7 +99,7 @@ func TestParseCreateOptionsNormalizesAssignments(t *testing.T) {
 func TestParseCreateOptionsReservesHeadlampBeforeInventoryMatching(t *testing.T) {
 	for _, text := range []string{
 		"create headlamp",
-		"create headlamp auth approve kubernetes",
+		"create headlamp auth dry-run kubernetes",
 		"create headlamp version=1.31",
 	} {
 		t.Run(text, func(t *testing.T) {
@@ -188,34 +188,11 @@ func TestParseCreateOptionsTreatsDryRunAsServitorOnlyPreviewIntent(t *testing.T)
 	}
 }
 
-func TestParseCreateOptionsTreatsApproveAsServitorOnlyApprovalIntent(t *testing.T) {
-	for _, text := range []string{"create approve version=4.22", "create approve=true version=4.22", "create approve=false version=4.22", "create auth approve version=4.22"} {
+func TestParseCreateOptionsRejectsObsoleteApprovalArguments(t *testing.T) {
+	for _, text := range []string{"create approve", "create approve=true", "create approve=false", "create auth approve version=4.22"} {
 		t.Run(text, func(t *testing.T) {
-			options, err := ParseCreateOptions(text)
-			if err != nil {
-				t.Fatal(err)
-			}
-			want := strings.Contains(text, "approve") && !strings.Contains(text, "approve=false")
-			if options.ApproveRequested() != want || len(options.Values()["--approve"]) != 0 {
-				t.Fatalf("options = %#v, approve=%t; want approve=%t without provisioning option", options, options.ApproveRequested(), want)
-			}
-			request, err := ParseCreate(text, testCreateDefaults)
-			if err != nil || slices.Contains(request.Args, "--approve") || slices.Contains(request.Args, "--auto-approve") {
-				t.Fatalf("request = %#v, err=%v; approval must not reach ICT argv", request, err)
-			}
-		})
-	}
-	for _, test := range []struct{ text, want string }{
-		{"create approve approve", "approve may only be supplied once"},
-		{"create approve approve=false", "approve may only be supplied once"},
-		{"create approve=false approve=true", "approve may only be supplied once"},
-		{"create approve=TRUE", "approve must be true or false"},
-		{"create approve=", "approve must be true or false"},
-		{"create approve=maybe", "approve must be true or false"},
-	} {
-		t.Run(test.text, func(t *testing.T) {
-			if _, err := ParseCreateOptions(test.text); err == nil || !strings.Contains(err.Error(), test.want) {
-				t.Fatalf("ParseCreateOptions(%q) error = %v, want %q", test.text, err, test.want)
+			if _, err := ParseCreateOptions(text); err == nil || !strings.Contains(err.Error(), "approve is no longer supported") {
+				t.Fatalf("ParseCreateOptions(%q) error = %v", text, err)
 			}
 		})
 	}

@@ -11,9 +11,6 @@ import (
 	servitorv1alpha1 "github.com/bevicted/servitor/api/v1alpha1"
 	"github.com/bevicted/servitor/internal/lifecycle"
 	"github.com/bevicted/servitor/internal/state"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -60,9 +57,6 @@ func (n *StatusNotifier) notify(ctx context.Context) error {
 		cluster := &clusters.Items[i]
 		now := n.now()
 		for _, notice := range statusNoticesAt(cluster, now) {
-			if notice.reviewDeadline != nil && !n.now().Before(notice.reviewDeadline.Time) {
-				continue
-			}
 			claimed, err := n.Receipts.Claim(ctx, notice.id)
 			if err != nil {
 				return err
@@ -75,9 +69,9 @@ func (n *StatusNotifier) notify(ctx context.Context) error {
 				if delivered {
 					continue
 				}
-				if notice.cleanupCause || notice.review && cluster.Spec.Lifecycle.AutoApprove {
+				if notice.cleanupCause {
 					// A command or an earlier notifier may have claimed this reply.
-					// Do not let a later cleanup or auto-review chunk overtake it.
+					// Do not let a later cleanup notice overtake it.
 					break
 				}
 				continue
@@ -92,21 +86,14 @@ func (n *StatusNotifier) notify(ctx context.Context) error {
 				return err
 			}
 		}
-		if cluster.Spec.Lifecycle.AutoApprove {
-			if err := n.approveDeliveredReview(ctx, cluster, now); err != nil {
-				return err
-			}
-		}
 	}
 	return nil
 }
 
 type statusNotice struct {
-	id             string
-	text           string
-	cleanupCause   bool
-	review         bool
-	reviewDeadline *metav1.Time
+	id           string
+	text         string
+	cleanupCause bool
 }
 
 func (n *StatusNotifier) now() time.Time {
@@ -114,53 +101,6 @@ func (n *StatusNotifier) now() time.Time {
 		return n.Clock().UTC()
 	}
 	return time.Now().UTC()
-}
-
-// approveDeliveredReview records approval only after every persisted review
-// notice is known delivered. The controller remains responsible for apply.
-func (n *StatusNotifier) approveDeliveredReview(ctx context.Context, cluster *servitorv1alpha1.ServitorCluster, renderedAt time.Time) error {
-	if !cluster.Spec.Lifecycle.AutoApprove || cluster.Status.Phase != servitorv1alpha1.PhaseAwaitingApproval || cluster.Status.ResolvedOptions == nil || cluster.Status.Review == nil || cluster.Status.ReviewDeadline == nil || cluster.Status.ReviewGeneration == 0 || !renderedAt.Before(cluster.Status.ReviewDeadline.Time) {
-		return nil
-	}
-	ids := reviewNoticeIDsAt(cluster, renderedAt)
-	if len(ids) == 0 {
-		return nil
-	}
-	for _, id := range ids {
-		delivered, err := n.Receipts.Delivered(ctx, id)
-		if err != nil {
-			return err
-		}
-		if !delivered {
-			return nil
-		}
-	}
-	expectedUID := cluster.UID
-	expectedReviewGeneration := cluster.Status.ReviewGeneration
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		current := &servitorv1alpha1.ServitorCluster{}
-		if err := n.Client.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: cluster.Name}, current); err != nil {
-			return err
-		}
-		if current.UID != expectedUID || current.Status.ReviewGeneration != expectedReviewGeneration || !current.Spec.Lifecycle.AutoApprove || current.Spec.Lifecycle.Approval != "" || current.Status.ReviewApproval != "" || current.Status.Phase != servitorv1alpha1.PhaseAwaitingApproval || current.Status.ResolvedOptions == nil || current.Status.Review == nil || current.Status.ReviewDeadline == nil || !n.now().Before(current.Status.ReviewDeadline.Time) || !current.DeletionTimestamp.IsZero() || current.Spec.Lifecycle.CleanupRequested || current.Status.CleanupRequested || current.Status.Cleanup != nil {
-			return nil
-		}
-		current.Spec.Lifecycle.Approval = "approved"
-		return n.Client.Update(ctx, current)
-	})
-}
-
-func reviewNoticeIDsAt(cluster *servitorv1alpha1.ServitorCluster, renderedAt time.Time) []string {
-	if cluster.Status.ReviewDeadline == nil {
-		return nil
-	}
-	texts := reviewNoticeTexts(cluster.Status.ResolvedOptions, cluster.Status.Review, cluster.Status.ReviewDeadline.Time, renderedAt, cluster.Spec.Lifecycle.AutoApprove)
-	notices := phaseNotices(clusterNoticeUID(cluster), servitorv1alpha1.PhaseAwaitingApproval, texts)
-	ids := make([]string, len(notices))
-	for index := range notices {
-		ids[index] = notices[index].id
-	}
-	return ids
 }
 
 func statusNotices(cluster *servitorv1alpha1.ServitorCluster) []statusNotice {
@@ -175,10 +115,6 @@ func statusNoticesAt(cluster *servitorv1alpha1.ServitorCluster, now time.Time) [
 	phase := cluster.Status.Phase
 	var texts []string
 	switch phase {
-	case servitorv1alpha1.PhaseAwaitingApproval:
-		if cluster.Status.ReviewDeadline != nil && now.Before(cluster.Status.ReviewDeadline.Time) {
-			texts = reviewNoticeTexts(cluster.Status.ResolvedOptions, cluster.Status.Review, cluster.Status.ReviewDeadline.Time, now, cluster.Spec.Lifecycle.AutoApprove)
-		}
 	case servitorv1alpha1.PhaseReady:
 		expiry := time.Time{}
 		if cluster.Status.LeaseExpiresAt != nil {
@@ -198,14 +134,10 @@ func statusNoticesAt(cluster *servitorv1alpha1.ServitorCluster, now time.Time) [
 	if cleanup := cluster.Status.Cleanup; cleanup != nil {
 		notices = append(notices, statusNotice{id: cleanupCauseNoticeID(uid, cleanup.Reason), text: cleanupCauseText(cleanup.Reason, cluster.Status.PlanRejection), cleanupCause: true})
 	}
-	phaseNotices := phaseNotices(uid, phase, texts)
-	if phase == servitorv1alpha1.PhaseAwaitingApproval && cluster.Status.ReviewDeadline != nil {
-		for index := range phaseNotices {
-			phaseNotices[index].review = true
-			phaseNotices[index].reviewDeadline = cluster.Status.ReviewDeadline
-		}
+	if cluster.Status.Recovery != nil && cluster.Status.ResolvedOptions != nil {
+		notices = append(notices, phaseNotices(uid, "configuration", configurationNoticeTexts(cluster.Status.ResolvedOptions))...)
 	}
-	notices = append(notices, phaseNotices...)
+	notices = append(notices, phaseNotices(uid, phase, texts)...)
 	if cleanup := cluster.Status.Cleanup; cleanup != nil && cleanup.NextRetryAt != nil && phase == servitorv1alpha1.PhaseCleanupPending {
 		notices = append(notices, statusNotice{id: fmt.Sprintf("cleanup-retry:%s:%d", uid, cleanup.RetryCount), text: fmt.Sprintf("Cleanup retry %d is scheduled for %s.", cleanup.RetryCount, cleanup.NextRetryAt.Time.UTC().Format("2006-01-02 15:04:05 UTC"))})
 	}
@@ -238,12 +170,8 @@ func cleanupCauseText(reason servitorv1alpha1.CleanupReason, rejection *servitor
 		return planRejectionText(*rejection) + "\nCleaning up..."
 	}
 	switch reason {
-	case servitorv1alpha1.CleanupReasonRejected:
-		return "Plan rejected.\nCleaning up..."
-	case servitorv1alpha1.CleanupReasonReviewExpired:
-		return "Plan auto rejected due to missed approval deadline.\nCleaning up..."
 	case servitorv1alpha1.CleanupReasonPlanningFailed:
-		return "Planning failed. Cleaning up..."
+		return "Provisioning failed. Cleaning up..."
 	case servitorv1alpha1.CleanupReasonApplyFailed:
 		return "Apply failed. Cleaning up..."
 	case servitorv1alpha1.CleanupReasonLeaseExpired:
@@ -257,13 +185,13 @@ func planRejectionText(rejection servitorv1alpha1.PlanRejection) string {
 	key := "`" + rejection.OptionKey + "`"
 	switch rejection.ReasonCode {
 	case "target_not_configured":
-		return "Cannot plan this request: " + key + " is not configured. Correct " + key + " and create a new request."
+		return "Cannot provision this request: " + key + " is not configured. Correct " + key + " and create a new request."
 	case "provider_not_supported":
-		return "Cannot plan this request: " + key + " is not supported for the selected target. Correct " + key + " and create a new request."
+		return "Cannot provision this request: " + key + " is not supported for the selected target. Correct " + key + " and create a new request."
 	case "version_not_supported":
-		return "Cannot plan this request: " + key + " is not supported. Correct " + key + " and create a new request."
+		return "Cannot provision this request: " + key + " is not supported. Correct " + key + " and create a new request."
 	default:
-		return "Cannot plan this request: " + key + " is not currently available. Correct " + key + " and create a new request."
+		return "Cannot provision this request: " + key + " is not currently available. Correct " + key + " and create a new request."
 	}
 }
 
@@ -275,23 +203,8 @@ func phaseNotices(uid, phase string, texts []string) []statusNotice {
 	return notices
 }
 
-func reviewNoticeTexts(options *servitorv1alpha1.ResolvedOptions, review *servitorv1alpha1.ReviewSummary, deadline, now time.Time, autoApprove bool) []string {
-	rows := make([][]string, 0)
-	if review != nil {
-		rows = make([][]string, 0, len(review.Resources))
-		for _, resource := range review.Resources {
-			rows = append(rows, []string{resource.Role, strings.Join(resource.Actions, "/")})
-		}
-	}
-	create, change, destroy := actionTotals(rows)
-	texts := statusTableChunks("Cluster request", nil, reviewConfigRows(options), "")
-	deadlineText := deadline.UTC().Format("2006-01-02 15:04:05.999999999 UTC")
-	remainingMinutes := deadline.Sub(now).Round(time.Minute) / time.Minute
-	conclusion := fmt.Sprintf("\nReply with exact `yes` in this thread before %s (~%dm) to approve or `no` to reject the configuration.", deadlineText, remainingMinutes)
-	if autoApprove {
-		conclusion = fmt.Sprintf("\nThis request will be approved automatically after all plan-summary messages are delivered, before %s (~%dm). Reply with exact `no` in this thread to reject the configuration.", deadlineText, remainingMinutes)
-	}
-	return append(texts, statusTableChunks(fmt.Sprintf("Plan ready for review.\nPlan: %d create, %d change, %d destroy\nPlanned resources:", create, change, destroy), []string{"Resource", "Action"}, rows, conclusion)...)
+func configurationNoticeTexts(options *servitorv1alpha1.ResolvedOptions) []string {
+	return statusTableChunks("Cluster configuration", nil, configurationConfigRows(options), "")
 }
 
 func previewNotices(options *servitorv1alpha1.ResolvedOptions) []string {
@@ -299,7 +212,7 @@ func previewNotices(options *servitorv1alpha1.ResolvedOptions) []string {
 }
 
 func previewConfigRows(options *servitorv1alpha1.ResolvedOptions) [][]string {
-	rows := reviewConfigRows(options)
+	rows := configurationConfigRows(options)
 	for _, row := range rows {
 		switch row[0] {
 		case "Name:":
@@ -320,7 +233,7 @@ func previewConfigRows(options *servitorv1alpha1.ResolvedOptions) [][]string {
 	return rows
 }
 
-func reviewConfigRows(options *servitorv1alpha1.ResolvedOptions) [][]string {
+func configurationConfigRows(options *servitorv1alpha1.ResolvedOptions) [][]string {
 	if options == nil {
 		return [][]string{{"Configuration:", "-"}}
 	}
@@ -409,22 +322,6 @@ func networkDescription(options *servitorv1alpha1.ResolvedOptions) string {
 		}
 		return "operator-managed existing network"
 	}
-}
-
-func actionTotals(rows [][]string) (create, change, destroy int) {
-	for _, row := range rows {
-		for _, action := range strings.Split(row[1], "/") {
-			switch action {
-			case "create":
-				create++
-			case "update":
-				change++
-			case "delete":
-				destroy++
-			}
-		}
-	}
-	return create, change, destroy
 }
 
 func extensionNoticeID(uid string, extension *servitorv1alpha1.LeaseExtensionStatus) string {
