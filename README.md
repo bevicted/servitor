@@ -50,7 +50,9 @@ Only the allocation owner can approve, extend, request credentials, or clean up 
 @servitor create version=roks
 @servitor create kubernetes headlamp
 @servitor create version=iks worker-count=3 auth=true
-@servitor create vpc-gen2 us-south-1 bx2.4x16 approve
+@servitor create dry-run kubernetes headlamp
+@servitor create dry-run=true version=iks
+@servitor create dry-run=false vpc-gen2 us-south-1 bx2.4x16 approve
 ```
 
 Common options:
@@ -62,6 +64,7 @@ Common options:
 | `version` | Numeric stream, `roks`, `openshift`, `iks`, `kubernetes`, or `k8s` |
 | `worker-count` | `1` to `100` |
 | `auth` | Request auth delivery when ready |
+| `dry-run` | Preview the locally resolved configuration only; no provisioning or capacity reservation |
 | `approve` | Approve automatically after the summary is delivered |
 | `headlamp` | Install the managed Headlamp add-on; Kubernetes only |
 | `private-only` | Create only a private endpoint; VPC Gen 2 only |
@@ -69,7 +72,7 @@ Common options:
 | `datacenter`, `machine-type` | Classic placement and worker shape |
 | `public-vlan-id`, `private-vlan-id` | Optional Classic VLAN IDs |
 
-Boolean options accept either a bare name, such as `auth`, or `name=true|false`. Inventory-backed values can also be supplied in bare form when the match is unambiguous. Use `help create` and `help create-options` in Slack for the current grammar and configured defaults.
+Boolean options accept either a bare name, such as `auth`, or `name=true|false`. `dry-run` and `dry-run=true` return a configuration preview without creating an allocation, PipelineRun, or auth-delivery intent; `dry-run=false` follows the normal create flow. Preview uses locally known values only: the name is `generated on create` and ICT-derived values can be `resolved during provisioning`. It does not reserve capacity or guarantee cloud availability. A later normal create is a separate request whose defaults may change. Inventory-backed values can also be supplied in bare form when the match is unambiguous. Use `help create` and `help create-options` in Slack for the current grammar and configured defaults.
 
 Cluster names, resource groups, network IDs, and platform selection are controlled or derived by Servitor; users cannot override them directly.
 

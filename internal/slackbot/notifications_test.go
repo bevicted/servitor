@@ -283,6 +283,26 @@ func TestStatusNotifierDeliversObservableCleanupCompletion(t *testing.T) {
 	}
 }
 
+func TestPreviewConfigRowsUseOnlyLocallyKnownValues(t *testing.T) {
+	options := &servitorv1alpha1.ResolvedOptions{
+		UserOptions:   servitorv1alpha1.UserOptions{Target: "target", Provider: "classic", Version: "default_kubernetes"},
+		Platform:      "kubernetes",
+		ResourceGroup: "Default",
+	}
+	rows := previewConfigRows(options)
+	values := make(map[string]string, len(rows))
+	for _, row := range rows {
+		values[row[0]] = row[1]
+	}
+	for key, want := range map[string]string{
+		"Name:": "generated on create", "Location:": "resolved during provisioning", "Worker:": "resolved during provisioning", "Network:": "Classic networking", "Platform:": "Kubernetes default_kubernetes",
+	} {
+		if values[key] != want {
+			t.Fatalf("preview %s = %q, want %q", key, values[key], want)
+		}
+	}
+}
+
 func TestStatusNoticesIncludePersistedReviewAndReadySummaries(t *testing.T) {
 	reviewNow := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
 	expiry := metav1.NewTime(time.Date(2026, 9, 8, 4, 0, 0, 0, time.UTC))

@@ -5,11 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	servitorv1alpha1 "github.com/bevicted/servitor/api/v1alpha1"
+	"github.com/bevicted/servitor/internal/command"
 	"github.com/bevicted/servitor/internal/pipeline"
 	tektonv1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -261,6 +263,36 @@ func TestAuthReportModeIsBoundToFrozenEndpointPolicy(t *testing.T) {
 				t.Fatalf("validAdoptedAuth(%+v) = %t, want %t", status, got, test.valid)
 			}
 		})
+	}
+}
+
+func TestSnapshotMatchesPreviewResolutionWithoutMutatingConfiguration(t *testing.T) {
+	policy := &servitorv1alpha1.FrozenAuthPolicy{VPNServerID: "vpn", SecretsManagerID: "secrets", SecretsManagerRegion: "us-south", SecretGroupID: "group", CertificateTemplate: "template", Issuer: "issuer", TTL: "1h"}
+	configuration := Config{
+		Defaults:         servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Target: "default-target", Provider: "vpc-gen2", Version: "4.22"}, ResourceGroup: "Default"},
+		NetworkBindings:  map[string]servitorv1alpha1.FrozenNetwork{"private-target": {BindingID: "binding", AccountID: "account", VPCID: "vpc", SubnetID: "subnet", PublicGatewayID: "gateway", Zone: "us-south-1", AuthPolicy: policy}},
+		OpenShiftFlavor:  "bx2.4x16",
+		KubernetesFlavor: "bx2.2x8",
+	}
+	supplied := servitorv1alpha1.UserOptions{Target: "private-target", Provider: "vpc-gen2", Version: "default_kubernetes", Zone: "us-south-1", Headlamp: true, PrivateOnly: true, WorkerCount: 3}
+	settings := command.ResolutionDefaults{Defaults: configuration.Defaults, NetworkBindings: configuration.NetworkBindings, OpenShiftFlavor: configuration.OpenShiftFlavor, KubernetesFlavor: configuration.KubernetesFlavor}
+	want, err := command.ResolveRequestOptions(supplied, settings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cluster := &servitorv1alpha1.ServitorCluster{Spec: servitorv1alpha1.ServitorClusterSpec{UserOptions: supplied}}
+	if err := (&Reconciler{Config: configuration}).snapshot(cluster); err != nil {
+		t.Fatal(err)
+	}
+	if cluster.Status.ResolvedOptions == nil || !reflect.DeepEqual(*cluster.Status.ResolvedOptions, want) {
+		t.Fatalf("snapshot = %#v, want %#v", cluster.Status.ResolvedOptions, want)
+	}
+	if want.Platform != "kubernetes" || want.Flavor != "bx2.2x8" || want.Network.VPCRegion != "us-south" || want.Network.AuthPolicy == policy {
+		t.Fatalf("preview resolution did not derive or freeze expected values: %#v", want)
+	}
+	want.Network.AuthPolicy.VPNServerID = "changed"
+	if configuration.NetworkBindings["private-target"].AuthPolicy.VPNServerID != "vpn" {
+		t.Fatal("preview resolution mutated shared network configuration")
 	}
 }
 

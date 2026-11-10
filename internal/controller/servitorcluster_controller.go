@@ -756,65 +756,12 @@ func (r *Reconciler) adoptReport(ctx context.Context, cluster *servitorv1alpha1.
 }
 
 func (r *Reconciler) snapshot(cluster *servitorv1alpha1.ServitorCluster) error {
-	resolved := r.Config.Defaults
-	// Platform and VPC worker flavor are derived from the selected request
-	// version and provider, rather than inherited from another default version.
-	resolved.Platform = ""
-	resolved.Flavor = ""
-	overlay(&resolved.UserOptions, cluster.Spec.UserOptions)
-	if resolved.Provider == "satellite" {
-		return errors.New("Satellite provisioning is not supported")
-	}
-	if resolved.PrivateOnly && resolved.Provider != "vpc-gen2" {
-		return errors.New("private-only is supported only for VPC Gen 2")
-	}
-	platform, err := command.InferPlatform(resolved.Version)
+	resolved, err := command.ResolveRequestOptions(cluster.Spec.UserOptions, command.ResolutionDefaults{
+		Defaults: r.Config.Defaults, NetworkBindings: r.Config.NetworkBindings,
+		OpenShiftFlavor: r.Config.OpenShiftFlavor, KubernetesFlavor: r.Config.KubernetesFlavor,
+	})
 	if err != nil {
-		return fmt.Errorf("infer platform: %w", err)
-	}
-	resolved.Platform = platform
-	if resolved.Headlamp && (platform != "kubernetes" || (resolved.Provider != "vpc-gen2" && resolved.Provider != "classic")) {
-		return errors.New("headlamp requires Kubernetes on VPC Gen 2 or Classic")
-	}
-	if resolved.Provider == "vpc-gen2" {
-		network, found := r.Config.NetworkBindings[resolved.Target]
-		if !found {
-			return errors.New("no configured existing network binding for target")
-		}
-		if network.VPCRegion == "" {
-			separator := strings.LastIndex(network.Zone, "-")
-			if separator > 0 {
-				network.VPCRegion = network.Zone[:separator]
-			}
-		}
-		if network.AuthPolicy != nil {
-			policy := *network.AuthPolicy
-			if err := policy.Validate(); err != nil {
-				return fmt.Errorf("invalid frozen auth policy: %w", err)
-			}
-			network.AuthPolicy = &policy
-		}
-		if !validFrozenNetwork(network) {
-			return errors.New("no configured existing network binding for target")
-		}
-		if resolved.PrivateOnly && network.AuthPolicy == nil {
-			return errors.New("private-only requires configured VPN authentication policy")
-		}
-		if resolved.Zone != "" && resolved.Zone != network.Zone {
-			return errors.New("requested zone is not configured for the selected network binding")
-		}
-		resolved.Zone = network.Zone
-		resolved.Network = network
-	}
-	if resolved.Provider == "vpc-gen2" && resolved.Flavor == "" {
-		if resolved.Platform == "openshift" {
-			resolved.Flavor = r.Config.OpenShiftFlavor
-		} else {
-			resolved.Flavor = r.Config.KubernetesFlavor
-		}
-	}
-	if resolved.Provider == "classic" {
-		resolved.Network = servitorv1alpha1.FrozenNetwork{}
+		return err
 	}
 	cluster.Status.ResolvedOptions = &resolved
 	cluster.Status.LifecycleSnapshot = &servitorv1alpha1.LifecycleSnapshot{
@@ -1077,69 +1024,6 @@ func contains(items []string, item string) bool {
 }
 func setCondition(cluster *servitorv1alpha1.ServitorCluster, kind string, status metav1.ConditionStatus, reason, message string) {
 	meta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{Type: kind, Status: status, Reason: reason, Message: message, ObservedGeneration: cluster.Generation, LastTransitionTime: metav1.NewTime(time.Now().UTC())})
-}
-
-func overlay(dst *servitorv1alpha1.UserOptions, supplied servitorv1alpha1.UserOptions) {
-	if supplied.Target != "" {
-		dst.Target = supplied.Target
-	}
-	if supplied.Provider != "" {
-		dst.Provider = supplied.Provider
-	}
-	if supplied.Version != "" {
-		dst.Version = supplied.Version
-	}
-	if supplied.Headlamp {
-		dst.Headlamp = true
-	}
-	if supplied.PrivateOnly {
-		dst.PrivateOnly = true
-	}
-	if supplied.Zone != "" {
-		dst.Zone = supplied.Zone
-	}
-	if supplied.Flavor != "" {
-		dst.Flavor = supplied.Flavor
-	}
-	if supplied.Datacenter != "" {
-		dst.Datacenter = supplied.Datacenter
-	}
-	if supplied.MachineType != "" {
-		dst.MachineType = supplied.MachineType
-	}
-	if supplied.PublicVLANID != "" {
-		dst.PublicVLANID = supplied.PublicVLANID
-	}
-	if supplied.PrivateVLANID != "" {
-		dst.PrivateVLANID = supplied.PrivateVLANID
-	}
-	if supplied.SatelliteManagedFrom != "" {
-		dst.SatelliteManagedFrom = supplied.SatelliteManagedFrom
-	}
-	if supplied.SatelliteLocationID != "" {
-		dst.SatelliteLocationID = supplied.SatelliteLocationID
-	}
-	if supplied.SatelliteHostImage != "" {
-		dst.SatelliteHostImage = supplied.SatelliteHostImage
-	}
-	if supplied.SatelliteHostProfile != "" {
-		dst.SatelliteHostProfile = supplied.SatelliteHostProfile
-	}
-	if supplied.SatelliteSSHKeyID != "" {
-		dst.SatelliteSSHKeyID = supplied.SatelliteSSHKeyID
-	}
-	if supplied.SatelliteWorkerOperatingSystem != "" {
-		dst.SatelliteWorkerOperatingSystem = supplied.SatelliteWorkerOperatingSystem
-	}
-	if supplied.WorkerCount != 0 {
-		dst.WorkerCount = supplied.WorkerCount
-	}
-	if supplied.SatelliteZones != nil {
-		dst.SatelliteZones = append([]string(nil), supplied.SatelliteZones...)
-	}
-	if supplied.SatelliteWorkerInstanceIDs != nil {
-		dst.SatelliteWorkerInstanceIDs = append([]string(nil), supplied.SatelliteWorkerInstanceIDs...)
-	}
 }
 
 type podLogs struct{ client kubernetes.Interface }

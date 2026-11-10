@@ -77,7 +77,7 @@ func main() {
 	if err := inventoryReconciler.SetupWithManager(manager); err != nil {
 		fail(fmt.Errorf("configure inventory refresh: %w", err))
 	}
-	bot := newSlackBot(operator, manager.GetClient(), manager.GetAPIReader(), transport, transport)
+	bot := newSlackBot(operator, controllerSettings, manager.GetClient(), manager.GetAPIReader(), transport, transport)
 	if err := manager.Add(slackbot.NewLeaderRunnable(transport, bot)); err != nil {
 		fail(fmt.Errorf("configure Slack intake: %w", err))
 	}
@@ -154,10 +154,12 @@ func commandDefaults(operator config.Config) command.CreateDefaults {
 	return command.CreateDefaults{Version: operator.Defaults.Version, Target: operator.Defaults.Target, Provider: operator.Defaults.Provider, OpenShiftFlavor: operator.Defaults.OpenShiftFlavor, KubernetesFlavor: operator.Defaults.KubernetesFlavor}
 }
 
-func newSlackBot(operator config.Config, kube client.Client, reader client.Reader, responder slackbot.Responder, permalinks slackbot.PermalinkLookup) slackbot.Bot {
+func newSlackBot(operator config.Config, resolution controller.Config, kube client.Client, reader client.Reader, responder slackbot.Responder, permalinks slackbot.PermalinkLookup) slackbot.Bot {
 	return slackbot.Bot{
 		ChannelID: operator.Slack.ChannelID, Namespace: operator.Namespace, Client: allocationClient{Client: kube, reader: reader},
-		MaxAllocationsPerUser: operator.MaxAllocationsPerUser(), Events: state.NewEventStore(kube, operator.Namespace), Defaults: commandDefaults(operator), PublicAuthTargets: append([]string(nil), operator.Auth.PublicTargets...), AuthEligibleTargets: authEligibleTargets(operator),
+		MaxAllocationsPerUser: operator.MaxAllocationsPerUser(), Events: state.NewEventStore(kube, operator.Namespace), Defaults: commandDefaults(operator),
+		Resolution:        command.ResolutionDefaults{Defaults: resolution.Defaults, NetworkBindings: resolution.NetworkBindings, OpenShiftFlavor: resolution.OpenShiftFlavor, KubernetesFlavor: resolution.KubernetesFlavor},
+		PublicAuthTargets: append([]string(nil), operator.Auth.PublicTargets...), AuthEligibleTargets: authEligibleTargets(operator),
 		InventoryConfigMap: operator.ICT.TargetConfigMap, InventoryConfigKey: operator.ICT.TargetConfigKey, InventoryMaximumAge: operator.InventoryMaximumAge(), MaintainerIDs: operator.Slack.MaintainerIDs,
 		Lease: operator.Lifecycle.Lease, RetryIntervals: operator.Lifecycle.RetryIntervals, Responder: responder, Permalinks: permalinks,
 	}

@@ -60,6 +60,7 @@ type Bot struct {
 	MaxAllocationsPerUser int
 	Events                EventStore
 	Defaults              command.CreateDefaults
+	Resolution            command.ResolutionDefaults
 	InventoryConfigMap    string
 	InventoryConfigKey    string
 	MaintainerIDs         []string
@@ -252,13 +253,15 @@ func (b Bot) create(ctx context.Context, message Message, text string, respond f
 	}
 	name := allocationClusterName(message.Channel, message.Timestamp)
 	existing := &servitorv1alpha1.ServitorCluster{}
-	err := b.allocationReader().Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: name}, existing)
-	if err == nil {
-		respond(b.existingAllocationNotice(ctx, existing, message.User))
-		return true
-	}
-	if !apierrors.IsNotFound(err) {
-		b.logf("get existing allocation: %v", err)
+	existingErr := b.allocationReader().Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: name}, existing)
+	if existingErr == nil {
+		parsed, parseErr := command.ParseCreateOptions(text)
+		if parseErr != nil || !parsed.DryRunRequested() {
+			respond(b.existingAllocationNotice(ctx, existing, message.User))
+			return true
+		}
+	} else if !apierrors.IsNotFound(existingErr) {
+		b.logf("get existing allocation: %v", existingErr)
 		respond(rejectedText("Unable to check an existing allocation. No operation was started."))
 		return false
 	}
@@ -288,6 +291,17 @@ func (b Bot) create(ctx context.Context, message Message, text string, respond f
 	}
 	if provider == "satellite" {
 		respond(rejectedText("Satellite provisioning is not supported."))
+		return true
+	}
+	if options.DryRunRequested() {
+		resolved, err := command.ResolveRequestOptions(userOptions, b.Resolution)
+		if err != nil {
+			respond(rejectedText(err.Error()))
+			return true
+		}
+		for _, notice := range previewNotices(&resolved) {
+			respond(notice)
+		}
 		return true
 	}
 	if userOptions.Headlamp {
@@ -1205,10 +1219,10 @@ func helpOverview(maintainer bool, maxAllocationsPerUser int) []string {
 	return []string{text + "```"}
 }
 func createHelp(defaults command.CreateDefaults, maxAllocationsPerUser int) []string {
-	return []string{fmt.Sprintf("Create a cluster from the configured channel root:\n```\n@servitor create [key=value ...]\n\nExamples\n  @servitor create version=roks\n  @servitor create kubernetes headlamp\n  @servitor create version=iks worker-count=3 auth=true\n\nCommon\n  target=<target>          environment; default: %s\n  provider=<provider>      vpc-gen2 | classic; default: %s\n  version=<version>        roks (OpenShift) | iks (Kubernetes) | numeric stream\n                          default: %s\n  worker-count=<1-100>      workers\n  auth=true                DM authentication when ready, if available; default: false\n  approve=true             auto-approve after the plan is delivered; default: false\n  headlamp                 install the managed add-on; Kubernetes only\n\nVPC Gen 2\n  zone=<zone>\n  flavor=<flavor>\n  private-only=true        omit the public endpoint; default: false\n\nClassic\n  datacenter=<datacenter>\n  machine-type=<type>\n  public-vlan-id=<id>\n  private-vlan-id=<id>\n```\nUp to %d active allocations per user.\nWithout `approve=true`, reply `yes` or `no` in the plan thread before its deadline.\nAll accepted forms: `help create-options` (DM).", safeHelpCell(defaults.Target), safeHelpCell(defaults.Provider), safeHelpCell(defaults.Version), maxAllocationsPerUser)}
+	return []string{fmt.Sprintf("Create a cluster from the configured channel root:\n```\n@servitor create [key=value ...]\n\nExamples\n  @servitor create version=roks\n  @servitor create kubernetes headlamp\n  @servitor create version=iks worker-count=3 auth=true\n  @servitor create dry-run kubernetes headlamp\n\nCommon\n  target=<target>          environment; default: %s\n  provider=<provider>      vpc-gen2 | classic; default: %s\n  version=<version>        roks (OpenShift) | iks (Kubernetes) | numeric stream\n                          default: %s\n  worker-count=<1-100>      workers\n  auth=true                DM authentication when ready, if available; default: false\n  dry-run                  configuration preview only; default: false\n  approve=true             auto-approve after the plan is delivered; default: false\n  headlamp                 install the managed add-on; Kubernetes only\n\nVPC Gen 2\n  zone=<zone>\n  flavor=<flavor>\n  private-only=true        omit the public endpoint; default: false\n\nClassic\n  datacenter=<datacenter>\n  machine-type=<type>\n  public-vlan-id=<id>\n  private-vlan-id=<id>\n```\nUp to %d active allocations per user.\n`dry-run` or `dry-run=true` previews configuration only: it does not provision or reserve capacity. It shows `generated on create` and `resolved during provisioning` when values are not locally known. `dry-run=false` provisions normally; a later create is a separate request whose defaults may change.\nWithout `approve=true`, reply `yes` or `no` in the plan thread before its deadline.\nAll accepted forms: `help create-options` (DM).", safeHelpCell(defaults.Target), safeHelpCell(defaults.Provider), safeHelpCell(defaults.Version), maxAllocationsPerUser)}
 }
 func createOptionsHelp() []string {
-	return []string{"```\nKeyed form                    Bare form\n  target=<target>               <target>\n  provider=<provider>           <provider>\n  version=<version>             <version>\n  worker-count=<1-100>           -\n  auth=true | auth=false        auth\n  approve=true | approve=false  approve\n  private-only=true             private-only\n  private-only=false            -\n  zone=<zone>                   <zone>\n  flavor=<flavor>               <flavor>\n  datacenter=<datacenter>       <datacenter>\n  machine-type=<type>           <type>\n  public-vlan-id=<id>           -\n  private-vlan-id=<id>          -\n\nTargets\n  <configured-target>\n  prestage | pretest\n  stage | test\n\nProviders\n  vpc-gen2 | classic\n\nVersions\n  roks | openshift | default_openshift\n  iks | kubernetes | k8s | default_kubernetes\n  <numeric-version>\n  <numeric-version>_openshift\n\nVersion refinement\n  <alias> <compatible-numeric-version>\n```"}
+	return []string{"```\nKeyed form                    Bare form\n  target=<target>               <target>\n  provider=<provider>           <provider>\n  version=<version>             <version>\n  worker-count=<1-100>           -\n  auth=true | auth=false        auth\n  dry-run=true | dry-run=false  dry-run\n  approve=true | approve=false  approve\n  private-only=true             private-only\n  private-only=false            -\n  zone=<zone>                   <zone>\n  flavor=<flavor>               <flavor>\n  datacenter=<datacenter>       <datacenter>\n  machine-type=<type>           <type>\n  public-vlan-id=<id>           -\n  private-vlan-id=<id>          -\n\nTargets\n  <configured-target>\n  prestage | pretest\n  stage | test\n\nProviders\n  vpc-gen2 | classic\n\nVersions\n  roks | openshift | default_openshift\n  iks | kubernetes | k8s | default_kubernetes\n  <numeric-version>\n  <numeric-version>_openshift\n\nVersion refinement\n  <alias> <compatible-numeric-version>\n```"}
 }
 
 func safeHelpCell(value string) string {

@@ -64,6 +64,85 @@ func botForTest(t *testing.T, objects ...runtime.Object) (Bot, *memoryResponder)
 	responses := &memoryResponder{}
 	return Bot{ChannelID: "C1", SelfUserID: "BOT", Namespace: "servitor", Client: kube, Events: state.NewEventStore(kube, "servitor"), Responder: responses, Lease: 4 * time.Hour, RetryIntervals: []time.Duration{time.Minute}, Clock: func() time.Time { return time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC) }}, responses
 }
+func previewResolution() command.ResolutionDefaults {
+	return command.ResolutionDefaults{
+		Defaults:        servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Version: "4.22", Target: "target", Provider: "vpc-gen2"}, ResourceGroup: "Default"},
+		NetworkBindings: map[string]servitorv1alpha1.FrozenNetwork{"target": {BindingID: "binding", AccountID: "account", VPCID: "vpc", SubnetID: "subnet", PublicGatewayID: "gateway", Zone: "us-south-1"}},
+		OpenShiftFlavor: "bx2.4x16", KubernetesFlavor: "bx2.2x8",
+	}
+}
+
+func TestCreatePreviewDoesNotProvision(t *testing.T) {
+	message := func(id, text, timestamp string) Envelope {
+		return Envelope{ID: id, Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "<@BOT> create " + text, Timestamp: timestamp}}
+	}
+	clusterCount := func(t *testing.T, bot Bot) int {
+		t.Helper()
+		var clusters servitorv1alpha1.ServitorClusterList
+		if err := bot.Client.List(context.Background(), &clusters); err != nil {
+			t.Fatal(err)
+		}
+		return len(clusters.Items)
+	}
+
+	t.Run("valid preview and duplicate event", func(t *testing.T) {
+		bot, responses := botForTest(t)
+		bot.Defaults = command.CreateDefaults{Version: "4.22", Target: "target", Provider: "vpc-gen2"}
+		bot.Resolution = previewResolution()
+		event := message("preview", "dry-run kubernetes headlamp worker-count=2", "100.000001")
+		if err := bot.Handle(context.Background(), event); err != nil {
+			t.Fatal(err)
+		}
+		if len(responses.responses) != 1 || clusterCount(t, bot) != 0 {
+			t.Fatalf("preview responses=%+v clusters=%d", responses.responses, clusterCount(t, bot))
+		}
+		text := responses.responses[0].Text
+		for _, want := range []string{"Configuration preview", "Name:", "generated on create", "Target:", "target", "Platform:", "Kubernetes", "Provider:", "VPC Gen 2", "Location:", "us-south/us-south-1", "Resource group:", "Default", "Headlamp:", "enabled", "Endpoints:", "Worker:", "2 x bx2.2x8", "Network:", "configuration preview only", "does not reserve capacity", "later create is a separate request"} {
+			if !strings.Contains(text, want) {
+				t.Fatalf("preview missing %q: %s", want, text)
+			}
+		}
+		if err := bot.Handle(context.Background(), event); err != nil {
+			t.Fatal(err)
+		}
+		if len(responses.responses) != 1 || clusterCount(t, bot) != 0 {
+			t.Fatalf("duplicate preview responses=%+v clusters=%d", responses.responses, clusterCount(t, bot))
+		}
+	})
+
+	t.Run("auth and capacity do not block preview", func(t *testing.T) {
+		allocated := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "allocated", Namespace: "servitor"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1"}}}
+		bot, responses := botForTest(t, allocated)
+		bot.MaxAllocationsPerUser = 1
+		bot.Defaults = command.CreateDefaults{Version: "4.22", Target: "target", Provider: "vpc-gen2"}
+		bot.Resolution = previewResolution()
+		if err := bot.Handle(context.Background(), message("preview-auth", "dry-run auth", "100.000002")); err != nil {
+			t.Fatal(err)
+		}
+		if len(responses.responses) != 1 || !strings.Contains(responses.responses[0].Text, "Configuration preview") || clusterCount(t, bot) != 1 {
+			t.Fatalf("preview responses=%+v clusters=%d", responses.responses, clusterCount(t, bot))
+		}
+	})
+
+	t.Run("invalid preview is rejected and false is normal create", func(t *testing.T) {
+		bot, responses := botForTest(t)
+		bot.Defaults = command.CreateDefaults{Version: "4.22", Target: "target", Provider: "vpc-gen2"}
+		bot.Resolution = previewResolution()
+		if err := bot.Handle(context.Background(), message("invalid-preview", "dry-run=maybe", "100.000003")); err != nil {
+			t.Fatal(err)
+		}
+		if len(responses.responses) != 1 || !strings.Contains(responses.responses[0].Text, "dry-run must be true or false") || clusterCount(t, bot) != 0 {
+			t.Fatalf("invalid preview responses=%+v clusters=%d", responses.responses, clusterCount(t, bot))
+		}
+		if err := bot.Handle(context.Background(), message("normal-create", "dry-run=false version=4.22", "100.000004")); err != nil {
+			t.Fatal(err)
+		}
+		if len(responses.responses) != 2 || responses.responses[1].Text != "Planning..." || clusterCount(t, bot) != 1 {
+			t.Fatalf("false preview responses=%+v clusters=%d", responses.responses, clusterCount(t, bot))
+		}
+	})
+}
+
 func TestCreateAcknowledgesBeforeCreatingOneDeterministicCluster(t *testing.T) {
 	bot, responses := botForTest(t)
 	if err := bot.Handle(context.Background(), Envelope{ID: "Ev1", Message: Message{Channel: "C1", ChannelType: "channel", User: "U1", Text: "<@BOT> create version=4.22", Timestamp: "123"}}); err != nil {
@@ -1182,7 +1261,7 @@ func TestCreateRejectsPlatformAndHelpDoesNotAdvertiseIt(t *testing.T) {
 }
 
 func TestCreateHelpDistinguishesDefaultsAliasesStreamsAndProvider(t *testing.T) {
-	const want = "Create a cluster from the configured channel root:\n```\n@servitor create [key=value ...]\n\nExamples\n  @servitor create version=roks\n  @servitor create kubernetes headlamp\n  @servitor create version=iks worker-count=3 auth=true\n\nCommon\n  target=<target>          environment; default: target-a\n  provider=<provider>      vpc-gen2 | classic; default: vpc-gen2\n  version=<version>        roks (OpenShift) | iks (Kubernetes) | numeric stream\n                          default: 4.17\n  worker-count=<1-100>      workers\n  auth=true                DM authentication when ready, if available; default: false\n  approve=true             auto-approve after the plan is delivered; default: false\n  headlamp                 install the managed add-on; Kubernetes only\n\nVPC Gen 2\n  zone=<zone>\n  flavor=<flavor>\n  private-only=true        omit the public endpoint; default: false\n\nClassic\n  datacenter=<datacenter>\n  machine-type=<type>\n  public-vlan-id=<id>\n  private-vlan-id=<id>\n```\nUp to 7 active allocations per user.\nWithout `approve=true`, reply `yes` or `no` in the plan thread before its deadline.\nAll accepted forms: `help create-options` (DM)."
+	const want = "Create a cluster from the configured channel root:\n```\n@servitor create [key=value ...]\n\nExamples\n  @servitor create version=roks\n  @servitor create kubernetes headlamp\n  @servitor create version=iks worker-count=3 auth=true\n  @servitor create dry-run kubernetes headlamp\n\nCommon\n  target=<target>          environment; default: target-a\n  provider=<provider>      vpc-gen2 | classic; default: vpc-gen2\n  version=<version>        roks (OpenShift) | iks (Kubernetes) | numeric stream\n                          default: 4.17\n  worker-count=<1-100>      workers\n  auth=true                DM authentication when ready, if available; default: false\n  dry-run                  configuration preview only; default: false\n  approve=true             auto-approve after the plan is delivered; default: false\n  headlamp                 install the managed add-on; Kubernetes only\n\nVPC Gen 2\n  zone=<zone>\n  flavor=<flavor>\n  private-only=true        omit the public endpoint; default: false\n\nClassic\n  datacenter=<datacenter>\n  machine-type=<type>\n  public-vlan-id=<id>\n  private-vlan-id=<id>\n```\nUp to 7 active allocations per user.\n`dry-run` or `dry-run=true` previews configuration only: it does not provision or reserve capacity. It shows `generated on create` and `resolved during provisioning` when values are not locally known. `dry-run=false` provisions normally; a later create is a separate request whose defaults may change.\nWithout `approve=true`, reply `yes` or `no` in the plan thread before its deadline.\nAll accepted forms: `help create-options` (DM)."
 
 	pages := createHelp(command.CreateDefaults{Target: "target-a", Provider: "vpc-gen2", Version: "4.17"}, 7)
 	if len(pages) != 1 || pages[0] != want {
@@ -1235,7 +1314,7 @@ func TestCreateHelpRoutesAndBoundsDefaults(t *testing.T) {
 }
 
 func TestCreateOptionsHelpRoutesAndMatchesApprovedReference(t *testing.T) {
-	const want = "```\nKeyed form                    Bare form\n  target=<target>               <target>\n  provider=<provider>           <provider>\n  version=<version>             <version>\n  worker-count=<1-100>           -\n  auth=true | auth=false        auth\n  approve=true | approve=false  approve\n  private-only=true             private-only\n  private-only=false            -\n  zone=<zone>                   <zone>\n  flavor=<flavor>               <flavor>\n  datacenter=<datacenter>       <datacenter>\n  machine-type=<type>           <type>\n  public-vlan-id=<id>           -\n  private-vlan-id=<id>          -\n\nTargets\n  <configured-target>\n  prestage | pretest\n  stage | test\n\nProviders\n  vpc-gen2 | classic\n\nVersions\n  roks | openshift | default_openshift\n  iks | kubernetes | k8s | default_kubernetes\n  <numeric-version>\n  <numeric-version>_openshift\n\nVersion refinement\n  <alias> <compatible-numeric-version>\n```"
+	const want = "```\nKeyed form                    Bare form\n  target=<target>               <target>\n  provider=<provider>           <provider>\n  version=<version>             <version>\n  worker-count=<1-100>           -\n  auth=true | auth=false        auth\n  dry-run=true | dry-run=false  dry-run\n  approve=true | approve=false  approve\n  private-only=true             private-only\n  private-only=false            -\n  zone=<zone>                   <zone>\n  flavor=<flavor>               <flavor>\n  datacenter=<datacenter>       <datacenter>\n  machine-type=<type>           <type>\n  public-vlan-id=<id>           -\n  private-vlan-id=<id>          -\n\nTargets\n  <configured-target>\n  prestage | pretest\n  stage | test\n\nProviders\n  vpc-gen2 | classic\n\nVersions\n  roks | openshift | default_openshift\n  iks | kubernetes | k8s | default_kubernetes\n  <numeric-version>\n  <numeric-version>_openshift\n\nVersion refinement\n  <alias> <compatible-numeric-version>\n```"
 
 	bot, responses := botForTest(t)
 	for index, test := range []struct {

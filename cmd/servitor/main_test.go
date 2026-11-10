@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	servitorv1alpha1 "github.com/bevicted/servitor/api/v1alpha1"
 	"github.com/bevicted/servitor/internal/config"
 	"github.com/bevicted/servitor/internal/controller"
 	rbacv1 "k8s.io/api/rbac/v1"
@@ -58,9 +59,10 @@ func TestInventoryControllerConfigCarriesValidatedPolicy(t *testing.T) {
 func TestNewSlackBotUsesDirectAPIReader(t *testing.T) {
 	cached := fake.NewClientBuilder().Build()
 	reader := fake.NewClientBuilder().Build()
-	bot := newSlackBot(config.Config{Namespace: "servitor", Slack: config.SlackConfig{ChannelID: "C1", MaxAllocationsPerUser: 7}}, cached, reader, nil, nil)
+	resolution := controller.Config{Defaults: servitorv1alpha1.ResolvedOptions{ResourceGroup: "Default"}, NetworkBindings: map[string]servitorv1alpha1.FrozenNetwork{"target": {Zone: "us-south-1"}}, OpenShiftFlavor: "bx2.4x16", KubernetesFlavor: "bx2.2x8"}
+	bot := newSlackBot(config.Config{Namespace: "servitor", Slack: config.SlackConfig{ChannelID: "C1", MaxAllocationsPerUser: 7}}, resolution, cached, reader, nil, nil)
 	direct, ok := bot.Client.(allocationClient)
-	if !ok || direct.Client != cached || direct.AllocationReader() != reader || bot.Namespace != "servitor" || bot.ChannelID != "C1" || bot.MaxAllocationsPerUser != 7 {
+	if !ok || direct.Client != cached || direct.AllocationReader() != reader || bot.Namespace != "servitor" || bot.ChannelID != "C1" || bot.MaxAllocationsPerUser != 7 || bot.Resolution.Defaults.ResourceGroup != "Default" || bot.Resolution.NetworkBindings["target"].Zone != "us-south-1" || bot.Resolution.OpenShiftFlavor != "bx2.4x16" || bot.Resolution.KubernetesFlavor != "bx2.2x8" {
 		t.Fatalf("Slack bot wiring = %+v", bot)
 	}
 }

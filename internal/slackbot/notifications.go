@@ -294,6 +294,32 @@ func reviewNoticeTexts(options *servitorv1alpha1.ResolvedOptions, review *servit
 	return append(texts, statusTableChunks(fmt.Sprintf("Plan ready for review.\nPlan: %d create, %d change, %d destroy\nPlanned resources:", create, change, destroy), []string{"Resource", "Action"}, rows, conclusion)...)
 }
 
+func previewNotices(options *servitorv1alpha1.ResolvedOptions) []string {
+	return statusTableChunks("Configuration preview", nil, previewConfigRows(options), "\nThis is a configuration preview only. It does not reserve capacity or guarantee cloud availability. A later create is a separate request and may use different defaults.")
+}
+
+func previewConfigRows(options *servitorv1alpha1.ResolvedOptions) [][]string {
+	rows := reviewConfigRows(options)
+	for _, row := range rows {
+		switch row[0] {
+		case "Name:":
+			row[1] = "generated on create"
+		case "Location:":
+			if options.Provider == "vpc-gen2" && options.Network.VPCRegion != "" {
+				row[1] = options.Network.VPCRegion + "/" + options.Zone
+			}
+			if row[1] == "" {
+				row[1] = "resolved during provisioning"
+			}
+		case "Worker:":
+			if row[1] == "" {
+				row[1] = "resolved during provisioning"
+			}
+		}
+	}
+	return rows
+}
+
 func reviewConfigRows(options *servitorv1alpha1.ResolvedOptions) [][]string {
 	if options == nil {
 		return [][]string{{"Configuration:", "-"}}

@@ -156,6 +156,38 @@ func TestParseCreateOptionsTreatsAuthAsServitorOnlyDeliveryIntent(t *testing.T) 
 	}
 }
 
+func TestParseCreateOptionsTreatsDryRunAsServitorOnlyPreviewIntent(t *testing.T) {
+	for _, text := range []string{"create dry-run version=4.22", "create dry-run=true version=4.22", "create dry-run=false version=4.22"} {
+		t.Run(text, func(t *testing.T) {
+			options, err := ParseCreateOptions(text)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := !strings.Contains(text, "dry-run=false")
+			if options.DryRunRequested() != want || len(options.Values()["--dry-run"]) != 0 || slices.Contains(options.BareValues(), "dry-run") {
+				t.Fatalf("options = %#v, dry-run=%t; want preview=%t without an inventory option", options, options.DryRunRequested(), want)
+			}
+			request, err := ParseCreate(text, testCreateDefaults)
+			if err != nil || slices.Contains(request.Args, "--dry-run") {
+				t.Fatalf("request = %#v, err=%v; dry-run must not reach ICT argv", request, err)
+			}
+		})
+	}
+	for _, test := range []struct{ text, want string }{
+		{"create dry-run dry-run", "dry-run may only be supplied once"},
+		{"create dry-run dry-run=false", "dry-run may only be supplied once"},
+		{"create dry-run=false dry-run=true", "dry-run may only be supplied once"},
+		{"create dry-run=TRUE", "dry-run must be true or false"},
+		{"create dry-run=maybe", "dry-run must be true or false"},
+	} {
+		t.Run(test.text, func(t *testing.T) {
+			if _, err := ParseCreateOptions(test.text); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("ParseCreateOptions(%q) error = %v, want %q", test.text, err, test.want)
+			}
+		})
+	}
+}
+
 func TestParseCreateOptionsTreatsApproveAsServitorOnlyApprovalIntent(t *testing.T) {
 	for _, text := range []string{"create approve version=4.22", "create approve=true version=4.22", "create approve=false version=4.22", "create auth approve version=4.22"} {
 		t.Run(text, func(t *testing.T) {

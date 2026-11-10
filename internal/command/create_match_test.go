@@ -61,8 +61,8 @@ func TestEnvironmentTargetShorthandUsesConfiguredEquivalent(t *testing.T) {
 	}
 }
 
-func TestHeadlampSurvivesBothInventoryReconstructionPaths(t *testing.T) {
-	options, err := ParseCreateOptions("create headlamp auth approve target-a vpc-gen2 bx2.4x16 us-south-1 kubernetes")
+func TestServitorExecutionFlagsSurviveBothInventoryReconstructionPaths(t *testing.T) {
+	options, err := ParseCreateOptions("create headlamp auth approve dry-run target-a vpc-gen2 bx2.4x16 us-south-1 kubernetes")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,7 +71,7 @@ func TestHeadlampSurvivesBothInventoryReconstructionPaths(t *testing.T) {
 		t.Fatal(err)
 	}
 	options, err = MatchBareCreateOptions(options, matchDefaults, matchCatalog)
-	if err != nil || !options.HeadlampRequested() || !options.AuthRequested() || !options.ApproveRequested() {
+	if err != nil || !options.HeadlampRequested() || !options.AuthRequested() || !options.ApproveRequested() || !options.DryRunRequested() {
 		t.Fatalf("matched options = %#v, err=%v", options, err)
 	}
 }

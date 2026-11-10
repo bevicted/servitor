@@ -61,6 +61,7 @@ type ExplicitCreateOptions struct {
 	bare             []string
 	authRequested    bool
 	approveRequested bool
+	dryRunRequested  bool
 	headlamp         bool
 	privateOnly      bool
 }
@@ -84,6 +85,9 @@ func (o ExplicitCreateOptions) AuthRequested() bool { return o.authRequested }
 
 // ApproveRequested reports whether create requested automatic approval after review delivery.
 func (o ExplicitCreateOptions) ApproveRequested() bool { return o.approveRequested }
+
+// DryRunRequested reports whether create requested a configuration preview.
+func (o ExplicitCreateOptions) DryRunRequested() bool { return o.dryRunRequested }
 
 // HeadlampRequested reports whether create requested the managed Headlamp add-on.
 func (o ExplicitCreateOptions) HeadlampRequested() bool { return o.headlamp }
@@ -117,12 +121,13 @@ func ParseCreateOptions(text string) (ExplicitCreateOptions, error) {
 	var bare []string
 	authRequested := false
 	approveRequested := false
+	dryRunRequested := false
 	headlamp := false
 	privateOnly := false
 	for _, word := range words[1:] {
 		key, value, assigned := strings.Cut(word, "=")
 		if !assigned {
-			if word == "auth" || word == "approve" || word == "headlamp" || word == "private-only" {
+			if word == "auth" || word == "approve" || word == "dry-run" || word == "headlamp" || word == "private-only" {
 				if seen[word] {
 					return ExplicitCreateOptions{}, fmt.Errorf("%s may only be supplied once", word)
 				}
@@ -132,6 +137,8 @@ func ParseCreateOptions(text string) (ExplicitCreateOptions, error) {
 					authRequested = true
 				case "approve":
 					approveRequested = true
+				case "dry-run":
+					dryRunRequested = true
 				case "headlamp":
 					headlamp = true
 				case "private-only":
@@ -154,7 +161,7 @@ func ParseCreateOptions(text string) (ExplicitCreateOptions, error) {
 		if strings.HasPrefix(key, "-") {
 			return ExplicitCreateOptions{}, fmt.Errorf("create options must use key=value without leading dashes")
 		}
-		if key == "auth" || key == "approve" || key == "private-only" {
+		if key == "auth" || key == "approve" || key == "dry-run" || key == "private-only" {
 			if seen[key] {
 				return ExplicitCreateOptions{}, fmt.Errorf("%s may only be supplied once", key)
 			}
@@ -167,6 +174,8 @@ func ParseCreateOptions(text string) (ExplicitCreateOptions, error) {
 				authRequested = value == "true"
 			case "approve":
 				approveRequested = value == "true"
+			case "dry-run":
+				dryRunRequested = value == "true"
 			case "private-only":
 				privateOnly = value == "true"
 			}
@@ -198,7 +207,7 @@ func ParseCreateOptions(text string) (ExplicitCreateOptions, error) {
 		seen[flag] = true
 		values[flag] = append(values[flag], value)
 	}
-	options := ExplicitCreateOptions{values: values, bare: bare, authRequested: authRequested, approveRequested: approveRequested, headlamp: headlamp, privateOnly: privateOnly}
+	options := ExplicitCreateOptions{values: values, bare: bare, authRequested: authRequested, approveRequested: approveRequested, dryRunRequested: dryRunRequested, headlamp: headlamp, privateOnly: privateOnly}
 	if _, err := options.WorkerCount(); err != nil {
 		return ExplicitCreateOptions{}, err
 	}
