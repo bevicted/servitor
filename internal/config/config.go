@@ -156,9 +156,8 @@ func (c NetworkConfig) BindingForTarget(target string) (string, NetworkBinding, 
 }
 
 type LifecycleConfig struct {
-	ConfirmationTimeout time.Duration   `yaml:"confirmation_timeout"`
-	Lease               time.Duration   `yaml:"lease"`
-	RetryIntervals      []time.Duration `yaml:"retry_intervals"`
+	Lease          time.Duration   `yaml:"lease"`
+	RetryIntervals []time.Duration `yaml:"retry_intervals"`
 }
 
 // InventoryConfig controls leader-owned private discovery scheduling.
@@ -365,9 +364,6 @@ func (c Config) Validate() error {
 	}
 	if _, err := command.InferPlatform(c.Defaults.Version); err != nil {
 		return fmt.Errorf("config: defaults.version is invalid: %w", err)
-	}
-	if c.Lifecycle.ConfirmationTimeout <= 0 {
-		return errors.New("config: lifecycle.confirmation_timeout must be positive")
 	}
 	refreshInterval, maximumAge := c.Inventory.RefreshInterval, c.Inventory.MaximumAge
 	if refreshInterval == 0 {

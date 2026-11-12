@@ -38,9 +38,8 @@ network:
   target_bindings:
     replace-me: synthetic-existing-network
 # This policy is copied into spec.lifecycle for each allocation. The controller
-# alone writes observed phase, deadlines, operations, retries, and summaries.
+# alone writes observed phase, operations, retries, and summaries.
 lifecycle:
-  confirmation_timeout: 5m
   lease: 4h
   retry_intervals: [1m, 5m, 15m]
 # Private target inventory refreshes initially when missing, then hourly. A

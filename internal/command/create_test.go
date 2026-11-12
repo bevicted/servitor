@@ -16,6 +16,16 @@ var testCreateDefaults = CreateDefaults{
 	KubernetesFlavor: "bx2.2x8",
 }
 
+func TestParseCreateOptionsRejectsObsoleteApprovalArguments(t *testing.T) {
+	for _, text := range []string{"create approve", "create approve=true", "create approve=false", "create auth approve version=4.22"} {
+		t.Run(text, func(t *testing.T) {
+			if _, err := ParseCreateOptions(text); err == nil || !strings.Contains(err.Error(), "approve is no longer supported") {
+				t.Fatalf("ParseCreateOptions(%q) error = %v", text, err)
+			}
+		})
+	}
+}
+
 func TestParseExtendAcceptsOnlyWholeHourGrammar(t *testing.T) {
 	for _, test := range []struct {
 		text string
@@ -183,16 +193,6 @@ func TestParseCreateOptionsTreatsDryRunAsServitorOnlyPreviewIntent(t *testing.T)
 		t.Run(test.text, func(t *testing.T) {
 			if _, err := ParseCreateOptions(test.text); err == nil || !strings.Contains(err.Error(), test.want) {
 				t.Fatalf("ParseCreateOptions(%q) error = %v, want %q", test.text, err, test.want)
-			}
-		})
-	}
-}
-
-func TestParseCreateOptionsRejectsObsoleteApprovalArguments(t *testing.T) {
-	for _, text := range []string{"create approve", "create approve=true", "create approve=false", "create auth approve version=4.22"} {
-		t.Run(text, func(t *testing.T) {
-			if _, err := ParseCreateOptions(text); err == nil || !strings.Contains(err.Error(), "approve is no longer supported") {
-				t.Fatalf("ParseCreateOptions(%q) error = %v", text, err)
 			}
 		})
 	}

@@ -5,28 +5,26 @@ package controller
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	goruntime "runtime"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	servitorv1alpha1 "github.com/bevicted/servitor/api/v1alpha1"
-	"github.com/bevicted/servitor/internal/command"
 	"github.com/bevicted/servitor/internal/pipeline"
 	"github.com/bevicted/servitor/internal/slackbot"
-	"github.com/bevicted/servitor/internal/state"
 	tektonv1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/yaml"
@@ -114,38 +112,6 @@ func (d *runtimeContractDelivery) result() (int, string, []byte) {
 	return d.calls, d.owner, append([]byte(nil), d.data...)
 }
 
-func TestStrictNetworkUserOptionsAdmission(t *testing.T) {
-	scheme, err := NewScheme()
-	if err != nil {
-		t.Fatal(err)
-	}
-	testEnvironment := &envtest.Environment{
-		Scheme:                scheme,
-		CRDDirectoryPaths:     []string{filepath.Join(repositoryRoot(t), "config", "crd", "bases")},
-		ErrorIfCRDPathMissing: true,
-	}
-	config, err := testEnvironment.Start()
-	if err != nil {
-		t.Fatalf("start envtest: %v", err)
-	}
-	t.Cleanup(func() {
-		if err := testEnvironment.Stop(); err != nil {
-			t.Errorf("stop envtest: %v", err)
-		}
-	})
-	admin, err := client.New(config, client.Options{Scheme: scheme})
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx := context.Background()
-	const namespace = "servitor-strict-admission"
-	if err := admin.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}); err != nil {
-		t.Fatal(err)
-	}
-	verifyRemovedNetworkUserOptionsRejected(t, ctx, config, namespace)
-	verifyResourceGroupUserOptionRejected(t, ctx, config, namespace)
-}
-
 func TestRuntimeContract(t *testing.T) {
 	scheme, err := NewScheme()
 	if err != nil {
@@ -180,10 +146,6 @@ func TestRuntimeContract(t *testing.T) {
 	}
 	installControllerRBAC(t, ctx, admin)
 	verifyHeadlampRuntimePersistence(t, ctx, adminConfig, runtimeContractNamespace)
-	verifyAutoApproveTransitionContract(t, ctx, admin)
-	autoKey, autoResponses := seedAutoApproveContract(t, ctx, admin)
-	manualKey := seedManualApproveFalseContract(t, ctx, admin, autoResponses)
-	timeoutKey := seedApprovalContractWithResponder(t, ctx, admin, "timeout", "1710000000.000101", "approve", true, autoResponses, 3*time.Second)
 
 	publicationKey := seedPublicationContract(t, ctx, admin)
 	deliveryKey := seedDeliveryContract(t, ctx, admin)
@@ -238,82 +200,6 @@ func TestRuntimeContract(t *testing.T) {
 	if !manager.GetCache().WaitForCacheSync(syncContext) {
 		t.Fatalf("manager cache did not synchronize: %v", managerResult(managerDone))
 	}
-
-	notifier := &slackbot.StatusNotifier{Client: admin, Namespace: runtimeContractNamespace, Responder: autoResponses, Receipts: state.NewEventStore(admin, runtimeContractNamespace), Interval: 10 * time.Millisecond}
-	notifierContext, stopNotifier := context.WithCancel(ctx)
-	notifierDone := make(chan error, 1)
-	go func() { notifierDone <- notifier.Start(notifierContext) }()
-	notifierStopped := false
-	stopStatusNotifier := func() {
-		if notifierStopped {
-			return
-		}
-		notifierStopped = true
-		stopNotifier()
-		if err := <-notifierDone; err != nil {
-			t.Errorf("stop notifier: %v", err)
-		}
-	}
-	t.Cleanup(stopStatusNotifier)
-
-	eventually(t, managerDone, "automatic delivery-gated apply", func() error {
-		cluster := &servitorv1alpha1.ServitorCluster{}
-		if err := admin.Get(ctx, autoKey, cluster); err != nil {
-			return err
-		}
-		if autoResponses.count() != 3 || cluster.Spec.Lifecycle.Approval != "approved" || cluster.Status.Phase != servitorv1alpha1.PhaseApplying {
-			return fmt.Errorf("responses=%d approval=%q phase=%q", autoResponses.count(), cluster.Spec.Lifecycle.Approval, cluster.Status.Phase)
-		}
-		var runs tektonv1.PipelineRunList
-		if err := admin.List(ctx, &runs, client.InNamespace(runtimeContractNamespace), client.MatchingLabels{pipeline.ClusterUIDLabel: string(cluster.UID), pipeline.OperationLabel: applyID(string(cluster.UID))}); err != nil {
-			return err
-		}
-		if len(runs.Items) != 1 {
-			return fmt.Errorf("apply PipelineRuns=%d", len(runs.Items))
-		}
-		return nil
-	})
-
-	eventually(t, managerDone, "approve=false remains manual", func() error {
-		cluster := &servitorv1alpha1.ServitorCluster{}
-		if err := admin.Get(ctx, manualKey, cluster); err != nil {
-			return err
-		}
-		if autoResponses.manualCount() != 3 || cluster.Spec.Lifecycle.AutoApprove || cluster.Spec.Lifecycle.Approval != "" || cluster.Status.Phase != servitorv1alpha1.PhaseAwaitingApproval {
-			return fmt.Errorf("manual replies=%d autoApprove=%t approval=%q phase=%q", autoResponses.manualCount(), cluster.Spec.Lifecycle.AutoApprove, cluster.Spec.Lifecycle.Approval, cluster.Status.Phase)
-		}
-		var runs tektonv1.PipelineRunList
-		if err := admin.List(ctx, &runs, client.InNamespace(runtimeContractNamespace), client.MatchingLabels{pipeline.ClusterUIDLabel: string(cluster.UID), pipeline.OperationLabel: applyID(string(cluster.UID))}); err != nil {
-			return err
-		}
-		if len(runs.Items) != 0 {
-			return fmt.Errorf("apply PipelineRuns=%d", len(runs.Items))
-		}
-		return nil
-	})
-
-	stopStatusNotifier()
-
-	if failures := autoResponses.failureCount(); failures == 0 {
-		t.Fatal("failing responder did not reject a review reply")
-	}
-	eventually(t, managerDone, "failed review delivery deadline cleanup", func() error {
-		cluster := &servitorv1alpha1.ServitorCluster{}
-		if err := admin.Get(ctx, timeoutKey, cluster); err != nil {
-			return err
-		}
-		if cluster.Spec.Lifecycle.Approval != "" || cluster.Status.Phase != servitorv1alpha1.PhaseCleanupComplete || cluster.Status.Cleanup == nil || cluster.Status.Cleanup.Reason != servitorv1alpha1.CleanupReasonReviewExpired {
-			return fmt.Errorf("approval=%q phase=%q cleanup=%+v", cluster.Spec.Lifecycle.Approval, cluster.Status.Phase, cluster.Status.Cleanup)
-		}
-		var runs tektonv1.PipelineRunList
-		if err := admin.List(ctx, &runs, client.InNamespace(runtimeContractNamespace), client.MatchingLabels{pipeline.ClusterUIDLabel: string(cluster.UID), pipeline.OperationLabel: applyID(string(cluster.UID))}); err != nil {
-			return err
-		}
-		if len(runs.Items) != 0 {
-			return fmt.Errorf("apply PipelineRuns=%d", len(runs.Items))
-		}
-		return nil
-	})
 
 	eventually(t, managerDone, "publisher resources and Applying status", func() error {
 		cluster := &servitorv1alpha1.ServitorCluster{}
@@ -398,6 +284,185 @@ func TestRuntimeContract(t *testing.T) {
 	})
 }
 
+func seedPublicationContract(t *testing.T, ctx context.Context, kube client.Client) types.NamespacedName {
+	t.Helper()
+	cluster := contractCluster("publication")
+	if err := kube.Create(ctx, cluster); err != nil {
+		t.Fatal(err)
+	}
+	key := client.ObjectKeyFromObject(cluster)
+	if err := kube.Get(ctx, key, cluster); err != nil {
+		t.Fatal(err)
+	}
+	cluster.Status = servitorv1alpha1.ServitorClusterStatus{
+		Phase:             servitorv1alpha1.PhasePending,
+		ResolvedOptions:   contractResolvedOptions("publication-cluster"),
+		LifecycleSnapshot: contractLifecycleSnapshot(true),
+		Backend:           &servitorv1alpha1.BackendIdentity{Version: 1, Bucket: "bucket", Key: "publication.tfstate", Region: "us-south", Endpoint: "https://s3.example.invalid"},
+		ExecutionImage:    "registry.example.invalid/task@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		Recovery:          contractRecovery("publication-cluster"),
+	}
+	if err := kube.Status().Update(ctx, cluster); err != nil {
+		t.Fatal(err)
+	}
+	return key
+}
+
+func TestStrictNetworkUserOptionsAdmission(t *testing.T) {
+	scheme, err := NewScheme()
+	if err != nil {
+		t.Fatal(err)
+	}
+	testEnvironment := &envtest.Environment{
+		Scheme:                scheme,
+		CRDDirectoryPaths:     []string{filepath.Join(repositoryRoot(t), "config", "crd", "bases")},
+		ErrorIfCRDPathMissing: true,
+	}
+	config, err := testEnvironment.Start()
+	if err != nil {
+		t.Fatalf("start envtest: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := testEnvironment.Stop(); err != nil {
+			t.Errorf("stop envtest: %v", err)
+		}
+	})
+	admin, err := client.New(config, client.Options{Scheme: scheme})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	const namespace = "servitor-strict-admission"
+	if err := admin.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}); err != nil {
+		t.Fatal(err)
+	}
+	verifyRemovedNetworkUserOptionsRejected(t, ctx, config, namespace)
+	verifyResourceGroupUserOptionRejected(t, ctx, config, namespace)
+}
+
+func TestApprovalContractAdmission(t *testing.T) {
+	scheme, err := NewScheme()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := apiextensionsv1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	environment := &envtest.Environment{Scheme: scheme, CRDDirectoryPaths: []string{filepath.Join(repositoryRoot(t), "config", "crd", "bases")}, ErrorIfCRDPathMissing: true}
+	configuration, err := environment.Start()
+	if err != nil {
+		t.Fatalf("start envtest: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := environment.Stop(); err != nil {
+			t.Errorf("stop envtest: %v", err)
+		}
+	})
+	ctx := context.Background()
+	const namespace = "servitor-approval-contract-admission"
+	admin, err := client.New(configuration, client.Options{Scheme: scheme})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := admin.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}); err != nil {
+		t.Fatal(err)
+	}
+	crd := &apiextensionsv1.CustomResourceDefinition{}
+	if err := admin.Get(ctx, types.NamespacedName{Name: "servitorclusters.servitor.bevicted.github.io"}, crd); err != nil {
+		t.Fatal(err)
+	}
+	properties := crd.Spec.Versions[0].Schema.OpenAPIV3Schema.Properties
+	for _, test := range []struct {
+		properties map[string]apiextensionsv1.JSONSchemaProps
+		fields     []string
+	}{
+		{properties["spec"].Properties["lifecycle"].Properties, []string{"autoApprove", "approval"}},
+		{properties["status"].Properties, []string{"review", "reviewDeadline", "reviewGeneration", "reviewApproval"}},
+	} {
+		for _, field := range test.fields {
+			if _, exists := test.properties[field]; exists {
+				t.Fatalf("CRD still advertises %s", field)
+			}
+		}
+	}
+	resources := dynamic.NewForConfigOrDie(configuration).Resource(schema.GroupVersionResource{Group: "servitor.bevicted.github.io", Version: "v1alpha1", Resource: "servitorclusters"}).Namespace(namespace)
+	base := &unstructured.Unstructured{Object: map[string]any{"apiVersion": "servitor.bevicted.github.io/v1alpha1", "kind": "ServitorCluster", "metadata": map[string]any{"name": "status-contract"}, "spec": map[string]any{"slack": map[string]any{"ownerID": "U1", "channelID": "C1", "threadTimestamp": "1.2"}, "lifecycle": map[string]any{"initialLeaseSeconds": int64(3600), "retrySeconds": []any{int64(60)}}}}}
+	for field, value := range map[string]any{"autoApprove": true, "approval": "approved"} {
+		t.Run("lifecycle-"+field, func(t *testing.T) {
+			candidate := base.DeepCopy()
+			candidate.SetName("removed-" + strings.ToLower(field))
+			if err := unstructured.SetNestedField(candidate.Object, value, "spec", "lifecycle", field); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := resources.Create(ctx, candidate, metav1.CreateOptions{FieldValidation: metav1.FieldValidationStrict}); !apierrors.IsBadRequest(err) || !strings.Contains(err.Error(), "unknown field") || !strings.Contains(err.Error(), field) {
+				t.Fatalf("strict lifecycle.%s error = %v, want unknown-field rejection", field, err)
+			}
+			stored, err := resources.Create(ctx, candidate, metav1.CreateOptions{FieldValidation: metav1.FieldValidationIgnore})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, found, err := unstructured.NestedFieldNoCopy(stored.Object, "spec", "lifecycle", field); err != nil || found {
+				t.Fatalf("obsolete lifecycle.%s survived pruning: found=%t err=%v", field, found, err)
+			}
+		})
+	}
+	stored, err := resources.Create(ctx, base, metav1.CreateOptions{FieldValidation: metav1.FieldValidationStrict})
+	if err != nil {
+		t.Fatal(err)
+	}
+	current := &servitorv1alpha1.ServitorCluster{}
+	if err := admin.Get(ctx, types.NamespacedName{Namespace: namespace, Name: stored.GetName()}, current); err != nil {
+		t.Fatal(err)
+	}
+	if err := current.Spec.Validate(); err != nil {
+		t.Fatalf("reduced CR spec is invalid: %v", err)
+	}
+	for field, value := range map[string]any{"review": map[string]any{"resources": []any{}}, "reviewDeadline": "2026-09-29T12:00:00Z", "reviewGeneration": int64(1), "reviewApproval": "approved"} {
+		t.Run("status-"+field, func(t *testing.T) {
+			candidate := stored.DeepCopy()
+			candidate.Object["status"] = map[string]any{field: value}
+			if _, err := resources.UpdateStatus(ctx, candidate, metav1.UpdateOptions{FieldValidation: metav1.FieldValidationStrict}); !apierrors.IsBadRequest(err) || !strings.Contains(err.Error(), "unknown field") || !strings.Contains(err.Error(), field) {
+				t.Fatalf("strict status.%s error = %v, want unknown-field rejection", field, err)
+			}
+			stored, err = resources.UpdateStatus(ctx, candidate, metav1.UpdateOptions{FieldValidation: metav1.FieldValidationIgnore})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, found, err := unstructured.NestedFieldNoCopy(stored.Object, "status", field); err != nil || found {
+				t.Fatalf("obsolete status.%s survived pruning: found=%t err=%v", field, found, err)
+			}
+		})
+	}
+	for _, test := range []struct{ field, value string }{
+		{"phase", "AwaitingApproval"}, {"cleanup", "Rejected"}, {"cleanup", "ReviewExpired"},
+	} {
+		enum := properties["status"].Properties[test.field].Enum
+		status := map[string]any{test.field: test.value}
+		if test.field == "cleanup" {
+			enum = properties["status"].Properties["cleanup"].Properties["reason"].Enum
+			status["cleanup"] = map[string]any{"reason": test.value}
+		}
+		for _, item := range enum {
+			if string(item.Raw) == strconv.Quote(test.value) {
+				t.Fatalf("CRD advertises removed enum %s", test.value)
+			}
+		}
+		candidate := stored.DeepCopy()
+		candidate.Object["status"] = status
+		if _, err := resources.UpdateStatus(ctx, candidate, metav1.UpdateOptions{}); !apierrors.IsInvalid(err) || !strings.Contains(err.Error(), "Unsupported value") {
+			t.Fatalf("removed enum %s error = %v, want enum rejection", test.value, err)
+		}
+	}
+	for _, phase := range []string{servitorv1alpha1.PhasePending, servitorv1alpha1.PhasePlanning, servitorv1alpha1.PhaseApplying, servitorv1alpha1.PhaseReady, servitorv1alpha1.PhaseCleanupPending, servitorv1alpha1.PhaseCleanupComplete, servitorv1alpha1.PhaseUnresolved} {
+		candidate := stored.DeepCopy()
+		candidate.Object["status"] = map[string]any{"phase": phase}
+		stored, err = resources.UpdateStatus(ctx, candidate, metav1.UpdateOptions{FieldValidation: metav1.FieldValidationStrict})
+		if err != nil {
+			t.Fatalf("retained phase %s rejected: %v", phase, err)
+		}
+	}
+}
+
 func verifyHeadlampRuntimePersistence(t *testing.T, ctx context.Context, config *rest.Config, namespace string) {
 	t.Helper()
 	clusters, err := dynamic.NewForConfig(config)
@@ -447,172 +512,6 @@ func verifyHeadlampRuntimePersistence(t *testing.T, ctx context.Context, config 
 	if err := resources.Delete(ctx, "headlamp-round-trip", metav1.DeleteOptions{}); err != nil {
 		t.Fatal(err)
 	}
-}
-
-func verifyAutoApproveTransitionContract(t *testing.T, ctx context.Context, kube client.Client) {
-	t.Helper()
-	updateMustFail := func(cluster *servitorv1alpha1.ServitorCluster) {
-		t.Helper()
-		if err := kube.Update(ctx, cluster); err == nil {
-			t.Fatalf("autoApprove transition unexpectedly succeeded: %+v", cluster.Spec.Lifecycle)
-		}
-	}
-	auto := contractCluster("auto-approve-true")
-	auto.Spec.Lifecycle.AutoApprove = true
-	if err := kube.Create(ctx, auto); err != nil {
-		t.Fatal(err)
-	}
-	if err := kube.Get(ctx, client.ObjectKeyFromObject(auto), auto); err != nil || !auto.Spec.Lifecycle.AutoApprove {
-		t.Fatalf("persist autoApprove = %+v, %v", auto.Spec.Lifecycle, err)
-	}
-	auto.Spec.Lifecycle.AutoApprove = false
-	updateMustFail(auto)
-	if err := kube.Get(ctx, client.ObjectKeyFromObject(auto), auto); err != nil {
-		t.Fatal(err)
-	}
-	auto.Spec.Lifecycle.AutoApprove = false
-	updateMustFail(auto)
-
-	manual := contractCluster("auto-approve-omitted")
-	if err := kube.Create(ctx, manual); err != nil {
-		t.Fatal(err)
-	}
-	if err := kube.Get(ctx, client.ObjectKeyFromObject(manual), manual); err != nil || manual.Spec.Lifecycle.AutoApprove {
-		t.Fatalf("omitted autoApprove = %+v, %v", manual.Spec.Lifecycle, err)
-	}
-	manual.Spec.Lifecycle.AutoApprove = true
-	updateMustFail(manual)
-	for _, cluster := range []*servitorv1alpha1.ServitorCluster{auto, manual} {
-		if err := kube.Delete(ctx, cluster); err != nil {
-			t.Fatal(err)
-		}
-	}
-}
-
-func seedAutoApproveContract(t *testing.T, ctx context.Context, kube client.Client) (types.NamespacedName, *runtimeContractResponder) {
-	t.Helper()
-	responses := &runtimeContractResponder{thread: "1710000000.000100", manualThread: "1710000000.000102", failingThread: "1710000000.000101"}
-	return seedApprovalContractWithResponder(t, ctx, kube, "auto", "1710000000.000100", "approve", true, responses, time.Minute), responses
-}
-
-func seedManualApproveFalseContract(t *testing.T, ctx context.Context, kube client.Client, responder slackbot.Responder) types.NamespacedName {
-	t.Helper()
-	return seedApprovalContractWithResponder(t, ctx, kube, "manual", "1710000000.000102", "approve=false", false, responder, time.Minute)
-}
-
-func seedApprovalContractWithResponder(t *testing.T, ctx context.Context, kube client.Client, name, thread, approvalOption string, wantAutoApprove bool, responder slackbot.Responder, reviewTimeout time.Duration) types.NamespacedName {
-	t.Helper()
-	bot := slackbot.Bot{
-		ChannelID: "CCHANNEL", SelfUserID: "BOT", Namespace: runtimeContractNamespace, Client: kube,
-		Events: state.NewEventStore(kube, runtimeContractNamespace), Responder: responder,
-		Defaults: command.CreateDefaults{Version: "4.22"}, Lease: time.Hour, RetryIntervals: []time.Duration{time.Minute},
-	}
-	message := slackbot.Message{Channel: "CCHANNEL", ChannelType: "channel", User: "UAUTO", Text: fmt.Sprintf("<@BOT> create %s version=4.22", approvalOption), Timestamp: thread}
-	if err := bot.Handle(ctx, slackbot.Envelope{ID: "auto-create-" + name, Message: message}); err != nil {
-		t.Fatal(err)
-	}
-	var clusters servitorv1alpha1.ServitorClusterList
-	if err := kube.List(ctx, &clusters, client.InNamespace(runtimeContractNamespace)); err != nil {
-		t.Fatal(err)
-	}
-	for index := range clusters.Items {
-		cluster := &clusters.Items[index]
-		if cluster.Spec.Slack.ThreadTimestamp != message.Timestamp {
-			continue
-		}
-		if cluster.Spec.Lifecycle.AutoApprove != wantAutoApprove || cluster.Spec.Lifecycle.Approval != "" {
-			t.Fatalf("create approval state = lifecycle=%+v", cluster.Spec.Lifecycle)
-		}
-		key := client.ObjectKeyFromObject(cluster)
-		now := time.Now().UTC()
-		reconciler := &Reconciler{Client: kube, Config: Config{
-			Namespace:       runtimeContractNamespace,
-			Defaults:        *contractResolvedOptions("auto-cluster"),
-			NetworkBindings: runtimeContractNetworkBindings(),
-			Backend:         servitorv1alpha1.BackendIdentity{Version: 1, Bucket: "bucket", Region: "us-south", Endpoint: "https://s3.example.invalid"},
-			BackendPrefix:   "runtime-contract",
-			ExecutionImage:  "registry.example.invalid/task@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-			ReviewTimeout:   reviewTimeout,
-		}, Now: func() time.Time { return now }}
-		request := ctrl.Request{NamespacedName: key}
-		for range 4 {
-			if _, err := reconciler.Reconcile(ctx, request); err != nil {
-				t.Fatal(err)
-			}
-		}
-		if err := kube.Get(ctx, key, cluster); err != nil {
-			t.Fatal(err)
-		}
-		if cluster.Status.Operation == nil {
-			t.Fatalf("synthetic plan operation missing: status=%+v", cluster.Status)
-		}
-		run := &tektonv1.PipelineRun{}
-		if err := kube.Get(ctx, types.NamespacedName{Namespace: runtimeContractNamespace, Name: cluster.Status.Operation.PipelineRunName}, run); err != nil {
-			t.Fatal(err)
-		}
-		run.Status.Status.Conditions = duckv1.Conditions{{Type: apis.ConditionSucceeded, Status: corev1.ConditionTrue}}
-		run.Status.ChildReferences = []tektonv1.ChildStatusReference{{TypeMeta: k8sruntime.TypeMeta{APIVersion: "tekton.dev/v1", Kind: "TaskRun"}, Name: "auto-plan-report-" + name, PipelineTaskName: "operation"}}
-		if err := kube.Status().Update(ctx, run); err != nil {
-			t.Fatal(err)
-		}
-		task := &tektonv1.TaskRun{ObjectMeta: metav1.ObjectMeta{Name: "auto-plan-report-" + name, Namespace: runtimeContractNamespace}}
-		if err := kube.Create(ctx, task); err != nil {
-			t.Fatal(err)
-		}
-		task.Status.PodName = "auto-plan-pod"
-		task.Status.Steps = []tektonv1.StepState{{Name: pipeline.ReportContainerName, Container: "step-report"}}
-		if err := kube.Status().Update(ctx, task); err != nil {
-			t.Fatal(err)
-		}
-		report, err := json.Marshal(pipeline.Report{Version: 1, ClusterUID: string(cluster.UID), OperationID: cluster.Status.Operation.ID, ResolvedOptions: *cluster.Status.ResolvedOptions, Recovery: *contractRecovery("auto-cluster-" + name), Review: servitorv1alpha1.ReviewSummary{Resources: []servitorv1alpha1.SummaryResource{{Role: "Cluster", Actions: []string{"create"}}}}})
-		if err != nil {
-			t.Fatal(err)
-		}
-		reconciler.Logs = reportLogs{data: report}
-		if _, err := reconciler.Reconcile(ctx, request); err != nil {
-			t.Fatal(err)
-		}
-		if err := kube.Get(ctx, key, cluster); err != nil || cluster.Status.Phase != servitorv1alpha1.PhaseAwaitingApproval || cluster.Status.Review == nil || cluster.Status.ReviewDeadline == nil {
-			t.Fatalf("synthetic plan report adoption = status=%+v err=%v", cluster.Status, err)
-		}
-		return key
-	}
-	t.Fatal("bot did not create allocation")
-	return types.NamespacedName{}
-}
-
-func seedPublicationContract(t *testing.T, ctx context.Context, kube client.Client) types.NamespacedName {
-	t.Helper()
-	cluster := contractCluster("publication")
-	if err := kube.Create(ctx, cluster); err != nil {
-		t.Fatal(err)
-	}
-	key := client.ObjectKeyFromObject(cluster)
-	if err := kube.Get(ctx, key, cluster); err != nil {
-		t.Fatal(err)
-	}
-	deadline := metav1.NewTime(time.Now().UTC().Add(time.Minute))
-	cluster.Status = servitorv1alpha1.ServitorClusterStatus{
-		Phase:             servitorv1alpha1.PhaseAwaitingApproval,
-		ResolvedOptions:   contractResolvedOptions("publication-cluster"),
-		LifecycleSnapshot: contractLifecycleSnapshot(true),
-		Backend:           &servitorv1alpha1.BackendIdentity{Version: 1, Bucket: "bucket", Key: "publication.tfstate", Region: "us-south", Endpoint: "https://s3.example.invalid"},
-		ExecutionImage:    "registry.example.invalid/task@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-		Recovery:          contractRecovery("publication-cluster"),
-		ReviewDeadline:    &deadline,
-		ReviewGeneration:  cluster.Generation,
-	}
-	if err := kube.Status().Update(ctx, cluster); err != nil {
-		t.Fatal(err)
-	}
-	if err := kube.Get(ctx, key, cluster); err != nil {
-		t.Fatal(err)
-	}
-	cluster.Spec.Lifecycle.Approval = "approved"
-	if err := kube.Update(ctx, cluster); err != nil {
-		t.Fatal(err)
-	}
-	return key
 }
 
 func seedDeliveryContract(t *testing.T, ctx context.Context, kube client.Client) types.NamespacedName {
@@ -726,6 +625,7 @@ func contractResolvedOptions(name string) *servitorv1alpha1.ResolvedOptions {
 		Platform:      "openshift",
 		ClusterName:   name,
 		Region:        "us-south",
+		Network:       runtimeContractNetworkBindings()["target"],
 	}
 }
 

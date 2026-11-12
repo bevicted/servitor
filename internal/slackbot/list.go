@@ -15,7 +15,7 @@ import (
 const listSafeCellLimit = 160
 
 var listStatuses = map[string]string{
-	servitorv1alpha1.PhasePending: "provisioning", servitorv1alpha1.PhasePlanning: "provisioning", servitorv1alpha1.PhaseAwaitingApproval: "provisioning", servitorv1alpha1.PhaseApplying: "provisioning", servitorv1alpha1.PhaseReady: "ready", servitorv1alpha1.PhaseCleanupPending: "cleanup in progress", servitorv1alpha1.PhaseCleanupComplete: "cleanup complete", servitorv1alpha1.PhaseUnresolved: "unresolved",
+	servitorv1alpha1.PhasePending: "provisioning", servitorv1alpha1.PhasePlanning: "provisioning", servitorv1alpha1.PhaseApplying: "provisioning", servitorv1alpha1.PhaseReady: "ready", servitorv1alpha1.PhaseCleanupPending: "cleanup in progress", servitorv1alpha1.PhaseCleanupComplete: "cleanup complete", servitorv1alpha1.PhaseUnresolved: "unresolved",
 }
 
 type clusterListRow struct {

@@ -5,7 +5,6 @@ import (
 	"errors"
 	"reflect"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -14,10 +13,21 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
-	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
+
+func TestConfigurationNoticeSurvivesReadyWithoutApproval(t *testing.T) {
+	recovery := servitorv1alpha1.RecoveryMetadata{}
+	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "allocation", Namespace: "servitor", UID: "uid"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseReady, Recovery: &recovery, ResolvedOptions: &servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Provider: "vpc-gen2", Version: "4.22"}, Platform: "openshift", ClusterName: "cluster", Region: "us-south"}}}
+	notices := statusNotices(cluster)
+	text := joinNotices(notices)
+	if !strings.Contains(text, "Cluster configuration") || strings.Contains(text, "yes") || strings.Contains(text, "review") || strings.Contains(text, "Plan:") {
+		t.Fatalf("configuration notices = %q", text)
+	}
+	if notices[0].id != "phase:uid:configuration:0" {
+		t.Fatalf("configuration notice ID = %q", notices[0].id)
+	}
+}
 
 func TestStatusNotifierDeliversTransitionOnceAcrossRestart(t *testing.T) {
 	scheme := runtime.NewScheme()
@@ -41,218 +51,6 @@ func TestStatusNotifierDeliversTransitionOnceAcrossRestart(t *testing.T) {
 	}
 	if len(responses.responses) != 2 || responses.responses[0].ThreadTimestamp != "root" || responses.responses[1].ThreadTimestamp != "root" {
 		t.Fatalf("responses=%+v", responses.responses)
-	}
-}
-
-func TestReviewNoticesUsePersistedDeadlineAndSkipExpiredDelivery(t *testing.T) {
-	t.Skip("review delivery is obsolete")
-	now := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
-	deadline := metav1.NewTime(now.Add(17*time.Minute + 29*time.Second))
-	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "slack-owner", Namespace: "servitor", UID: "uid"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseAwaitingApproval, ReviewDeadline: &deadline}}
-	notices := statusNoticesAt(cluster, now)
-	if len(notices) < 2 {
-		t.Fatalf("review notices=%+v, want multipart review", notices)
-	}
-	want := "Reply with exact `yes` in this thread before 2026-09-08 00:17:29 UTC (~17m) to approve or `no` to reject the configuration."
-	if text := joinNotices(notices); !strings.Contains(text, want) {
-		t.Fatalf("review notice missing persisted deadline %q: %s", want, text)
-	}
-	if notices := statusNoticesAt(cluster, deadline.Time); len(notices) != 0 {
-		t.Fatalf("expired review notices=%+v, want none", notices)
-	}
-
-	scheme := runtime.NewScheme()
-	if err := corev1.AddToScheme(scheme); err != nil {
-		t.Fatal(err)
-	}
-	if err := servitorv1alpha1.AddToScheme(scheme); err != nil {
-		t.Fatal(err)
-	}
-	kube := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(cluster).Build()
-	responses := &memoryResponder{}
-	calls := 0
-	notifier := &StatusNotifier{Client: kube, Namespace: "servitor", Responder: responses, Receipts: state.NewEventStore(kube, "servitor"), Clock: func() time.Time {
-		calls++
-		if calls == 1 {
-			return now
-		}
-		return deadline.Time
-	}}
-	if err := notifier.notify(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if len(responses.responses) != 0 {
-		t.Fatalf("delayed review delivery sent an expired prompt: %+v", responses.responses)
-	}
-}
-
-func TestStatusNotifierAutoApproveWaitsForEveryDeliveredReviewChunk(t *testing.T) {
-	t.Skip("automatic approval is obsolete")
-	scheme := runtime.NewScheme()
-	if err := corev1.AddToScheme(scheme); err != nil {
-		t.Fatal(err)
-	}
-	if err := servitorv1alpha1.AddToScheme(scheme); err != nil {
-		t.Fatal(err)
-	}
-	now := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
-	deadline := metav1.NewTime(now.Add(time.Hour))
-	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "auto", Namespace: "servitor", UID: "auto-uid"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{AutoApprove: true}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseAwaitingApproval, ResolvedOptions: &servitorv1alpha1.ResolvedOptions{}, Review: &servitorv1alpha1.ReviewSummary{}, ReviewDeadline: &deadline, ReviewGeneration: 1}}
-	kube := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(cluster).Build()
-	responses := &memoryResponder{}
-	notifier := &StatusNotifier{Client: kube, Namespace: "servitor", Responder: responses, Receipts: state.NewEventStore(kube, "servitor"), Clock: func() time.Time { return now }}
-	ids := reviewNoticeIDsAt(cluster, now)
-	if len(ids) < 2 {
-		t.Fatalf("review ids = %v, want multipart summary", ids)
-	}
-	if claimed, err := notifier.Receipts.Claim(context.Background(), ids[1]); err != nil || !claimed {
-		t.Fatalf("claim later review chunk = (%t, %v)", claimed, err)
-	}
-	if err := notifier.notify(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	stored := &servitorv1alpha1.ServitorCluster{}
-	if err := kube.Get(context.Background(), client.ObjectKeyFromObject(cluster), stored); err != nil {
-		t.Fatal(err)
-	}
-	if len(responses.responses) != 1 || stored.Spec.Lifecycle.Approval != "" {
-		t.Fatalf("claimed chunk allowed early approval: responses=%+v lifecycle=%+v", responses.responses, stored.Spec.Lifecycle)
-	}
-	if err := notifier.Receipts.Release(context.Background(), ids[1]); err != nil {
-		t.Fatal(err)
-	}
-	if err := notifier.notify(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if err := kube.Get(context.Background(), client.ObjectKeyFromObject(cluster), stored); err != nil {
-		t.Fatal(err)
-	}
-	if len(responses.responses) != 2 || stored.Spec.Lifecycle.Approval != "approved" {
-		t.Fatalf("all delivered review chunks did not approve: responses=%+v lifecycle=%+v", responses.responses, stored.Spec.Lifecycle)
-	}
-	if text := joinNotices(statusNoticesAt(cluster, now)); !strings.Contains(text, "approved automatically after all plan-summary messages are delivered") || strings.Contains(text, "Reply with exact `yes`") {
-		t.Fatalf("automatic review text = %q", text)
-	}
-}
-
-func TestStatusNotifierAutoApproveRequiresRenderedBoundaryChunk(t *testing.T) {
-	t.Skip("automatic approval is obsolete")
-	scheme := runtime.NewScheme()
-	if err := corev1.AddToScheme(scheme); err != nil {
-		t.Fatal(err)
-	}
-	if err := servitorv1alpha1.AddToScheme(scheme); err != nil {
-		t.Fatal(err)
-	}
-	now := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
-	deadline := metav1.NewTime(time.Date(2300, 9, 8, 0, 0, 0, 0, time.UTC))
-	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "boundary", Namespace: "servitor", UID: "boundary-uid"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{AutoApprove: true}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseAwaitingApproval, ResolvedOptions: &servitorv1alpha1.ResolvedOptions{}, Review: &servitorv1alpha1.ReviewSummary{}, ReviewDeadline: &deadline, ReviewGeneration: 1}}
-	boundaryFound := false
-	for rowCount := 1; rowCount < 50 && !boundaryFound; rowCount++ {
-		resources := make([]servitorv1alpha1.SummaryResource, rowCount, rowCount+1)
-		for index := range resources {
-			resources[index] = servitorv1alpha1.SummaryResource{Role: "resource", Actions: []string{strings.Repeat("x", 100)}}
-		}
-		for padding := 0; padding <= listSafeCellLimit; padding++ {
-			cluster.Status.Review.Resources = append(resources, servitorv1alpha1.SummaryResource{Role: "boundary", Actions: []string{strings.Repeat("x", padding)}})
-			if len(reviewNoticeIDsAt(cluster, now)) > len(reviewNoticeIDsAt(cluster, deadline.Time)) {
-				boundaryFound = true
-				break
-			}
-		}
-	}
-	if !boundaryFound {
-		t.Fatal("could not create a rendered review boundary")
-	}
-	deliveredIDs := reviewNoticeIDsAt(cluster, now)
-	if len(deliveredIDs) < 2 {
-		t.Fatalf("rendered review ids = %v, want multipart summary", deliveredIDs)
-	}
-	kube := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(cluster).Build()
-	responses := &memoryResponder{}
-	notifier := &StatusNotifier{Client: kube, Namespace: "servitor", Responder: responses, Receipts: state.NewEventStore(kube, "servitor"), Clock: func() time.Time { return now }}
-	lastID := deliveredIDs[len(deliveredIDs)-1]
-	if claimed, err := notifier.Receipts.Claim(context.Background(), lastID); err != nil || !claimed {
-		t.Fatalf("claim final rendered review chunk = (%t, %v)", claimed, err)
-	}
-	if err := notifier.notify(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	stored := &servitorv1alpha1.ServitorCluster{}
-	if err := kube.Get(context.Background(), client.ObjectKeyFromObject(cluster), stored); err != nil {
-		t.Fatal(err)
-	}
-	if len(responses.responses) != len(deliveredIDs)-1 || stored.Spec.Lifecycle.Approval != "" {
-		t.Fatalf("undelivered rendered chunk allowed approval: responses=%d ids=%d lifecycle=%+v", len(responses.responses), len(deliveredIDs), stored.Spec.Lifecycle)
-	}
-	if err := notifier.Receipts.Release(context.Background(), lastID); err != nil {
-		t.Fatal(err)
-	}
-	if err := notifier.notify(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if err := kube.Get(context.Background(), client.ObjectKeyFromObject(cluster), stored); err != nil || stored.Spec.Lifecycle.Approval != "approved" {
-		t.Fatalf("all rendered review chunks did not approve: lifecycle=%+v err=%v", stored.Spec.Lifecycle, err)
-	}
-}
-
-func TestStatusNotifierRetriesApprovalWithoutResendingDeliveredReview(t *testing.T) {
-	t.Skip("automatic approval is obsolete")
-	scheme := runtime.NewScheme()
-	if err := corev1.AddToScheme(scheme); err != nil {
-		t.Fatal(err)
-	}
-	if err := servitorv1alpha1.AddToScheme(scheme); err != nil {
-		t.Fatal(err)
-	}
-	now := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
-	deadline := metav1.NewTime(now.Add(time.Hour))
-	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "retry", Namespace: "servitor", UID: "retry-uid"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{AutoApprove: true}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseAwaitingApproval, ResolvedOptions: &servitorv1alpha1.ResolvedOptions{}, Review: &servitorv1alpha1.ReviewSummary{}, ReviewDeadline: &deadline, ReviewGeneration: 1}}
-	failUpdate := true
-	kube := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(cluster).WithInterceptorFuncs(interceptor.Funcs{Update: func(ctx context.Context, underlying client.WithWatch, object client.Object, options ...client.UpdateOption) error {
-		if current, ok := object.(*servitorv1alpha1.ServitorCluster); ok && current.Spec.Lifecycle.Approval == "approved" && failUpdate {
-			failUpdate = false
-			return errors.New("transient update failure")
-		}
-		return underlying.Update(ctx, object, options...)
-	}}).Build()
-	responses := &memoryResponder{}
-	notifier := &StatusNotifier{Client: kube, Namespace: "servitor", Responder: responses, Receipts: state.NewEventStore(kube, "servitor"), Clock: func() time.Time { return now }}
-	if err := notifier.notify(context.Background()); err == nil {
-		t.Fatal("first approval update unexpectedly succeeded")
-	}
-	if len(responses.responses) != 2 {
-		t.Fatalf("review delivery = %+v, want both chunks", responses.responses)
-	}
-	if err := notifier.notify(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	stored := &servitorv1alpha1.ServitorCluster{}
-	if err := kube.Get(context.Background(), client.ObjectKeyFromObject(cluster), stored); err != nil || stored.Spec.Lifecycle.Approval != "approved" || len(responses.responses) != 2 {
-		t.Fatalf("approval retry = lifecycle=%+v responses=%+v err=%v", stored.Spec.Lifecycle, responses.responses, err)
-	}
-}
-
-func reviewNoticeIDsAt(*servitorv1alpha1.ServitorCluster, time.Time) []string { return nil }
-
-func TestStatusNoticesSuppressCommandProgressDuplicatesAndDescribeUnresolvedOperation(t *testing.T) {
-	t.Skip("review rejection presentation is obsolete")
-	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "slack-owner", Namespace: "servitor", UID: "uid"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhasePlanning}}
-	for _, phase := range []string{servitorv1alpha1.PhasePlanning, servitorv1alpha1.PhaseApplying} {
-		cluster.Status.Phase = phase
-		if notices := statusNotices(cluster); len(notices) != 0 {
-			t.Fatalf("%s notices = %+v, want none", phase, notices)
-		}
-	}
-	cluster.Status.Phase = servitorv1alpha1.PhaseCleanupPending
-	cluster.Status.Cleanup = &servitorv1alpha1.CleanupStatus{Reason: servitorv1alpha1.CleanupReasonRejected}
-	if notices := statusNotices(cluster); len(notices) != 1 || notices[0].text != "Plan rejected.\nCleaning up..." {
-		t.Fatalf("rejected cleanup notices = %+v", notices)
-	}
-	cluster.Status.Phase = servitorv1alpha1.PhaseUnresolved
-	cluster.Status.Cleanup = nil
-	if notices := statusNotices(cluster); len(notices) != 1 || notices[0].text != "The operation is unresolved. An administrator must inspect the allocation CR status and private cluster logs." {
-		t.Fatalf("unresolved notices = %+v", notices)
 	}
 }
 
@@ -290,16 +88,33 @@ func TestStatusNotifierDeliversObservableCleanupCompletion(t *testing.T) {
 	}
 }
 
-func TestConfigurationNoticeSurvivesReadyWithoutApproval(t *testing.T) {
-	recovery := servitorv1alpha1.RecoveryMetadata{}
-	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "allocation", Namespace: "servitor", UID: "uid"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseReady, Recovery: &recovery, ResolvedOptions: &servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Provider: "vpc-gen2", Version: "4.22"}, Platform: "openshift", ClusterName: "cluster", Region: "us-south"}}}
-	notices := statusNotices(cluster)
-	text := joinNotices(notices)
-	if !strings.Contains(text, "Cluster configuration") || strings.Contains(text, "yes") || strings.Contains(text, "review") || strings.Contains(text, "Plan:") {
-		t.Fatalf("configuration notices = %q", text)
+func TestCleanupCauseClaimWithholdsCompletionUntilCommandReply(t *testing.T) {
+	completed := metav1.NewTime(time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC))
+	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "slack-owner", Namespace: "servitor", UID: "uid"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{ChannelID: "C1", ThreadTimestamp: "root"}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseCleanupComplete, Cleanup: &servitorv1alpha1.CleanupStatus{Reason: servitorv1alpha1.CleanupReasonExplicit, CompletedAt: &completed}}}
+	bot, responses := botForTest(t, cluster)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	bot.Responder = blockingResponder{Responder: responses, started: started, release: release}
+	notifier := &StatusNotifier{Client: bot.Client, Namespace: "servitor", Responder: responses, Receipts: state.NewEventStore(bot.Client, "servitor")}
+	commandDone := make(chan struct{})
+	go func() {
+		bot.respondCleanupCause(context.Background(), "C1", "root", cluster, servitorv1alpha1.CleanupReasonExplicit, "Cleaning up...")
+		close(commandDone)
+	}()
+	<-started
+	if err := notifier.notify(context.Background()); err != nil {
+		t.Fatal(err)
 	}
-	if notices[0].id != "phase:uid:configuration:0" {
-		t.Fatalf("configuration notice ID = %q", notices[0].id)
+	if len(responses.responses) != 0 {
+		t.Fatalf("completion overtook claimed cause: %+v", responses.responses)
+	}
+	close(release)
+	<-commandDone
+	if err := notifier.notify(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := []string{responses.responses[0].Text, responses.responses[1].Text}; !reflect.DeepEqual(got, []string{"Cleaning up...", "Cleanup complete."}) {
+		t.Fatalf("transcript = %q", got)
 	}
 }
 
@@ -436,48 +251,6 @@ func TestPreviewConfigRowsUseOnlyLocallyKnownValues(t *testing.T) {
 	}
 }
 
-func TestStatusNoticesIncludePersistedReviewAndReadySummaries(t *testing.T) {
-	t.Skip("review summary is obsolete")
-	reviewNow := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
-	expiry := metav1.NewTime(time.Date(2026, 9, 8, 4, 0, 0, 0, time.UTC))
-	deadline := metav1.NewTime(reviewNow.Add(time.Hour))
-	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "slack-owner", Namespace: "servitor", UID: "uid"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "root"}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseAwaitingApproval, ResolvedOptions: &servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Target: "target", Provider: "vpc-gen2", Version: "4.22", Headlamp: true, Zone: "us-south-1", Flavor: "bx2.4x16", WorkerCount: 2}, Platform: "openshift", ClusterName: "cluster", Region: "us-south"}, Review: &servitorv1alpha1.ReviewSummary{Resources: []servitorv1alpha1.SummaryResource{{Role: "Cluster<@U1>", Actions: []string{"create", "update```"}}}}, ReviewDeadline: &deadline}}
-	review := statusNoticesAt(cluster, reviewNow)
-	reviewText := joinNotices(review)
-	for _, wanted := range []string{"Cluster request", "Name:", "Target:", "Platform:", "Provider:", "Location:", "Resource group:", "Headlamp:", "enabled", "Worker:", "Network:", "Plan ready for review.", "Resource", "Action", "Cluster U1", "create/update", "Reply with exact `yes` in this thread before " + deadline.Time.UTC().Format("2006-01-02 15:04:05 UTC") + " (~60m) to approve or `no` to reject the configuration."} {
-		if !strings.Contains(reviewText, wanted) {
-			t.Fatalf("review notice missing %q: %s", wanted, reviewText)
-		}
-	}
-	for _, forbidden := range []string{"<@", "```update"} {
-		if strings.Contains(reviewText, forbidden) {
-			t.Fatalf("review notice leaked %q: %s", forbidden, reviewText)
-		}
-	}
-	cluster.Status.Phase = servitorv1alpha1.PhaseReady
-	cluster.Status.LeaseExpiresAt = &expiry
-	cluster.Status.Ready = &servitorv1alpha1.ReadySummary{Resources: []servitorv1alpha1.SummaryResource{{Role: "Cluster", Name: "created<@U1>", ID: "id```"}, {Role: "VPC", Name: "shared", ID: "vpc", Reused: true}}}
-	previous := metav1.NewTime(expiry.Add(-2 * time.Hour))
-	cluster.Status.LeaseExtension = &servitorv1alpha1.LeaseExtensionStatus{RequestedExpiry: expiry, PreviousExpiry: &previous, NewExpiry: &expiry, AddedSeconds: int64((2 * time.Hour).Seconds()), Outcome: servitorv1alpha1.ExtensionOutcomeApplied}
-	ready := statusNotices(cluster)
-	readyText := joinNotices(ready)
-	for _, wanted := range []string{"<@U1> your request is complete.", "Created", "Reused", "Resource", "Name", "ID", "Cluster", "VPC", "Lease extended.", "Previous expiry:", "New expiry:", "Added:", "Remaining lease time is capped at 24 hours.", "extend [N[h]]", "`done`", "@servitor done"} {
-		if !strings.Contains(readyText, wanted) {
-			t.Fatalf("ready notice missing %q: %s", wanted, readyText)
-		}
-	}
-	for _, forbidden := range []string{"Your cluster is ready.", "created<@U1>", "```id", "@servitor extend"} {
-		if strings.Contains(readyText, forbidden) {
-			t.Fatalf("ready notice leaked %q: %s", forbidden, readyText)
-		}
-	}
-	for _, notice := range append(review, ready...) {
-		if len(notice.text) > maxSlackMessage || strings.Count(notice.text, "```") != 2 {
-			t.Fatalf("notice is not bounded and balanced: %q", notice.text)
-		}
-	}
-}
-
 func TestStatusNotifierReadyLeasePresentationUsesFixedClock(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := corev1.AddToScheme(scheme); err != nil {
@@ -519,39 +292,6 @@ func TestStatusNotifierReadyLeasePresentationUsesFixedClock(t *testing.T) {
 	}
 }
 
-func TestCleanupCauseNoticesSurviveSkippedPhases(t *testing.T) {
-	t.Skip("review cleanup cause presentation is obsolete")
-	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "slack-owner", Namespace: "servitor", UID: "uid"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{ChannelID: "C1", ThreadTimestamp: "root"}}}
-	for _, test := range []struct {
-		name      string
-		reason    servitorv1alpha1.CleanupReason
-		rejection *servitorv1alpha1.PlanRejection
-		want      string
-	}{
-		{"rejected", servitorv1alpha1.CleanupReasonRejected, nil, "Plan rejected.\nCleaning up..."},
-		{"expired", servitorv1alpha1.CleanupReasonReviewExpired, nil, "Plan auto rejected due to missed approval deadline.\nCleaning up..."},
-		{"typed planning rejection", servitorv1alpha1.CleanupReasonPlanningFailed, &servitorv1alpha1.PlanRejection{ReasonCode: "version_not_supported", OptionKey: "version"}, "Cannot plan this request: `version` is not supported. Correct `version` and create a new request.\nCleaning up..."},
-		{"planning failure", servitorv1alpha1.CleanupReasonPlanningFailed, nil, "Planning failed. Cleaning up..."},
-		{"apply failure", servitorv1alpha1.CleanupReasonApplyFailed, nil, "Apply failed. Cleaning up..."},
-		{"lease expiry", servitorv1alpha1.CleanupReasonLeaseExpired, nil, "Lease expired. Cleaning up..."},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			cluster.Status.Cleanup = &servitorv1alpha1.CleanupStatus{Reason: test.reason}
-			cluster.Status.PlanRejection = test.rejection
-			for _, phase := range []string{servitorv1alpha1.PhaseCleanupPending, servitorv1alpha1.PhaseCleanupComplete, servitorv1alpha1.PhaseUnresolved} {
-				cluster.Status.Phase = phase
-				notices := statusNotices(cluster)
-				if len(notices) == 0 || notices[0].id != cleanupCauseNoticeID("uid", test.reason) || notices[0].text != test.want {
-					t.Fatalf("%s notices = %+v", phase, notices)
-				}
-				if phase == servitorv1alpha1.PhaseCleanupComplete && (len(notices) < 2 || notices[1].text != "Cleanup complete.") {
-					t.Fatalf("completion did not follow cause: %+v", notices)
-				}
-			}
-		})
-	}
-}
-
 func TestCleanupRetryNoticeUsesPersistedScheduleOnlyWhilePending(t *testing.T) {
 	next := metav1.NewTime(time.Date(2026, 9, 8, 1, 2, 3, 0, time.UTC))
 	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "slack-owner", Namespace: "servitor", UID: "uid"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{ChannelID: "C1", ThreadTimestamp: "root"}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseCleanupPending, Cleanup: &servitorv1alpha1.CleanupStatus{Reason: servitorv1alpha1.CleanupReasonApplyFailed, RetryCount: 2, NextRetryAt: &next}}}
@@ -564,132 +304,6 @@ func TestCleanupRetryNoticeUsesPersistedScheduleOnlyWhilePending(t *testing.T) {
 	notices = statusNotices(cluster)
 	if len(notices) != 2 || notices[1].text != "Cleanup complete." {
 		t.Fatalf("resolved notices retained a retry: %+v", notices)
-	}
-}
-
-func TestCleanupCauseFailureWithholdsCompletionAcrossRestart(t *testing.T) {
-	t.Skip("review cleanup cause presentation is obsolete")
-	scheme := runtime.NewScheme()
-	if err := corev1.AddToScheme(scheme); err != nil {
-		t.Fatal(err)
-	}
-	if err := servitorv1alpha1.AddToScheme(scheme); err != nil {
-		t.Fatal(err)
-	}
-	completed := metav1.NewTime(time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC))
-	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "slack-owner", Namespace: "servitor", UID: "uid"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{ChannelID: "C1", ThreadTimestamp: "root"}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseCleanupComplete, Cleanup: &servitorv1alpha1.CleanupStatus{Reason: servitorv1alpha1.CleanupReasonReviewExpired, CompletedAt: &completed}}}
-	kube := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(cluster).Build()
-	responses := &memoryResponder{err: errors.New("Slack unavailable")}
-	notifier := &StatusNotifier{Client: kube, Namespace: "servitor", Responder: responses, Receipts: state.NewEventStore(kube, "servitor")}
-	if err := notifier.notify(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if len(responses.responses) != 0 {
-		t.Fatalf("completion overtook failed cause: %+v", responses.responses)
-	}
-	responses.err = nil
-	notifier.Receipts = state.NewEventStore(kube, "servitor")
-	if err := notifier.notify(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if got := []string{responses.responses[0].Text, responses.responses[1].Text}; !reflect.DeepEqual(got, []string{"Plan auto rejected due to missed approval deadline.\nCleaning up...", "Cleanup complete."}) {
-		t.Fatalf("restart transcript = %q", got)
-	}
-	if err := notifier.notify(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if len(responses.responses) != 2 {
-		t.Fatalf("restart redelivered receipts: %+v", responses.responses)
-	}
-}
-
-func TestCleanupCauseReceiptPreventsNotifierFirstAndConcurrentDuplicates(t *testing.T) {
-	t.Skip("review cleanup cause presentation is obsolete")
-	for _, test := range []struct {
-		name string
-		run  func(context.Context, Bot, *StatusNotifier, *servitorv1alpha1.ServitorCluster) error
-	}{
-		{
-			name: "notifier first",
-			run: func(ctx context.Context, bot Bot, notifier *StatusNotifier, cluster *servitorv1alpha1.ServitorCluster) error {
-				if err := notifier.notify(ctx); err != nil {
-					return err
-				}
-				bot.respondCleanupCause(ctx, "C1", "root", cluster, servitorv1alpha1.CleanupReasonRejected, "Plan rejected.\nCleaning up...")
-				return nil
-			},
-		},
-		{
-			name: "concurrent command and notifier",
-			run: func(ctx context.Context, bot Bot, notifier *StatusNotifier, cluster *servitorv1alpha1.ServitorCluster) error {
-				start := make(chan struct{})
-				var group sync.WaitGroup
-				errs := make(chan error, 1)
-				group.Add(2)
-				go func() {
-					defer group.Done()
-					<-start
-					errs <- notifier.notify(ctx)
-				}()
-				go func() {
-					defer group.Done()
-					<-start
-					bot.respondCleanupCause(ctx, "C1", "root", cluster, servitorv1alpha1.CleanupReasonRejected, "Plan rejected.\nCleaning up...")
-				}()
-				close(start)
-				group.Wait()
-				if err := <-errs; err != nil {
-					return err
-				}
-				return notifier.notify(ctx)
-			},
-		},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			completed := metav1.NewTime(time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC))
-			cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "slack-owner", Namespace: "servitor", UID: "uid"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{ChannelID: "C1", ThreadTimestamp: "root"}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseCleanupComplete, Cleanup: &servitorv1alpha1.CleanupStatus{Reason: servitorv1alpha1.CleanupReasonRejected, CompletedAt: &completed}}}
-			bot, responses := botForTest(t, cluster)
-			notifier := &StatusNotifier{Client: bot.Client, Namespace: "servitor", Responder: responses, Receipts: state.NewEventStore(bot.Client, "servitor")}
-			if err := test.run(context.Background(), bot, notifier, cluster); err != nil {
-				t.Fatal(err)
-			}
-			if len(responses.responses) != 2 {
-				t.Fatalf("responses = %+v", responses.responses)
-			}
-			if got := []string{responses.responses[0].Text, responses.responses[1].Text}; !reflect.DeepEqual(got, []string{"Plan rejected.\nCleaning up...", "Cleanup complete."}) {
-				t.Fatalf("transcript = %q", got)
-			}
-		})
-	}
-}
-
-func TestCleanupCauseClaimWithholdsCompletionUntilCommandReply(t *testing.T) {
-	completed := metav1.NewTime(time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC))
-	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "slack-owner", Namespace: "servitor", UID: "uid"}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{ChannelID: "C1", ThreadTimestamp: "root"}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseCleanupComplete, Cleanup: &servitorv1alpha1.CleanupStatus{Reason: servitorv1alpha1.CleanupReasonRejected, CompletedAt: &completed}}}
-	bot, responses := botForTest(t, cluster)
-	started := make(chan struct{})
-	release := make(chan struct{})
-	bot.Responder = blockingResponder{Responder: responses, started: started, release: release}
-	notifier := &StatusNotifier{Client: bot.Client, Namespace: "servitor", Responder: responses, Receipts: state.NewEventStore(bot.Client, "servitor")}
-	commandDone := make(chan struct{})
-	go func() {
-		bot.respondCleanupCause(context.Background(), "C1", "root", cluster, servitorv1alpha1.CleanupReasonRejected, "Plan rejected.\nCleaning up...")
-		close(commandDone)
-	}()
-	<-started
-	if err := notifier.notify(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if len(responses.responses) != 0 {
-		t.Fatalf("completion overtook claimed cause: %+v", responses.responses)
-	}
-	close(release)
-	<-commandDone
-	if err := notifier.notify(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if got := []string{responses.responses[0].Text, responses.responses[1].Text}; !reflect.DeepEqual(got, []string{"Plan rejected.\nCleaning up...", "Cleanup complete."}) {
-		t.Fatalf("transcript = %q", got)
 	}
 }
 

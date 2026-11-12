@@ -117,21 +117,3 @@ func TestClusterListMessagesRemainBoundedAndUnderstandableAcrossChunks(t *testin
 		}
 	}
 }
-
-func TestListStatusCellDistinguishesLifecyclePhases(t *testing.T) {
-	t.Skip("phase labels now collapse to provisioning")
-	for phase, want := range map[string]string{
-		servitorv1alpha1.PhasePending:          "planning",
-		servitorv1alpha1.PhasePlanning:         "planning",
-		servitorv1alpha1.PhaseAwaitingApproval: "review",
-		servitorv1alpha1.PhaseApplying:         "applying",
-		servitorv1alpha1.PhaseReady:            "ready",
-		servitorv1alpha1.PhaseCleanupPending:   "cleanup in progress",
-		servitorv1alpha1.PhaseCleanupComplete:  "cleanup complete",
-		servitorv1alpha1.PhaseUnresolved:       "unresolved",
-	} {
-		if got := listStatusCell(phase); got != want {
-			t.Errorf("listStatusCell(%q) = %q, want %q", phase, got, want)
-		}
-	}
-}

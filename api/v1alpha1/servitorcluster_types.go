@@ -15,15 +15,14 @@ import (
 )
 
 const (
-	PhasePending          = "Pending"
-	PhasePlanning         = "Planning"
-	PhaseAwaitingApproval = "AwaitingApproval"
-	PhaseApplying         = "Applying"
-	PhaseReady            = "Ready"
-	PhaseCleanupPending   = "CleanupPending"
-	PhaseCleanupComplete  = "CleanupComplete"
-	PhaseUnresolved       = "Unresolved"
-	CleanupFinalizer      = "servitor.bevicted.github.io/cleanup"
+	PhasePending         = "Pending"
+	PhasePlanning        = "Planning"
+	PhaseApplying        = "Applying"
+	PhaseReady           = "Ready"
+	PhaseCleanupPending  = "CleanupPending"
+	PhaseCleanupComplete = "CleanupComplete"
+	PhaseUnresolved      = "Unresolved"
+	CleanupFinalizer     = "servitor.bevicted.github.io/cleanup"
 )
 
 // SlackIdentity is immutable routing and authorization identity for an allocation.
@@ -61,8 +60,6 @@ type UserOptions struct {
 type LifecyclePolicy struct {
 	InitialLeaseSeconds int64   `json:"initialLeaseSeconds"`
 	RetrySeconds        []int64 `json:"retrySeconds"`
-	AutoApprove         bool    `json:"autoApprove,omitempty"`
-	Approval            string  `json:"approval,omitempty"`
 	// RequestedExpiry is an absolute extension target. Its value is stable across
 	// Slack redelivery, controller restarts, and optimistic-concurrency retries.
 	RequestedExpiry         *metav1.Time `json:"requestedExpiry,omitempty"`
@@ -460,8 +457,6 @@ type OperationReference struct {
 type CleanupReason string
 
 const (
-	CleanupReasonRejected       CleanupReason = "Rejected"
-	CleanupReasonReviewExpired  CleanupReason = "ReviewExpired"
 	CleanupReasonPlanningFailed CleanupReason = "PlanningFailed"
 	CleanupReasonApplyFailed    CleanupReason = "ApplyFailed"
 	CleanupReasonLeaseExpired   CleanupReason = "LeaseExpired"
@@ -493,18 +488,13 @@ func (r PlanRejection) Validate() error {
 	return nil
 }
 
-// SummaryResource is deliberately bounded, sanitized review metadata.
+// SummaryResource is deliberately bounded, sanitized resource metadata.
 type SummaryResource struct {
 	Role    string   `json:"role,omitempty"`
 	ID      string   `json:"id,omitempty"`
 	Name    string   `json:"name,omitempty"`
 	Actions []string `json:"actions,omitempty"`
 	Reused  bool     `json:"reused,omitempty"`
-}
-
-// ReviewSummary is the controller-persisted sanitized planning review.
-type ReviewSummary struct {
-	Resources []SummaryResource `json:"resources,omitempty"`
 }
 
 // ReadySummary is the controller-persisted sanitized resource metadata after apply.
@@ -612,15 +602,9 @@ type ServitorClusterStatus struct {
 	Backend           *BackendIdentity    `json:"backend,omitempty"`
 	ExecutionImage    string              `json:"executionImage,omitempty"`
 	Operation         *OperationReference `json:"operation,omitempty"`
-	Review            *ReviewSummary      `json:"review,omitempty"`
 	Recovery          *RecoveryMetadata   `json:"recovery,omitempty"`
-	ReviewDeadline    *metav1.Time        `json:"reviewDeadline,omitempty"`
-	// ReviewGeneration and ReviewApproval record the spec state that entered AwaitingApproval.
-	// An approval must be written in a later generation.
-	ReviewGeneration int64         `json:"reviewGeneration,omitempty"`
-	ReviewApproval   string        `json:"reviewApproval,omitempty"`
-	Ready            *ReadySummary `json:"ready,omitempty"`
-	Auth             *AuthStatus   `json:"auth,omitempty"`
+	Ready             *ReadySummary       `json:"ready,omitempty"`
+	Auth              *AuthStatus         `json:"auth,omitempty"`
 	// AuthCertificateReferences retains every unresolved allocation-owned
 	// certificate across auth attempts. It contains identifiers only.
 	AuthCertificateReferences []AuthCertificateReference `json:"authCertificateReferences,omitempty"`
@@ -762,14 +746,6 @@ func (in *ServitorClusterStatus) DeepCopy() *ServitorClusterStatus {
 		v := *in.Operation
 		out.Operation = &v
 	}
-	if in.Review != nil {
-		v := *in.Review
-		v.Resources = append([]SummaryResource(nil), v.Resources...)
-		for index := range v.Resources {
-			v.Resources[index].Actions = append([]string(nil), v.Resources[index].Actions...)
-		}
-		out.Review = &v
-	}
 	if in.Recovery != nil {
 		v := *in.Recovery
 		v.Endpoints = make(map[string]string, len(in.Recovery.Endpoints))
@@ -813,9 +789,6 @@ func (in *ServitorClusterStatus) DeepCopy() *ServitorClusterStatus {
 		out.PublicAuth = &v
 	}
 	out.AuthCertificateReferences = append([]AuthCertificateReference(nil), in.AuthCertificateReferences...)
-	if in.ReviewDeadline != nil {
-		out.ReviewDeadline = in.ReviewDeadline.DeepCopy()
-	}
 	if in.LeaseExpiresAt != nil {
 		out.LeaseExpiresAt = in.LeaseExpiresAt.DeepCopy()
 	}

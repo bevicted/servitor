@@ -55,40 +55,6 @@ func validRecoveryPointer() *servitorv1alpha1.RecoveryMetadata {
 	return &recovery
 }
 
-func TestInitialAuthAttemptIDHashesBoundedIdentity(t *testing.T) {
-	const allocation = "allocation-uid"
-	const request = "1710000000.000001"
-	const operation = "auth-retry-operation"
-	const expected = "auth-attempt-2c835c4733fc29bbc13570eab381b26d"
-
-	attempt := initialAuthAttemptID(allocation, operation, request)
-	if attempt != expected {
-		t.Fatalf("attempt = %q, want %q", attempt, expected)
-	}
-	if attempt != initialAuthAttemptID(allocation, operation, request) {
-		t.Fatal("attempt identity is not stable")
-	}
-	for name, candidate := range map[string]string{
-		"allocation": initialAuthAttemptID("another-allocation", operation, request),
-		"operation":  initialAuthAttemptID(allocation, "apply-operation", request),
-		"request":    initialAuthAttemptID(allocation, operation, "1710000000.000002"),
-	} {
-		if attempt == candidate {
-			t.Fatalf("attempt identity did not distinguish %s", name)
-		}
-	}
-
-	longRequest := strings.Repeat("request-", 32)
-	longOperation := operationID(allocation, "auth-retry-"+longRequest)
-	longAttempt := initialAuthAttemptID(allocation, longOperation, longRequest)
-	if len(longAttempt) > 64 || !strings.HasPrefix(longAttempt, "auth-attempt-") {
-		t.Fatalf("long attempt is not a bounded DNS-safe value: %q", longAttempt)
-	}
-	if longAttempt == longOperation {
-		t.Fatalf("attempt reused operation identity: %q", longAttempt)
-	}
-}
-
 func TestReconcilePersistsOneOperationAndAdoptsMatchingReport(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := servitorv1alpha1.AddToScheme(scheme); err != nil {
@@ -100,7 +66,7 @@ func TestReconcilePersistsOneOperationAndAdoptsMatchingReport(t *testing.T) {
 	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "cluster", Namespace: "ns", UID: "cluster-uid", Generation: 1}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "1.2"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 3600, RetrySeconds: []int64{60}}}}
 	client := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&servitorv1alpha1.ServitorCluster{}, &tektonv1.PipelineRun{}, &tektonv1.TaskRun{}).WithObjects(cluster).Build()
 	now := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
-	reconciler := &Reconciler{Client: client, Scheme: scheme, Config: Config{Namespace: "ns", Defaults: servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Target: "target", Provider: "vpc-gen2", Version: "4.22"}, ResourceGroup: "Default", Platform: "openshift"}, NetworkBindings: map[string]servitorv1alpha1.FrozenNetwork{"target": frozenNetwork()}, Backend: servitorv1alpha1.BackendIdentity{Version: 1, Bucket: "ict-state-bucket", Region: "us-south", Endpoint: "https://s3.us-south.example.invalid", SkipCredentialsValidation: true, SkipMetadataAPICheck: true, SkipRegionValidation: true, SkipRequestingAccountID: true, ForcePathStyle: true}, BackendPrefix: "servitor", ExecutionImage: "registry.example/ict@sha256:deadbeef", ReviewTimeout: 5 * time.Minute}, Now: func() time.Time { return now }}
+	reconciler := &Reconciler{Client: client, Scheme: scheme, Config: Config{Namespace: "ns", Defaults: servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Target: "target", Provider: "vpc-gen2", Version: "4.22"}, ResourceGroup: "Default", Platform: "openshift"}, NetworkBindings: map[string]servitorv1alpha1.FrozenNetwork{"target": frozenNetwork()}, Backend: servitorv1alpha1.BackendIdentity{Version: 1, Bucket: "ict-state-bucket", Region: "us-south", Endpoint: "https://s3.us-south.example.invalid", SkipCredentialsValidation: true, SkipMetadataAPICheck: true, SkipRegionValidation: true, SkipRequestingAccountID: true, ForcePathStyle: true}, BackendPrefix: "servitor", ExecutionImage: "registry.example/ict@sha256:deadbeef"}, Now: func() time.Time { return now }}
 	request := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "ns", Name: "cluster"}}
 	for i := 0; i < 4; i++ {
 		if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
@@ -201,8 +167,136 @@ func TestReconcilePersistsOneOperationAndAdoptsMatchingReport(t *testing.T) {
 	if err := client.Get(context.Background(), request.NamespacedName, stored); err != nil {
 		t.Fatal(err)
 	}
-	if stored.Status.Phase != servitorv1alpha1.PhaseReady || stored.Status.Operation != nil || stored.Status.Ready == nil || stored.Spec.Lifecycle.Approval != "" || stored.Status.Review != nil || stored.Status.ReviewDeadline != nil || stored.Status.ReviewApproval != "" {
+	if stored.Status.Phase != servitorv1alpha1.PhaseReady || stored.Status.Operation != nil || stored.Status.Ready == nil {
 		t.Fatalf("automatic apply did not reach Ready without approval state: %+v", stored.Status)
+	}
+}
+
+func TestReconcileRejectsNewSatelliteBeforeOperationDispatch(t *testing.T) {
+	scheme := cleanupScheme(t)
+	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "satellite", Namespace: "ns", UID: "satellite-uid"}, Spec: servitorv1alpha1.ServitorClusterSpec{
+		Slack:       servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "1.2"},
+		UserOptions: servitorv1alpha1.UserOptions{Provider: "satellite", Version: "4.22"},
+		Lifecycle:   servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 3600, RetrySeconds: []int64{60}, AuthRequestTimestamp: "1.2"},
+	}}
+	client := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&servitorv1alpha1.ServitorCluster{}).WithObjects(cluster).Build()
+	reconciler := &Reconciler{Client: client, Config: Config{Namespace: "ns", Defaults: servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Provider: "vpc-gen2", Version: "4.22"}}}}
+	request := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "ns", Name: "satellite"}}
+	for range 2 {
+		if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stored := &servitorv1alpha1.ServitorCluster{}
+	if err := client.Get(context.Background(), request.NamespacedName, stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status.Phase != servitorv1alpha1.PhaseUnresolved || stored.Status.Diagnostic != "InvalidResolvedOptions" || stored.Status.Operation != nil || stored.Status.ResolvedOptions != nil {
+		t.Fatalf("Satellite admission state = %+v", stored.Status)
+	}
+	var runs tektonv1.PipelineRunList
+	if err := client.List(context.Background(), &runs); err != nil || len(runs.Items) != 0 {
+		t.Fatalf("Satellite admission dispatched runs=%+v, err=%v", runs.Items, err)
+	}
+}
+
+func TestReconcileRejectsUnsupportedHeadlampProviderBeforeOperationDispatch(t *testing.T) {
+	scheme := cleanupScheme(t)
+	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "unsupported-headlamp", Namespace: "ns", UID: "unsupported-headlamp-uid"}, Spec: servitorv1alpha1.ServitorClusterSpec{
+		Slack:       servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "1.2"},
+		UserOptions: servitorv1alpha1.UserOptions{Version: "1.31", Headlamp: true},
+		Lifecycle:   servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 3600, RetrySeconds: []int64{60}},
+	}}
+	client := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&servitorv1alpha1.ServitorCluster{}).WithObjects(cluster).Build()
+	reconciler := &Reconciler{Client: client, Config: Config{Namespace: "ns", Defaults: servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Provider: "unsupported", Version: "4.22"}}}}
+	request := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "ns", Name: "unsupported-headlamp"}}
+	for range 2 {
+		if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stored := &servitorv1alpha1.ServitorCluster{}
+	if err := client.Get(context.Background(), request.NamespacedName, stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status.Phase != servitorv1alpha1.PhaseUnresolved || stored.Status.Diagnostic != "InvalidResolvedOptions" || stored.Status.Operation != nil || stored.Status.ResolvedOptions != nil {
+		t.Fatalf("unsupported Headlamp provider admission state = %+v", stored.Status)
+	}
+	var runs tektonv1.PipelineRunList
+	if err := client.List(context.Background(), &runs); err != nil || len(runs.Items) != 0 {
+		t.Fatalf("unsupported Headlamp provider dispatched runs=%+v, err=%v", runs.Items, err)
+	}
+}
+
+func TestPlanOnlyCleanupFinalizesWithoutDestroy(t *testing.T) {
+	now := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
+	scheme := cleanupScheme(t)
+	cluster := cleanupCluster(now)
+	cluster.Status.Phase = servitorv1alpha1.PhaseCleanupPending
+	cluster.Status.Cleanup = &servitorv1alpha1.CleanupStatus{Reason: servitorv1alpha1.CleanupReasonExplicit, RequestedAt: metav1.NewTime(now)}
+	cluster.Status.Operation = operationReference("plan", "plan-run")
+	labels := map[string]string{pipeline.ClusterUIDLabel: string(cluster.UID), pipeline.OperationLabel: "plan"}
+	plan := &tektonv1.PipelineRun{ObjectMeta: metav1.ObjectMeta{Name: "plan-run", Namespace: "ns", Labels: labels}}
+	succeededRun(plan)
+	task := &tektonv1.TaskRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "plan-task", Namespace: "ns", Labels: labels},
+		Status:     tektonv1.TaskRunStatus{Status: duckv1.Status{Conditions: duckv1.Conditions{{Type: apis.ConditionSucceeded, Status: corev1.ConditionTrue}}}},
+	}
+	client := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&servitorv1alpha1.ServitorCluster{}, &tektonv1.PipelineRun{}, &tektonv1.TaskRun{}).WithObjects(cluster, plan, task).Build()
+	reconciler := cleanupReconciler(client, now)
+	for i := 0; i < 2; i++ {
+		if _, err := reconciler.Reconcile(context.Background(), cleanupRequest()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stored := &servitorv1alpha1.ServitorCluster{}
+	if err := client.Get(context.Background(), cleanupRequest().NamespacedName, stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status.Cleanup.CompletedAt == nil || stored.Status.Phase != servitorv1alpha1.PhaseCleanupComplete || !contains(stored.Finalizers, servitorv1alpha1.CleanupFinalizer) {
+		t.Fatalf("plan-only cleanup did not retain its observable completion state: %+v", stored)
+	}
+	var pipelineRuns tektonv1.PipelineRunList
+	if err := client.List(context.Background(), &pipelineRuns); err != nil || len(pipelineRuns.Items) != 0 {
+		t.Fatalf("plan PipelineRun was not explicitly removed: %d, %v", len(pipelineRuns.Items), err)
+	}
+	var taskRuns tektonv1.TaskRunList
+	if err := client.List(context.Background(), &taskRuns); err != nil || len(taskRuns.Items) != 0 {
+		t.Fatalf("plan TaskRun was not explicitly removed: %d, %v", len(taskRuns.Items), err)
+	}
+}
+
+func TestInitialAuthAttemptIDHashesBoundedIdentity(t *testing.T) {
+	const allocation = "allocation-uid"
+	const request = "1710000000.000001"
+	const operation = "auth-retry-operation"
+	const expected = "auth-attempt-2c835c4733fc29bbc13570eab381b26d"
+
+	attempt := initialAuthAttemptID(allocation, operation, request)
+	if attempt != expected {
+		t.Fatalf("attempt = %q, want %q", attempt, expected)
+	}
+	if attempt != initialAuthAttemptID(allocation, operation, request) {
+		t.Fatal("attempt identity is not stable")
+	}
+	for name, candidate := range map[string]string{
+		"allocation": initialAuthAttemptID("another-allocation", operation, request),
+		"operation":  initialAuthAttemptID(allocation, "apply-operation", request),
+		"request":    initialAuthAttemptID(allocation, operation, "1710000000.000002"),
+	} {
+		if attempt == candidate {
+			t.Fatalf("attempt identity did not distinguish %s", name)
+		}
+	}
+
+	longRequest := strings.Repeat("request-", 32)
+	longOperation := operationID(allocation, "auth-retry-"+longRequest)
+	longAttempt := initialAuthAttemptID(allocation, longOperation, longRequest)
+	if len(longAttempt) > 64 || !strings.HasPrefix(longAttempt, "auth-attempt-") {
+		t.Fatalf("long attempt is not a bounded DNS-safe value: %q", longAttempt)
+	}
+	if longAttempt == longOperation {
+		t.Fatalf("attempt reused operation identity: %q", longAttempt)
 	}
 }
 
@@ -353,62 +447,6 @@ func TestSnapshotOmitsVPCDefaultForClassic(t *testing.T) {
 	}
 }
 
-func TestReconcileRejectsNewSatelliteBeforeOperationDispatch(t *testing.T) {
-	scheme := cleanupScheme(t)
-	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "satellite", Namespace: "ns", UID: "satellite-uid"}, Spec: servitorv1alpha1.ServitorClusterSpec{
-		Slack:       servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "1.2"},
-		UserOptions: servitorv1alpha1.UserOptions{Provider: "satellite", Version: "4.22"},
-		Lifecycle:   servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 3600, RetrySeconds: []int64{60}, AutoApprove: true, AuthRequestTimestamp: "1.2"},
-	}}
-	client := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&servitorv1alpha1.ServitorCluster{}).WithObjects(cluster).Build()
-	reconciler := &Reconciler{Client: client, Config: Config{Namespace: "ns", Defaults: servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Provider: "vpc-gen2", Version: "4.22"}}}}
-	request := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "ns", Name: "satellite"}}
-	for range 2 {
-		if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
-			t.Fatal(err)
-		}
-	}
-	stored := &servitorv1alpha1.ServitorCluster{}
-	if err := client.Get(context.Background(), request.NamespacedName, stored); err != nil {
-		t.Fatal(err)
-	}
-	if stored.Status.Phase != servitorv1alpha1.PhaseUnresolved || stored.Status.Diagnostic != "InvalidResolvedOptions" || stored.Status.Operation != nil || stored.Status.ResolvedOptions != nil {
-		t.Fatalf("Satellite admission state = %+v", stored.Status)
-	}
-	var runs tektonv1.PipelineRunList
-	if err := client.List(context.Background(), &runs); err != nil || len(runs.Items) != 0 {
-		t.Fatalf("Satellite admission dispatched runs=%+v, err=%v", runs.Items, err)
-	}
-}
-
-func TestReconcileRejectsUnsupportedHeadlampProviderBeforeOperationDispatch(t *testing.T) {
-	scheme := cleanupScheme(t)
-	cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "unsupported-headlamp", Namespace: "ns", UID: "unsupported-headlamp-uid"}, Spec: servitorv1alpha1.ServitorClusterSpec{
-		Slack:       servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "1.2"},
-		UserOptions: servitorv1alpha1.UserOptions{Version: "1.31", Headlamp: true},
-		Lifecycle:   servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 3600, RetrySeconds: []int64{60}, AutoApprove: true},
-	}}
-	client := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&servitorv1alpha1.ServitorCluster{}).WithObjects(cluster).Build()
-	reconciler := &Reconciler{Client: client, Config: Config{Namespace: "ns", Defaults: servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Provider: "unsupported", Version: "4.22"}}}}
-	request := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "ns", Name: "unsupported-headlamp"}}
-	for range 2 {
-		if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
-			t.Fatal(err)
-		}
-	}
-	stored := &servitorv1alpha1.ServitorCluster{}
-	if err := client.Get(context.Background(), request.NamespacedName, stored); err != nil {
-		t.Fatal(err)
-	}
-	if stored.Status.Phase != servitorv1alpha1.PhaseUnresolved || stored.Status.Diagnostic != "InvalidResolvedOptions" || stored.Status.Operation != nil || stored.Status.ResolvedOptions != nil {
-		t.Fatalf("unsupported Headlamp provider admission state = %+v", stored.Status)
-	}
-	var runs tektonv1.PipelineRunList
-	if err := client.List(context.Background(), &runs); err != nil || len(runs.Items) != 0 {
-		t.Fatalf("unsupported Headlamp provider dispatched runs=%+v, err=%v", runs.Items, err)
-	}
-}
-
 func TestSnapshotRejectsHeadlampOutsideKubernetes(t *testing.T) {
 	for _, test := range []struct {
 		name, provider, version string
@@ -514,247 +552,6 @@ func TestReconcileRejectsChangedLifecyclePolicy(t *testing.T) {
 	}
 	if stored.Status.Phase != servitorv1alpha1.PhaseUnresolved || stored.Status.Diagnostic != "LifecyclePolicyChanged" || stored.Status.LifecycleSnapshot.InitialLeaseSeconds != 3600 || stored.Status.LifecycleSnapshot.RetrySeconds[0] != 60 {
 		t.Fatalf("changed policy was not rejected against the frozen snapshot: %+v", stored.Status)
-	}
-}
-
-func TestReconcileApprovedApplyUsesFrozenInputsAndAdoptsReadyReport(t *testing.T) {
-	t.Skip("approval-driven apply is obsolete")
-	scheme := runtime.NewScheme()
-	if err := servitorv1alpha1.AddToScheme(scheme); err != nil {
-		t.Fatal(err)
-	}
-	if err := tektonv1.AddToScheme(scheme); err != nil {
-		t.Fatal(err)
-	}
-	now := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
-	operation := "plan-a"
-	deadline := metav1.NewTime(now.Add(time.Minute))
-	cluster := &servitorv1alpha1.ServitorCluster{
-		ObjectMeta: metav1.ObjectMeta{Name: "cluster", Namespace: "ns", UID: "cluster-uid", Generation: 1, Finalizers: []string{servitorv1alpha1.CleanupFinalizer}},
-		Spec:       servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "1.2"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 3600, RetrySeconds: []int64{60}}},
-		Status: servitorv1alpha1.ServitorClusterStatus{
-			Phase:             servitorv1alpha1.PhaseAwaitingApproval,
-			ResolvedOptions:   &servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Provider: "vpc-gen2", Version: "4.22"}, ResourceGroup: "Default", ClusterName: "frozen", Region: "us-south", Network: frozenNetwork()},
-			LifecycleSnapshot: &servitorv1alpha1.LifecycleSnapshot{InitialLeaseSeconds: 3600, RetrySeconds: []int64{60}},
-			Backend:           &servitorv1alpha1.BackendIdentity{Version: 1, Bucket: "bucket", Key: "frozen.tfstate", Region: "us-south", Endpoint: "https://s3.example.invalid"},
-			ExecutionImage:    "registry.example/ict@sha256:frozen",
-			Recovery:          validRecoveryPointer(),
-			Operation:         &servitorv1alpha1.OperationReference{ID: operation, Kind: "plan", PipelineRunName: "plan-run", Adopted: true},
-			ReviewDeadline:    &deadline,
-			ReviewGeneration:  1,
-		},
-	}
-	client := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&servitorv1alpha1.ServitorCluster{}, &tektonv1.PipelineRun{}, &tektonv1.TaskRun{}).WithObjects(cluster).Build()
-	reconciler := &Reconciler{Client: client, Scheme: scheme, Config: Config{Namespace: "ns", Defaults: servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Version: "changed"}}, ExecutionImage: "registry.example/changed"}, Now: func() time.Time { return now }}
-	request := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "ns", Name: "cluster"}}
-	if result, err := reconciler.Reconcile(context.Background(), request); err != nil || result.RequeueAfter <= 0 {
-		t.Fatalf("awaiting approval did not requeue: result=%+v err=%v", result, err)
-	}
-	stored := &servitorv1alpha1.ServitorCluster{}
-	if err := client.Get(context.Background(), request.NamespacedName, stored); err != nil {
-		t.Fatal(err)
-	}
-	if stored.Status.Operation == nil || stored.Status.Operation.ID != operation {
-		t.Fatalf("awaiting approval changed the planning operation: %+v", stored.Status)
-	}
-	stored.Spec.Lifecycle.Approval = "approved"
-	stored.Generation++
-	if err := client.Update(context.Background(), stored); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
-		t.Fatal(err)
-	}
-	if err := client.Get(context.Background(), request.NamespacedName, stored); err != nil {
-		t.Fatal(err)
-	}
-	if stored.Status.Phase != servitorv1alpha1.PhaseApplying || stored.Status.Operation.Kind != "apply" || stored.Status.Operation.ID == operation {
-		t.Fatalf("approval did not persist a fresh apply identity: %+v", stored.Status)
-	}
-	if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
-		t.Fatal(err)
-	}
-	applyRun := &tektonv1.PipelineRun{}
-	if err := client.Get(context.Background(), types.NamespacedName{Namespace: "ns", Name: stored.Status.Operation.PipelineRunName}, applyRun); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
-		t.Fatal(err)
-	}
-	var runs tektonv1.PipelineRunList
-	if err := client.List(context.Background(), &runs); err != nil || len(runs.Items) != 1 {
-		t.Fatalf("duplicate approval created PipelineRuns: %d, %v", len(runs.Items), err)
-	}
-	params := map[string]string{}
-	for _, param := range applyRun.Spec.Params {
-		params[param.Name] = param.Value.StringVal
-	}
-	if params["operation-kind"] != "apply" || params["execution-image"] != "registry.example/ict@sha256:frozen" || params["resolved-options"] == "" || params["recovery"] == "" || params["backend"] == "" {
-		t.Fatalf("apply PipelineRun did not receive frozen inputs: %#v", params)
-	}
-	applyRun.Status.Status.Conditions = duckv1.Conditions{{Type: apis.ConditionSucceeded, Status: corev1.ConditionTrue}}
-	applyRun.Status.ChildReferences = []tektonv1.ChildStatusReference{{TypeMeta: runtime.TypeMeta{Kind: "TaskRun"}, Name: "apply-task", PipelineTaskName: "operation"}}
-	if err := client.Status().Update(context.Background(), applyRun); err != nil {
-		t.Fatal(err)
-	}
-	task := &tektonv1.TaskRun{ObjectMeta: metav1.ObjectMeta{Name: "apply-task", Namespace: "ns"}, Status: tektonv1.TaskRunStatus{TaskRunStatusFields: tektonv1.TaskRunStatusFields{PodName: "pod", Steps: []tektonv1.StepState{{Name: pipeline.ReportContainerName, Container: "step-report"}}}}}
-	if err := client.Create(context.Background(), task); err != nil {
-		t.Fatal(err)
-	}
-	report, err := json.Marshal(pipeline.Report{Version: 1, ClusterUID: string(stored.UID), OperationID: stored.Status.Operation.ID, ResolvedOptions: *stored.Status.ResolvedOptions, Recovery: *stored.Status.Recovery, Ready: servitorv1alpha1.ReadySummary{Resources: []servitorv1alpha1.SummaryResource{{Role: "Cluster", ID: "cluster-id", Name: "frozen"}}}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	reconciler.Logs = reportLogs{data: report}
-	if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
-		t.Fatal(err)
-	}
-	if err := client.Get(context.Background(), request.NamespacedName, stored); err != nil {
-		t.Fatal(err)
-	}
-	if stored.Status.Phase != servitorv1alpha1.PhaseReady || stored.Status.Operation != nil || stored.Status.Ready == nil || len(stored.Status.Ready.Resources) != 1 {
-		t.Fatalf("apply report was not adopted as ready: %+v", stored.Status)
-	}
-	if stored.Status.LeaseExpiresAt == nil || !stored.Status.LeaseExpiresAt.Time.Equal(now.Add(time.Hour)) {
-		t.Fatalf("ready transition did not snapshot the initial lease: %+v", stored.Status.LeaseExpiresAt)
-	}
-	reconciler.Now = func() time.Time { return now.Add(10 * time.Minute) }
-	if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
-		t.Fatal(err)
-	}
-	if err := client.Get(context.Background(), request.NamespacedName, stored); err != nil {
-		t.Fatal(err)
-	}
-	if !stored.Status.LeaseExpiresAt.Time.Equal(now.Add(time.Hour)) {
-		t.Fatalf("duplicate ready reconcile moved lease expiry: %s", stored.Status.LeaseExpiresAt)
-	}
-}
-
-func TestReconcileApprovalSetBeforeReviewRequiresNewApproval(t *testing.T) {
-	t.Skip("approval state is obsolete")
-	scheme := runtime.NewScheme()
-	if err := servitorv1alpha1.AddToScheme(scheme); err != nil {
-		t.Fatal(err)
-	}
-	now := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
-	deadline := metav1.NewTime(now.Add(time.Minute))
-	cluster := &servitorv1alpha1.ServitorCluster{
-		ObjectMeta: metav1.ObjectMeta{Name: "cluster", Namespace: "ns", UID: "uid", Generation: 2, Finalizers: []string{servitorv1alpha1.CleanupFinalizer}},
-		Spec:       servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "1.2"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 3600, RetrySeconds: []int64{60}, Approval: "approved"}},
-		Status: servitorv1alpha1.ServitorClusterStatus{
-			Phase:             servitorv1alpha1.PhaseAwaitingApproval,
-			ResolvedOptions:   &servitorv1alpha1.ResolvedOptions{},
-			LifecycleSnapshot: &servitorv1alpha1.LifecycleSnapshot{InitialLeaseSeconds: 3600, RetrySeconds: []int64{60}},
-			Operation:         &servitorv1alpha1.OperationReference{ID: "plan-a", Kind: "plan", PipelineRunName: "plan-run", Adopted: true},
-			ReviewDeadline:    &deadline,
-			ReviewGeneration:  1,
-			ReviewApproval:    "approved",
-		},
-	}
-	client := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&servitorv1alpha1.ServitorCluster{}).WithObjects(cluster).Build()
-	reconciler := &Reconciler{Client: client, Config: Config{Namespace: "ns"}, Now: func() time.Time { return now }}
-	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "ns", Name: "cluster"}})
-	if err != nil || result.RequeueAfter <= 0 {
-		t.Fatalf("pre-existing approval did not remain pending: result=%+v err=%v", result, err)
-	}
-	if err := client.Get(context.Background(), types.NamespacedName{Namespace: "ns", Name: "cluster"}, cluster); err != nil {
-		t.Fatal(err)
-	}
-	if cluster.Status.Phase != servitorv1alpha1.PhaseAwaitingApproval || cluster.Status.Operation == nil || cluster.Status.Operation.Kind != "plan" {
-		t.Fatalf("approval written during planning launched apply: %+v", cluster.Status)
-	}
-	cluster.Spec.Lifecycle.Approval = ""
-	cluster.Generation++
-	if err := client.Update(context.Background(), cluster); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "ns", Name: "cluster"}}); err != nil {
-		t.Fatal(err)
-	}
-	if err := client.Get(context.Background(), types.NamespacedName{Namespace: "ns", Name: "cluster"}, cluster); err != nil {
-		t.Fatal(err)
-	}
-	if cluster.Status.ReviewGeneration != cluster.Generation || cluster.Status.ReviewApproval != "" {
-		t.Fatalf("cleared approval did not reset review state: %+v", cluster.Status)
-	}
-	cluster.Spec.Lifecycle.Approval = "approved"
-	cluster.Generation++
-	if err := client.Update(context.Background(), cluster); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "ns", Name: "cluster"}}); err != nil {
-		t.Fatal(err)
-	}
-	if err := client.Get(context.Background(), types.NamespacedName{Namespace: "ns", Name: "cluster"}, cluster); err != nil {
-		t.Fatal(err)
-	}
-	if cluster.Status.Phase != servitorv1alpha1.PhaseApplying || cluster.Status.Operation == nil || cluster.Status.Operation.Kind != "apply" {
-		t.Fatalf("new approval written while awaiting did not launch apply: %+v", cluster.Status)
-	}
-}
-
-func TestReconcileApprovalRejectsLateAndRejectedDecisions(t *testing.T) {
-	t.Skip("approval state is obsolete")
-	for _, test := range []struct {
-		name     string
-		approval string
-		deadline time.Time
-	}{
-		{name: "late approval", approval: "approved", deadline: time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)},
-		{name: "rejected approval", approval: "rejected", deadline: time.Date(2026, 9, 8, 0, 1, 0, 0, time.UTC)},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			scheme := runtime.NewScheme()
-			if err := servitorv1alpha1.AddToScheme(scheme); err != nil {
-				t.Fatal(err)
-			}
-			deadline := metav1.NewTime(test.deadline)
-			cluster := &servitorv1alpha1.ServitorCluster{ObjectMeta: metav1.ObjectMeta{Name: "cluster", Namespace: "ns", UID: "uid", Finalizers: []string{servitorv1alpha1.CleanupFinalizer}}, Spec: servitorv1alpha1.ServitorClusterSpec{Slack: servitorv1alpha1.SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "1.2"}, Lifecycle: servitorv1alpha1.LifecyclePolicy{InitialLeaseSeconds: 3600, RetrySeconds: []int64{60}, Approval: test.approval}}, Status: servitorv1alpha1.ServitorClusterStatus{Phase: servitorv1alpha1.PhaseAwaitingApproval, ResolvedOptions: &servitorv1alpha1.ResolvedOptions{}, LifecycleSnapshot: &servitorv1alpha1.LifecycleSnapshot{InitialLeaseSeconds: 3600, RetrySeconds: []int64{60}}, ReviewDeadline: &deadline}}
-			client := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&servitorv1alpha1.ServitorCluster{}).WithObjects(cluster).Build()
-			reconciler := &Reconciler{Client: client, Config: Config{Namespace: "ns"}, Now: func() time.Time { return time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC) }}
-			if _, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "ns", Name: "cluster"}}); err != nil {
-				t.Fatal(err)
-			}
-			if err := client.Get(context.Background(), types.NamespacedName{Namespace: "ns", Name: "cluster"}, cluster); err != nil {
-				t.Fatal(err)
-			}
-			if cluster.Status.Phase != servitorv1alpha1.PhaseCleanupPending || !cluster.Status.CleanupRequested || cluster.Status.Operation != nil {
-				t.Fatalf("invalid decision launched or retained apply: %+v", cluster.Status)
-			}
-		})
-	}
-}
-
-func TestReviewExpiryCleanupProgressesWithoutExternalEvents(t *testing.T) {
-	t.Skip("review expiry is obsolete")
-	now := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
-	cluster := cleanupCluster(now)
-	deadline := metav1.NewTime(now)
-	cluster.Status.Phase = servitorv1alpha1.PhaseAwaitingApproval
-	cluster.Status.ReviewDeadline = &deadline
-	cluster.Status.Operation = operationReference("plan", "plan-run")
-	plan := &tektonv1.PipelineRun{ObjectMeta: metav1.ObjectMeta{Name: "plan-run", Namespace: "ns", Labels: map[string]string{pipeline.ClusterUIDLabel: string(cluster.UID), pipeline.OperationLabel: "plan"}}}
-	succeededRun(plan)
-	client := fake.NewClientBuilder().WithScheme(cleanupScheme(t)).WithStatusSubresource(&servitorv1alpha1.ServitorCluster{}, &tektonv1.PipelineRun{}).WithObjects(cluster, plan).Build()
-	reconciler := cleanupReconciler(client, now)
-
-	for _, expected := range []time.Duration{cleanupProgressRequeue, cleanupProgressRequeue, cleanupNotificationGrace} {
-		result, err := reconciler.Reconcile(context.Background(), cleanupRequest())
-		if err != nil || result.RequeueAfter != expected {
-			t.Fatalf("cleanup result = %+v, %v; want requeue after %s", result, err, expected)
-		}
-	}
-
-	stored := &servitorv1alpha1.ServitorCluster{}
-	if err := client.Get(context.Background(), cleanupRequest().NamespacedName, stored); err != nil {
-		t.Fatal(err)
-	}
-	if stored.Status.Phase != servitorv1alpha1.PhaseCleanupComplete || stored.Status.Cleanup == nil || stored.Status.Cleanup.Reason != servitorv1alpha1.CleanupReasonReviewExpired || stored.Status.Cleanup.RequiresDestroy {
-		t.Fatalf("expired review did not complete plan-only cleanup: %+v", stored.Status)
-	}
-	var runs tektonv1.PipelineRunList
-	if err := client.List(context.Background(), &runs); err != nil || len(runs.Items) != 0 {
-		t.Fatalf("terminal plan run was not removed: %d, %v", len(runs.Items), err)
 	}
 }
 
@@ -1079,44 +876,6 @@ func TestCleanupWaitsForActiveApplyThenUsesDeterministicDestroy(t *testing.T) {
 		if run.Name == stored.Status.Operation.PipelineRunName && len(run.OwnerReferences) != 0 {
 			t.Fatal("destroy PipelineRun must not have a CR owner reference")
 		}
-	}
-}
-
-func TestPlanOnlyCleanupFinalizesWithoutDestroy(t *testing.T) {
-	now := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
-	scheme := cleanupScheme(t)
-	cluster := cleanupCluster(now)
-	cluster.Status.Phase = servitorv1alpha1.PhaseCleanupPending
-	cluster.Status.Cleanup = &servitorv1alpha1.CleanupStatus{Reason: servitorv1alpha1.CleanupReasonRejected, RequestedAt: metav1.NewTime(now)}
-	cluster.Status.Operation = operationReference("plan", "plan-run")
-	labels := map[string]string{pipeline.ClusterUIDLabel: string(cluster.UID), pipeline.OperationLabel: "plan"}
-	plan := &tektonv1.PipelineRun{ObjectMeta: metav1.ObjectMeta{Name: "plan-run", Namespace: "ns", Labels: labels}}
-	succeededRun(plan)
-	task := &tektonv1.TaskRun{
-		ObjectMeta: metav1.ObjectMeta{Name: "plan-task", Namespace: "ns", Labels: labels},
-		Status:     tektonv1.TaskRunStatus{Status: duckv1.Status{Conditions: duckv1.Conditions{{Type: apis.ConditionSucceeded, Status: corev1.ConditionTrue}}}},
-	}
-	client := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&servitorv1alpha1.ServitorCluster{}, &tektonv1.PipelineRun{}, &tektonv1.TaskRun{}).WithObjects(cluster, plan, task).Build()
-	reconciler := cleanupReconciler(client, now)
-	for i := 0; i < 2; i++ {
-		if _, err := reconciler.Reconcile(context.Background(), cleanupRequest()); err != nil {
-			t.Fatal(err)
-		}
-	}
-	stored := &servitorv1alpha1.ServitorCluster{}
-	if err := client.Get(context.Background(), cleanupRequest().NamespacedName, stored); err != nil {
-		t.Fatal(err)
-	}
-	if stored.Status.Cleanup.CompletedAt == nil || stored.Status.Phase != servitorv1alpha1.PhaseCleanupComplete || !contains(stored.Finalizers, servitorv1alpha1.CleanupFinalizer) {
-		t.Fatalf("plan-only cleanup did not retain its observable completion state: %+v", stored)
-	}
-	var pipelineRuns tektonv1.PipelineRunList
-	if err := client.List(context.Background(), &pipelineRuns); err != nil || len(pipelineRuns.Items) != 0 {
-		t.Fatalf("plan PipelineRun was not explicitly removed: %d, %v", len(pipelineRuns.Items), err)
-	}
-	var taskRuns tektonv1.TaskRunList
-	if err := client.List(context.Background(), &taskRuns); err != nil || len(taskRuns.Items) != 0 {
-		t.Fatalf("plan TaskRun was not explicitly removed: %d, %v", len(taskRuns.Items), err)
 	}
 }
 

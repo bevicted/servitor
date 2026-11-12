@@ -124,9 +124,6 @@ spec:
                 lifecycle:
                   type: object
                   required: [initialLeaseSeconds, retrySeconds]
-                  x-kubernetes-validations:
-                    - rule: "(has(self.autoApprove) ? self.autoApprove : false) == (has(oldSelf.autoApprove) ? oldSelf.autoApprove : false)"
-                      message: autoApprove is immutable
                   properties:
                     initialLeaseSeconds:
                       type: integer
@@ -144,8 +141,6 @@ spec:
                       x-kubernetes-validations:
                         - rule: self == oldSelf
                           message: retrySeconds is immutable
-                    autoApprove: { type: boolean }
-                    approval: { type: string, enum: ["", approved, rejected] }
                     requestedExpiry: { type: string, format: date-time }
                     extensionEventTimestamp:
                       {
@@ -176,7 +171,6 @@ spec:
                       [
                         Pending,
                         Planning,
-                        AwaitingApproval,
                         Applying,
                         Ready,
                         CleanupPending,
@@ -319,35 +313,6 @@ spec:
                         startedAt: { type: string, format: date-time },
                         dispatched: { type: boolean },
                         adopted: { type: boolean },
-                      },
-                  }
-                review:
-                  {
-                    type: object,
-                    properties:
-                      {
-                        resources:
-                          {
-                            type: array,
-                            maxItems: 256,
-                            items:
-                              {
-                                type: object,
-                                properties:
-                                  {
-                                    role: { type: string, maxLength: 64 },
-                                    id: { type: string, maxLength: 256 },
-                                    name: { type: string, maxLength: 256 },
-                                    actions:
-                                      {
-                                        type: array,
-                                        maxItems: 2,
-                                        items: { type: string },
-                                      },
-                                    reused: { type: boolean },
-                                  },
-                              },
-                          },
                       },
                   }
                 auth:
@@ -537,9 +502,6 @@ spec:
                               { type: string, maxLength: 256 }
                             issuer: { type: string, maxLength: 256 }
                             ttl: { type: string, maxLength: 32 }
-                reviewDeadline: { type: string, format: date-time }
-                reviewGeneration: { type: integer, format: int64, minimum: 1 }
-                reviewApproval: { type: string, enum: ["", approved, rejected] }
                 ready:
                   type: object
                   properties:
@@ -669,8 +631,6 @@ spec:
                         type: string,
                         enum:
                           [
-                            Rejected,
-                            ReviewExpired,
                             PlanningFailed,
                             ApplyFailed,
                             LeaseExpired,

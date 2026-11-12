@@ -18,13 +18,13 @@ network:
                 synthetic-existing-network:
                         account_id: synthetic-account
                         vpc_id: synthetic-vpc-id
+                        vpc_region: us-south
                         subnet_id: synthetic-subnet-id
                         public_gateway_id: synthetic-gateway-id
                         zone: us-south-1
         target_bindings:
                 replace-me: synthetic-existing-network
 lifecycle:
-        confirmation_timeout: 10m
         lease: 4h
         retry_intervals: [1m, 5m, 15m]
 # The leader creates missing target snapshots, refreshes them hourly, and

@@ -442,7 +442,7 @@ func runPlan(ctx context.Context, uid, operation string, options servitorv1alpha
 		return err
 	}
 	recovery := servitorv1alpha1.RecoveryMetadata{Version: result.Recovery.Version, Target: result.Recovery.Target, Endpoints: result.Recovery.Endpoints, Values: result.Recovery.Values, SatelliteSSHPublicKeyFingerprint: result.Recovery.SatelliteSSHPublicKeyFingerprint, TFVarsSHA256: result.Recovery.TFVarsSHA256}
-	return writeReport(reportFile, pipeline.Report{Version: 1, ClusterUID: uid, OperationID: operation, ResolvedOptions: options, Recovery: recovery, Review: summaryFromPlan(plan)})
+	return writeReport(reportFile, pipeline.Report{Version: 1, ClusterUID: uid, OperationID: operation, ResolvedOptions: options, Recovery: recovery})
 }
 
 func validatePlanOptions(ctx context.Context, configPath, apiKey string, options servitorv1alpha1.ResolvedOptions) (servitorv1alpha1.ResolvedOptions, *servitorv1alpha1.PlanRejection, error) {
@@ -1197,14 +1197,6 @@ func replaceReportFileWithRename(path string, data []byte, rename func(string, s
 		return err
 	}
 	return rename(temporary.Name(), path)
-}
-
-func summaryFromPlan(plan terraformview.Plan) servitorv1alpha1.ReviewSummary {
-	summary := servitorv1alpha1.ReviewSummary{Resources: make([]servitorv1alpha1.SummaryResource, 0, len(plan.Resources))}
-	for _, resource := range plan.Resources {
-		summary.Resources = append(summary.Resources, servitorv1alpha1.SummaryResource{Role: resource.Role(), ID: resource.ID, Name: resource.DisplayName, Actions: resource.Actions, Reused: resource.Reused})
-	}
-	return summary
 }
 
 func summaryFromState(state terraformview.State) servitorv1alpha1.ReadySummary {

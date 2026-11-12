@@ -18,6 +18,17 @@ import (
 	"k8s.io/kube-openapi/pkg/validation/validate"
 )
 
+func TestServitorClusterDeepCopyDoesNotAliasSummaryActions(t *testing.T) {
+	cluster := &ServitorCluster{Status: ServitorClusterStatus{
+		Ready: &ReadySummary{Resources: []SummaryResource{{Actions: []string{"read"}}}},
+	}}
+	copy := cluster.DeepCopy()
+	copy.Status.Ready.Resources[0].Actions[0] = "update"
+	if cluster.Status.Ready.Resources[0].Actions[0] != "read" {
+		t.Fatalf("DeepCopy() aliases summary actions: %+v", cluster.Status)
+	}
+}
+
 func TestServitorClusterSpecRequiresWholeHourInitialLease(t *testing.T) {
 	spec := ServitorClusterSpec{
 		Slack: SlackIdentity{OwnerID: "U1", ChannelID: "C1", ThreadTimestamp: "1.2"},
@@ -128,49 +139,6 @@ func TestServitorClusterDeepCopyDoesNotAliasPlanRejection(t *testing.T) {
 	copy.Status.PlanRejection.OptionKey = "provider"
 	if cluster.Status.PlanRejection.OptionKey != "version" {
 		t.Fatalf("DeepCopy() aliases plan rejection: %+v", cluster.Status.PlanRejection)
-	}
-}
-
-func TestServitorClusterDeepCopyDoesNotAliasSummaryActions(t *testing.T) {
-	cluster := &ServitorCluster{Status: ServitorClusterStatus{
-		Review: &ReviewSummary{Resources: []SummaryResource{{Actions: []string{"create"}}}},
-		Ready:  &ReadySummary{Resources: []SummaryResource{{Actions: []string{"read"}}}},
-	}}
-	copy := cluster.DeepCopy()
-	copy.Status.Review.Resources[0].Actions[0] = "delete"
-	copy.Status.Ready.Resources[0].Actions[0] = "update"
-	if cluster.Status.Review.Resources[0].Actions[0] != "create" || cluster.Status.Ready.Resources[0].Actions[0] != "read" {
-		t.Fatalf("DeepCopy() aliases summary actions: %+v", cluster.Status)
-	}
-}
-
-func TestLifecycleAutoApproveRoundTripsAndCRDProtectsItsEffectiveValue(t *testing.T) {
-	cluster := ServitorCluster{Spec: ServitorClusterSpec{Lifecycle: LifecyclePolicy{AutoApprove: true}}}
-	data, err := json.Marshal(cluster)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var decoded ServitorCluster
-	if err := json.Unmarshal(data, &decoded); err != nil || !decoded.Spec.Lifecycle.AutoApprove {
-		t.Fatalf("autoApprove round trip = %+v, %v", decoded.Spec.Lifecycle, err)
-	}
-	contents, err := os.ReadFile(filepath.Join("..", "..", "config", "crd", "bases", "servitor.bevicted.github.io_servitorclusters.yaml"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var document map[string]any
-	if err := yaml.Unmarshal(contents, &document); err != nil {
-		t.Fatal(err)
-	}
-	versions := yamlList(t, yamlMap(t, document["spec"])["versions"])
-	lifecycle := yamlMap(t, yamlMap(t, yamlMap(t, yamlMap(t, versions[0])["schema"])["openAPIV3Schema"])["properties"])
-	lifecycle = yamlMap(t, yamlMap(t, yamlMap(t, lifecycle["spec"])["properties"])["lifecycle"])
-	if autoApprove := yamlMap(t, lifecycle["properties"])["autoApprove"]; yamlMap(t, autoApprove)["type"] != "boolean" {
-		t.Fatalf("autoApprove schema = %#v", autoApprove)
-	}
-	validations := yamlList(t, lifecycle["x-kubernetes-validations"])
-	if len(validations) != 1 || !strings.Contains(yamlMap(t, validations[0])["rule"].(string), "has(self.autoApprove)") {
-		t.Fatalf("autoApprove transition validation = %#v", validations)
 	}
 }
 

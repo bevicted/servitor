@@ -149,6 +149,10 @@ kubectl kustomize config/default
 kubectl apply -k config/default
 ```
 
+### Upgrading to approval-free provisioning
+
+Upgrade only with zero allocations: clean up every existing `ServitorCluster` and confirm none remain before rollout. Remove `lifecycle.confirmation_timeout` from operator configuration and any approval/review fields from custom resource manifests. Roll out the matching operator image, task image, and CRD together; mixed versions are not supported. There is no migration path for existing allocations.
+
 ### 3. Configure Slack
 
 Enable Socket Mode and grant the app:

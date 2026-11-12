@@ -158,7 +158,7 @@ func TestRecoveredConfigurationDeliveryFailureDoesNotBlockAutomaticApply(t *test
 	if err := kube.Get(ctx, request.NamespacedName, stored); err != nil {
 		t.Fatal(err)
 	}
-	if stored.Status.Phase != servitorv1alpha1.PhaseReady || stored.Spec.Lifecycle.Approval != "" || stored.Status.Review != nil || stored.Status.ReviewDeadline != nil || stored.Status.ReviewApproval != "" {
+	if stored.Status.Phase != servitorv1alpha1.PhaseReady {
 		t.Fatalf("apply did not reach Ready without approval state: %+v", stored.Status)
 	}
 	stopFirst()
@@ -231,7 +231,7 @@ func TestHeadlampAllocationUsesFrozenLifecycleForAutomaticApplyAndDestroy(t *tes
 		Namespace: "ns", Defaults: servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Target: "target", Provider: "vpc-gen2", Version: "4.22"}, ResourceGroup: "Default"},
 		NetworkBindings: map[string]servitorv1alpha1.FrozenNetwork{"target": {BindingID: "existing", AccountID: "account", VPCRegion: "us-south", VPCID: "vpc", SubnetID: "subnet", PublicGatewayID: "gateway", Zone: "us-south-1"}},
 		Backend:         servitorv1alpha1.BackendIdentity{Version: 1, Bucket: "bucket", Region: "us-south", Endpoint: "https://s3.example.invalid"}, BackendPrefix: "servitor",
-		ExecutionImage: "registry.example/ict@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", ReviewTimeout: time.Minute,
+		ExecutionImage: "registry.example/ict@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 	}, Now: func() time.Time { return now }}
 	request := ctrl.Request{NamespacedName: key}
 	for range 4 {
@@ -242,7 +242,7 @@ func TestHeadlampAllocationUsesFrozenLifecycleForAutomaticApplyAndDestroy(t *tes
 	if err := kube.Get(ctx, key, cluster); err != nil || cluster.Status.Operation == nil || cluster.Status.Operation.Kind != "plan" || cluster.Status.ResolvedOptions == nil || !cluster.Status.ResolvedOptions.Headlamp {
 		t.Fatalf("frozen plan state = %+v, %v", cluster.Status, err)
 	}
-	adoptHeadlampReport(t, ctx, kube, reconciler, request, cluster, "plan", servitorv1alpha1.ReviewSummary{Resources: []servitorv1alpha1.SummaryResource{{Role: "Add-on", Name: "headlamp", Actions: []string{"create"}}}})
+	adoptHeadlampReport(t, ctx, kube, reconciler, request, cluster, "plan", []servitorv1alpha1.SummaryResource{{Role: "Add-on", Name: "headlamp", Actions: []string{"create"}}})
 	if err := kube.Get(ctx, key, cluster); err != nil || cluster.Status.Phase != servitorv1alpha1.PhasePending || cluster.Status.Recovery == nil || cluster.Status.ResolvedOptions == nil || !cluster.Status.ResolvedOptions.Headlamp {
 		t.Fatalf("Headlamp recovery state = %+v, %v", cluster.Status, err)
 	}
@@ -254,7 +254,7 @@ func TestHeadlampAllocationUsesFrozenLifecycleForAutomaticApplyAndDestroy(t *tes
 	if err := kube.Get(ctx, key, cluster); err != nil || cluster.Status.Operation == nil || cluster.Status.Operation.Kind != "apply" {
 		t.Fatalf("Headlamp apply state = %+v, %v", cluster.Status, err)
 	}
-	adoptHeadlampReport(t, ctx, kube, reconciler, request, cluster, "apply", servitorv1alpha1.ReviewSummary{Resources: []servitorv1alpha1.SummaryResource{{Role: "Add-on", Name: "headlamp", Actions: []string{"create"}}}})
+	adoptHeadlampReport(t, ctx, kube, reconciler, request, cluster, "apply", []servitorv1alpha1.SummaryResource{{Role: "Add-on", Name: "headlamp", Actions: []string{"create"}}})
 	if err := kube.Get(ctx, key, cluster); err != nil || cluster.Status.Phase != servitorv1alpha1.PhaseReady || cluster.Status.Ready == nil || cluster.Status.Ready.Resources[0].Role != "Add-on" {
 		t.Fatalf("Headlamp Ready state = %+v, %v", cluster.Status, err)
 	}
@@ -282,7 +282,7 @@ func TestHeadlampAllocationUsesFrozenLifecycleForAutomaticApplyAndDestroy(t *tes
 	}
 }
 
-func adoptHeadlampReport(t *testing.T, ctx context.Context, kube client.Client, reconciler *controller.Reconciler, request ctrl.Request, cluster *servitorv1alpha1.ServitorCluster, kind string, review servitorv1alpha1.ReviewSummary) {
+func adoptHeadlampReport(t *testing.T, ctx context.Context, kube client.Client, reconciler *controller.Reconciler, request ctrl.Request, cluster *servitorv1alpha1.ServitorCluster, kind string, resources []servitorv1alpha1.SummaryResource) {
 	t.Helper()
 	run := &tektonv1.PipelineRun{}
 	if err := kube.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: cluster.Status.Operation.PipelineRunName}, run); err != nil {
@@ -303,10 +303,9 @@ func adoptHeadlampReport(t *testing.T, ctx context.Context, kube client.Client, 
 	resolved.ClusterName = "headlamp-cluster"
 	resolved.Region = "us-south"
 	recovery := servitorv1alpha1.RecoveryMetadata{Version: 1, Target: "target", TFVarsSHA256: strings.Repeat("a", 64), Endpoints: map[string]string{"IAM": "https://iam.example.invalid", "ContainerService": "https://containers.example.invalid", "GlobalTagging": "https://tagging.example.invalid", "ResourceManagement": "https://management.example.invalid", "ResourceController": "https://controller.example.invalid", "VPC": "https://vpc.example.invalid"}, Values: servitorv1alpha1.RecoveryValues{ClusterName: "headlamp-cluster", ResourceGroupName: "Default", Region: "us-south", ClusterMode: "vpc", Platform: "kubernetes", KubeVersion: "1.31", WorkerCount: 1, Headlamp: true, Zone: "us-south-1", Flavor: "bx2.2x8", AccountID: "account", VPCRegion: "us-south", VPCID: "vpc", SubnetIDs: []string{"subnet"}, PublicGatewayIDs: []string{"gateway"}}}
-	report := pipeline.Report{Version: 1, ClusterUID: string(cluster.UID), OperationID: cluster.Status.Operation.ID, ResolvedOptions: resolved, Recovery: recovery, Review: review}
+	report := pipeline.Report{Version: 1, ClusterUID: string(cluster.UID), OperationID: cluster.Status.Operation.ID, ResolvedOptions: resolved, Recovery: recovery}
 	if kind == "apply" {
-		report.Ready = servitorv1alpha1.ReadySummary{Resources: review.Resources}
-		report.Review = servitorv1alpha1.ReviewSummary{}
+		report.Ready = servitorv1alpha1.ReadySummary{Resources: resources}
 	}
 	data, err := json.Marshal(report)
 	if err != nil {

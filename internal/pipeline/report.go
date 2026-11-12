@@ -27,7 +27,6 @@ type Report struct {
 	OperationID     string                            `json:"operationID"`
 	ResolvedOptions servitorv1alpha1.ResolvedOptions  `json:"resolvedOptions"`
 	Recovery        servitorv1alpha1.RecoveryMetadata `json:"recovery"`
-	Review          servitorv1alpha1.ReviewSummary    `json:"review,omitempty"`
 	Ready           servitorv1alpha1.ReadySummary     `json:"ready,omitempty"`
 	Auth            *servitorv1alpha1.AuthStatus      `json:"auth,omitempty"`
 	PlanRejection   *servitorv1alpha1.PlanRejection   `json:"planRejection,omitempty"`
@@ -41,13 +40,10 @@ func (r Report) Validate(expectedUID, expectedOperation string) error {
 		if err := r.PlanRejection.Validate(); err != nil {
 			return err
 		}
-		if !reflect.DeepEqual(r.ResolvedOptions, servitorv1alpha1.ResolvedOptions{}) || !reflect.DeepEqual(r.Recovery, servitorv1alpha1.RecoveryMetadata{}) || len(r.Review.Resources) != 0 || len(r.Ready.Resources) != 0 || r.Auth != nil {
+		if !reflect.DeepEqual(r.ResolvedOptions, servitorv1alpha1.ResolvedOptions{}) || !reflect.DeepEqual(r.Recovery, servitorv1alpha1.RecoveryMetadata{}) || len(r.Ready.Resources) != 0 || r.Auth != nil {
 			return errors.New("planning rejection must not contain a success payload")
 		}
 		return nil
-	}
-	if err := validateSummary(r.Review.Resources); err != nil {
-		return err
 	}
 	if err := validateSummary(r.Ready.Resources); err != nil {
 		return err

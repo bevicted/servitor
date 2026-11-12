@@ -294,11 +294,11 @@ func connectedAuthConfig() config.Config {
 		Namespace: "servitor", Slack: config.SlackConfig{ChannelID: "C123"},
 		Defaults:  config.DefaultsConfig{Version: "4.22", Target: "production", Provider: "vpc-gen2", ResourceGroup: "Default", OpenShiftFlavor: "bx2.4x16", KubernetesFlavor: "bx2.2x8"},
 		Network:   config.NetworkConfig{Bindings: map[string]config.NetworkBinding{"existing": binding}, TargetBindings: map[string]string{"production": "existing"}},
-		Lifecycle: config.LifecycleConfig{ConfirmationTimeout: time.Minute, Lease: time.Hour, RetryIntervals: []time.Duration{time.Minute}}, Auth: config.AuthConfig{},
-		ICT:     config.ICTConfig{TargetConfigMap: "ict-config", TargetConfigKey: "config.yaml"},
-		COS:     config.COSConfig{Bucket: "bucket", Region: "us-south", Endpoint: "https://s3.example.invalid", KeyPrefix: "servitor", SkipCredentialsValidation: true, SkipMetadataAPICheck: true, SkipRegionValidation: true, SkipRequestingAccountID: true, ForcePathStyle: true},
-		Images:  config.ImagesConfig{Execution: "registry.example.invalid/task@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
-		Secrets: config.SecretsConfig{Slack: "slack", COS: "cos", IBM: "ibm"},
+		Lifecycle: config.LifecycleConfig{Lease: time.Hour, RetryIntervals: []time.Duration{time.Minute}},
+		ICT:       config.ICTConfig{TargetConfigMap: "ict-config", TargetConfigKey: "config.yaml"},
+		COS:       config.COSConfig{Bucket: "bucket", Region: "us-south", Endpoint: "https://s3.example.invalid", KeyPrefix: "servitor", SkipCredentialsValidation: true, SkipMetadataAPICheck: true, SkipRegionValidation: true, SkipRequestingAccountID: true, ForcePathStyle: true},
+		Images:    config.ImagesConfig{Execution: "registry.example.invalid/task@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+		Secrets:   config.SecretsConfig{Slack: "slack", COS: "cos", IBM: "ibm"},
 	}
 }
 

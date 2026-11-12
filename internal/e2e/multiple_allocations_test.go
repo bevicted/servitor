@@ -93,7 +93,7 @@ func TestMultipleThreadAllocationsAdmissionAndCleanup(t *testing.T) {
 		Namespace: "ns", Defaults: servitorv1alpha1.ResolvedOptions{UserOptions: servitorv1alpha1.UserOptions{Target: "target", Provider: "vpc-gen2", Version: "4.22"}, ResourceGroup: "Default", Platform: "openshift"},
 		NetworkBindings: map[string]servitorv1alpha1.FrozenNetwork{"target": {BindingID: "existing", AccountID: "account", VPCID: "vpc", SubnetID: "subnet", PublicGatewayID: "gateway", Zone: "us-south-1"}},
 		Backend:         servitorv1alpha1.BackendIdentity{Version: 1, Bucket: "bucket", Region: "us-south", Endpoint: "https://s3.us-south.example.invalid"}, BackendPrefix: "servitor",
-		ExecutionImage: "registry.example/ict@sha256:deadbeef", ReviewTimeout: time.Minute,
+		ExecutionImage: "registry.example/ict@sha256:deadbeef",
 	}, Now: func() time.Time { return now }}
 	for _, thread := range threads {
 		request := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "ns", Name: byThread[thread].Name}}
@@ -140,7 +140,7 @@ func TestMultipleThreadAllocationsAdmissionAndCleanup(t *testing.T) {
 		if err := kube.Get(ctx, types.NamespacedName{Namespace: "ns", Name: byThread[thread].Name}, stored); err != nil {
 			t.Fatal(err)
 		}
-		if stored.Spec.Lifecycle.Approval != "" || stored.Spec.Lifecycle.CleanupRequested {
+		if stored.Spec.Lifecycle.CleanupRequested {
 			t.Fatalf("yes mutated allocation %s: %+v", thread, stored.Spec.Lifecycle)
 		}
 	}

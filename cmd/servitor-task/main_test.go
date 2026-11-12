@@ -426,8 +426,27 @@ func TestRunPlanUsesInitializedWorkspaceAndSanitizesOversizedPlan(t *testing.T) 
 	if decoded.ResolvedOptions.ClusterName != recovery.Values.ClusterName || decoded.ResolvedOptions.Region != recovery.Values.Region || decoded.ResolvedOptions.Version != recovery.Values.KubeVersion || decoded.ResolvedOptions.WorkerCount != recovery.Values.WorkerCount || decoded.ResolvedOptions.Zone != recovery.Values.Zone || decoded.ResolvedOptions.Flavor != recovery.Values.Flavor {
 		t.Fatalf("plan report did not adopt ICT-normalized options: %+v", decoded.ResolvedOptions)
 	}
+	if !reflect.DeepEqual(decoded.Recovery, recovery) {
+		t.Fatalf("plan report changed recovery: %+v", decoded.Recovery)
+	}
+	if strings.Contains(string(report), "review") {
+		t.Fatalf("plan report retained review payload: %s", report)
+	}
 	if strings.Contains(string(report), workspace) {
 		t.Fatal("plan workspace was exposed in the report")
+	}
+	for _, test := range []struct{ name, plan string }{
+		{"managed network", `{"format_version":"1.2","resource_changes":[{"address":"ibm_is_vpc.shared","mode":"managed","type":"ibm_is_vpc","name":"shared","change":{"actions":["create"],"after":{}}}]}`},
+		{"malformed plan", `{"format_version":`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := os.WriteFile(planShowFile, []byte(test.plan), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := runPlan(context.Background(), "uid", "plan-a", options, backendFile, resultFile, reportFile, ict, terraform, planningConfig, apiKey); err == nil {
+				t.Fatal("unsafe or malformed Terraform plan was accepted")
+			}
+		})
 	}
 }
 
@@ -1121,7 +1140,7 @@ func TestRunApplyReviewsFrozenExistingNetworkBeforeApply(t *testing.T) {
 		t.Fatal(err)
 	}
 	ict := filepath.Join(directory, "ict")
-	ictScript := fmt.Sprintf("#!/bin/sh\nprintf '%%s\\n' \"$1\" >> %q\ncase \"$1\" in\nreview) cp \"$4\" %q; cp %q \"$8\" ;;\napply) printf '%%s' '{\"version\":1,\"operation\":\"apply\",\"workspace\":\"/tmp/workspace\"}' > \"$8\" ;;\n*) exit 2 ;;\nesac\n", ictTrace, contextTrace, freshResult)
+	ictScript := fmt.Sprintf("#!/bin/sh\nprintf '%%s\\n' \"$1\" >> %q\ncase \"$1\" in\nreview) cp \"$4\" %q; cp %q \"$8\" ;;\napply) [ \"$9\" = --auto-approve ] || exit 9; printf '%%s' '{\"version\":1,\"operation\":\"apply\",\"workspace\":\"/tmp/workspace\"}' > \"$8\" ;;\n*) exit 2 ;;\nesac\n", ictTrace, contextTrace, freshResult)
 	if err := os.WriteFile(ict, []byte(ictScript), 0o700); err != nil {
 		t.Fatal(err)
 	}

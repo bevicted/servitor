@@ -716,7 +716,7 @@ func extensionUnavailableText(cluster *servitorv1alpha1.ServitorCluster, now tim
 		return "Cleanup is in progress. The lease cannot be extended."
 	}
 	switch cluster.Status.Phase {
-	case servitorv1alpha1.PhasePending, servitorv1alpha1.PhasePlanning, servitorv1alpha1.PhaseAwaitingApproval, servitorv1alpha1.PhaseApplying:
+	case servitorv1alpha1.PhasePending, servitorv1alpha1.PhasePlanning, servitorv1alpha1.PhaseApplying:
 		return "Provisioning is in progress. Extend is available when your cluster is ready."
 	case servitorv1alpha1.PhaseCleanupComplete:
 		return "Cleanup is complete. Use @servitor create to start a new allocation."

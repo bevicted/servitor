@@ -28,7 +28,7 @@ func main() {
 	configPath := flag.String("config", "", "mounted operator configuration YAML path")
 	flag.Usage = func() {
 		output := flag.CommandLine.Output()
-		_, _ = output.Write([]byte("Servitor reconciles namespaced ServitorCluster resources through Tekton PipelineRuns and COS-backed ICT.\nThe controller alone writes CR status; Slack writes authorized spec.userOptions and spec.lifecycle intent.\nTerraform plans are ephemeral and approval starts a fresh auto-approved apply from frozen resolved options.\n"))
+		_, _ = output.Write([]byte("Servitor reconciles namespaced ServitorCluster resources through Tekton PipelineRuns and COS-backed ICT.\nThe controller alone writes CR status; Slack writes authorized spec.userOptions and spec.lifecycle intent.\nTerraform plans are ephemeral; apply uses frozen resolved options after fresh safety checks.\n"))
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -129,7 +129,6 @@ func controllerConfig(operator config.Config) (controller.Config, error) {
 			ICTConfigMap: operator.ICT.TargetConfigMap, ICTConfigKey: operator.ICT.TargetConfigKey,
 			COSSecret: operator.Secrets.COS, IBMSecret: operator.Secrets.IBM,
 		},
-		ReviewTimeout:   operator.Lifecycle.ConfirmationTimeout,
 		OpenShiftFlavor: operator.Defaults.OpenShiftFlavor, KubernetesFlavor: operator.Defaults.KubernetesFlavor,
 		PublicAuthTargets: append([]string(nil), operator.Auth.PublicTargets...),
 	}, nil

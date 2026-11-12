@@ -54,6 +54,7 @@ func TestReadReportAcceptsOnlyExactBoundedIdentity(t *testing.T) {
 		container string
 	}{
 		{"extra JSON", append(validReport(t), []byte("{}")...), "step-report"},
+		{"removed review field", bytes.Replace(validReport(t), []byte(`"version":1`), []byte(`"version":1,"review":{}`), 1), "step-report"},
 		{"wrong container", validReport(t), ""},
 		{"oversized", bytes.Repeat([]byte("x"), MaxReportBytes+1), "step-report"},
 	} {

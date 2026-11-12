@@ -41,7 +41,6 @@ type Config struct {
 	BackendPrefix     string
 	ExecutionImage    string
 	TaskConfig        pipeline.TaskConfig
-	ReviewTimeout     time.Duration
 	OpenShiftFlavor   string
 	KubernetesFlavor  string
 	PublicAuthTargets []string
